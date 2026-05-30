@@ -20,7 +20,7 @@ jobs:
 
     steps:
       # =========================================================
-      # CHECKOUT
+      # CHECKOUT PAT_WORKFLOW : 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
       # =========================================================
       - name: Checkout destination repo
         uses: actions/checkout@v4
