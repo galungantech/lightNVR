@@ -25,15 +25,20 @@ export function getAuthHeaders() {
 }
 
 /**
- * Clear all authentication state
+ * Remove client-side authentication state so the user is logged out.
+ *
+ * Removes the 'auth' entry from localStorage and expires client-accessible
+ * 'auth' and 'session' cookies. Note: HttpOnly session cookies must be cleared
+ * by the server and may not be affected by this call.
  */
 export function clearAuthState() {
   // Clear localStorage
   localStorage.removeItem('auth');
-  
-  // Clear cookies
-  document.cookie = "auth=; Path=/; Expires=Thu, 01 Jan 1970 00:00:00 GMT; SameSite=Strict";
-  document.cookie = "session=; Path=/; Expires=Thu, 01 Jan 1970 00:00:00 GMT; SameSite=Strict";
+
+  // Clear non-HttpOnly cookies (session cookie is HttpOnly and can only be
+  // cleared server-side, but we clear legacy/fallback cookies here)
+  document.cookie = "auth=; Path=/; Expires=Thu, 01 Jan 1970 00:00:00 GMT; SameSite=Lax";
+  document.cookie = "session=; Path=/; Expires=Thu, 01 Jan 1970 00:00:00 GMT; SameSite=Lax";
 }
 
 /**
