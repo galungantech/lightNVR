@@ -43,7 +43,7 @@ jobs:
       - name: Add upstream and fetch
         run: |
           git remote remove upstream || true
-          git remote add upstream https://github.com/opensensor/lightnvr-modif.git
+          git remote add upstream https://github.com/rivandraa/lightnvr-modif.git
           git fetch upstream main
 
       # =========================================================
