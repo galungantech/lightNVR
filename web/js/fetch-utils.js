@@ -4,10 +4,8 @@
  */
 
 /**
- * Clear local authentication state, expire non-HttpOnly fallback auth cookies, and redirect the browser to the login page if not already there.
- *
- * Clears client-side auth storage and attempts to remove legacy/non-HttpOnly auth cookies. Note that HttpOnly cookies (e.g., a server-set session cookie) cannot be cleared from client-side code and must be cleared server-side.
- * @param {string} reason - Short description of why authentication failed; used for logging and diagnostics. Defaults to "Session expired".
+ * Clear authentication state and redirect to login
+ * @param {string} reason - Reason for redirect (optional)
  */
 function handleAuthenticationFailure(reason = 'Session expired') {
   console.warn(`Authentication failure: ${reason}`);
@@ -15,10 +13,9 @@ function handleAuthenticationFailure(reason = 'Session expired') {
   // Clear all auth-related storage
   localStorage.removeItem('auth');
 
-  // Clear non-HttpOnly cookies (session cookie is HttpOnly and can only be
-  // cleared server-side via Set-Cookie, but we clear legacy/fallback cookies here)
-  document.cookie = "auth=; Path=/; Expires=Thu, 01 Jan 1970 00:00:00 GMT; SameSite=Lax";
-  document.cookie = "session=; Path=/; Expires=Thu, 01 Jan 1970 00:00:00 GMT; SameSite=Lax";
+  // Clear auth cookies
+  document.cookie = "auth=; Path=/; Expires=Thu, 01 Jan 1970 00:00:00 GMT; SameSite=Strict";
+  document.cookie = "session=; Path=/; Expires=Thu, 01 Jan 1970 00:00:00 GMT; SameSite=Strict";
 
   // Only redirect if we're not already on the login page
   if (!window.location.pathname.includes('login.html')) {

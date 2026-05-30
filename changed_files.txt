@@ -1,5 +1,0 @@
-src/web/api_handlers_auth_backend_agnostic.c
-src/web/api_handlers_users_backend_agnostic.c
-web/js/components/preact/LoginView.jsx
-web/js/fetch-utils.js
-web/js/utils/auth-utils.js

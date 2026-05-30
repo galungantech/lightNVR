@@ -224,10 +224,10 @@ bool go2rtc_stream_register(const char *stream_id, const char *stream_url,
     int combined_idx = -1;
     
     // Tentukan codec & parameter
-    const char *audio_codec = (strstr(encoded_stream_id, "_sub") != NULL) ? "opus" : "aac";
-    
+    const char *audio_codec = ends_with(encoded_stream_id, "_sub") ? "opus" : "aac";
+
     // Deteksi h264 yang akurat dan aman (Tahan terhadap variasi metadata)
-    bool is_h264 = (codec != NULL && strcasestr(codec, "h264") != NULL);
+    bool is_h264 = (codec != NULL && strcasecmp(codec, "h264") == 0);
     
     // Kita buat satu string gabungan yang efisien
     if (!is_h264) {
@@ -249,15 +249,22 @@ bool go2rtc_stream_register(const char *stream_id, const char *stream_url,
         num_sources++;
         log_info("Stream %s: Combined producer added (audio=%s, h264_detected=%s)", 
                  encoded_stream_id, audio_codec, is_h264 ? "yes" : "no");
+    } else {
+    log_warn("Stream %s: Failed to allocate combined producer source; proceeding without audio/H.264 fallback", encoded_stream_id);
     }
     
     // 3. Registrasi ke go2rtc
     bool result = false;
     if (num_sources > 0) {
-        // Gunakan multi jika ada tambahan, atau single jika hanya primary
-        result = (num_sources > 1) 
-                 ? go2rtc_api_add_stream_multi(encoded_stream_id, sources, num_sources)
-                 : go2rtc_api_add_stream(encoded_stream_id, modified_url);
+        if (num_sources > 1) {
+            result = go2rtc_api_add_stream_multi(stream_id, sources, num_sources);
+            if (!result) {
+                log_warn("Failed to register stream %s with multiple sources; retrying with primary source only", encoded_stream_id);
+                result = go2rtc_api_add_stream(stream_id, modified_url);
+            }
+        } else {
+            result = go2rtc_api_add_stream(stream_id, modified_url);
+        }
     }
     
     if (result) {

@@ -11,15 +11,12 @@ import { useI18n } from '../../i18n.js';
  */
 const ptzApi = {
   async move(streamName, pan, tilt, zoom) {
-    const response = await fetch(
-      `/api/streams/${encodeURIComponent(streamName)}/ptz/move`,
-      {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ pan, tilt, zoom })
-      }
-    );
-
+    const response = await fetch(`/api/streams/${encodeURIComponent(streamName)}/ptz/move`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ pan, tilt, zoom })
+    });
+    if (!response.ok) throw new Error('Failed to move');
     return response.json();
   },
 
@@ -151,6 +148,7 @@ function DirectionButton({
       onMouseLeave={onMouseLeave}
       onTouchStart={onMouseDown}
       onTouchEnd={onMouseUp}
+      onTouchCancel={onMouseUp}
       disabled={disabled}
       style={{
         width: '40px',
@@ -384,12 +382,12 @@ export function PTZControls({
   );
 
   const handleMoveStop = useCallback(() => {
-
-    if (!stream?.name || !isMoving)
+  
+    if (!stream?.name)
       return;
-
+  
     setIsMoving(false);
-
+  
     ptzApi.stop(stream.name)
       .catch(err =>
         console.error(
@@ -397,8 +395,8 @@ export function PTZControls({
           err
         )
       );
-
-  }, [stream?.name, isMoving]);
+  
+  }, [stream?.name]);
 
   const handleHome = useCallback(() => {
 
