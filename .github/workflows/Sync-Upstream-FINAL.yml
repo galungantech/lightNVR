@@ -20,7 +20,7 @@ jobs:
 
     steps:
       # =========================================================
-      # CHECKOUT
+      # CHECKOUT PAT_WORKFLOW : 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
       # =========================================================
       - name: Checkout destination repo
         uses: actions/checkout@v4
@@ -43,7 +43,7 @@ jobs:
       - name: Add upstream and fetch
         run: |
           git remote remove upstream || true
-          git remote add upstream https://github.com/opensensor/lightNVR.git
+          git remote add upstream https://github.com/rivandraa/lightnvr-modif.git
           git fetch upstream main
 
       # =========================================================
