@@ -1434,10 +1434,10 @@ bool go2rtc_integration_register_all_streams(void) {
                 snprintf(sub_name, sizeof(sub_name), "%s_sub", streams[i].name);
                 log_info("Registering sub-stream %s with go2rtc", sub_name);
                 if (!go2rtc_stream_register(sub_name, streams[i].sub_stream_url,
-                                           streams[i].onvif_username[0] != '\0' ? streams[i].onvif_username : NULL,
-                                           streams[i].onvif_password[0] != '\0' ? streams[i].onvif_password : NULL,
-                                           false, streams[i].protocol, true,
-                                           streams[i].codec)) {
+                    streams[i].onvif_username[0] != '\0' ? streams[i].onvif_username : NULL,
+                    streams[i].onvif_password[0] != '\0' ? streams[i].onvif_password : NULL,
+                    false, streams[i].protocol, streams[i].record_audio,
+                    streams[i].codec)) {
                     log_warn("Failed to register sub-stream %s with go2rtc", sub_name);
                 }
             }
@@ -1549,10 +1549,12 @@ bool go2rtc_sync_streams_from_database(void) {
             snprintf(sub_name, sizeof(sub_name), "%s_sub", db_streams[i].name);
             if (!go2rtc_api_stream_exists(sub_name)) {
                 log_info("Registering missing sub-stream %s with go2rtc", sub_name);
-                go2rtc_stream_register(sub_name, db_streams[i].sub_stream_url,
-                                       username, password,
-                                       false, db_streams[i].protocol, true,
-                                       db_streams[i].codec);
+                if (!go2rtc_stream_register(sub_name, db_streams[i].sub_stream_url,
+                    username, password,
+                    false, db_streams[i].protocol, db_streams[i].record_audio,
+                    db_streams[i].codec)) {
+                    log_warn("Failed to register missing sub-stream %s with go2rtc", sub_name);
+                }
             }
         }
     }
@@ -1948,11 +1950,14 @@ bool go2rtc_integration_register_stream(const char *stream_name) {
         char sub_name[MAX_STREAM_NAME + 8];
         snprintf(sub_name, sizeof(sub_name), "%s_sub", stream_name);
         log_info("Registering sub-stream %s with go2rtc", sub_name);
-        go2rtc_stream_register(sub_name, config.sub_stream_url,
-                               username[0] != '\0' ? username : NULL,
-                               password[0] != '\0' ? password : NULL,
-                               false, config.protocol, true,
-                               config.codec);
+        if (!go2rtc_stream_register(sub_name, config.sub_stream_url,
+            username[0] != '\0' ? username : NULL,
+            password[0] != '\0' ? password : NULL,
+            false, config.protocol, config.record_audio,
+            config.codec)) {
+            log_warn("Failed to register single sub-stream %s with go2rtc", sub_name);
+            // Opsional: kembalikan status false jika fungsi ini mengharuskan return value sukses
+        }
     }
 
     return main_ok || skip_main;

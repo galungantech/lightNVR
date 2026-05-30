@@ -477,7 +477,13 @@ void handle_auth_login(const http_request_t *req, http_response_t *res) {
 }
 
 /**
- * @brief Backend-agnostic handler for POST /api/auth/logout and GET /logout
+ * Handle logout requests for both API and browser clients.
+ *
+ * Clears the server-side session (if present), removes session and trusted-device cookies,
+ * and responds with either a JSON success payload for API requests or an HTTP redirect for browser requests.
+ *
+ * @param req Incoming HTTP request; used to read session token, cookies, and headers.
+ * @param res HTTP response to populate with the logout result (JSON or redirect) and cookie-clearing headers.
  */
 void handle_auth_logout(const http_request_t *req, http_response_t *res) {
     log_info("Handling logout request");
@@ -489,6 +495,7 @@ void handle_auth_logout(const http_request_t *req, http_response_t *res) {
     }
 
     httpd_clear_session_cookie(res);
+    httpd_clear_trusted_device_cookie(res);
 
     // Check if this is an API request or browser request
     const char *accept = http_request_get_header(req, "Accept");
@@ -517,7 +524,15 @@ void handle_auth_logout(const http_request_t *req, http_response_t *res) {
 }
 
 /**
- * @brief Backend-agnostic handler for GET /api/auth/verify
+ * Verify the caller's authentication state and return authentication metadata.
+ *
+ * Depending on server configuration and authentication state, this handler:
+ * - When web authentication is disabled: returns an authenticated admin response with auth configuration values.
+ * - When a valid session is present: returns the authenticated user's id, username, email, role, role_id, active/lock flags, and auth configuration values.
+ * - When demo mode is enabled and no valid session exists: returns an unauthenticated demo viewer response.
+ * - When no valid authentication is found: clears any stale session cookie and returns a 401 Unauthorized JSON error.
+ *
+ * Responses are returned as JSON with appropriate HTTP status codes (200 for successful info responses, 401 for unauthorized).
  */
 void handle_auth_verify(const http_request_t *req, http_response_t *res) {
     log_info("Handling GET /api/auth/verify request");
@@ -584,7 +599,10 @@ void handle_auth_verify(const http_request_t *req, http_response_t *res) {
         return;
     }
 
-    // No valid authentication
+    // No valid authentication — clear any stale session cookie so the browser
+    // stops resending an expired/invalid HttpOnly token on every request.
+    httpd_clear_session_cookie(res);
+
     log_debug("Authentication verification failed");
     http_response_set_json_error(res, 401, "Unauthorized");
 }
