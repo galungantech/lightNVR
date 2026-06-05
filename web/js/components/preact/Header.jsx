@@ -331,7 +331,7 @@ export function Header({ version = VERSION }) {
               }
             }}
           >
-            <h1 className="text-xs font-bold m-0">LightNVR-Modded</h1>
+            <h1 className="!text-base font-bold m-0">LightNVR-Modded</h1>
             <span className="version text-xs ml-2" style={{color: 'hsl(var(--muted-foreground))'}}>v{version}</span>
           </a>
 
