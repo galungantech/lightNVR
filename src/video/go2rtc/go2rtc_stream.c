@@ -223,10 +223,8 @@ bool go2rtc_stream_register(const char *stream_id, const char *stream_url,
      * codec, go2rtc_integration_reregister_stream() re-issues this call
      * with the corrected value.
      */
-    const char *sources[4];
+    const char *sources[3];
     int num_sources = 0;
-    
-    // 1. Tambahkan primary URL (Tidak perlu di-free)
     sources[num_sources++] = modified_url;
 
     char ffmpeg_audio_source[URL_BUFFER_SIZE];
@@ -261,21 +259,7 @@ bool go2rtc_stream_register(const char *stream_id, const char *stream_url,
                  stream_id, (codec && codec[0]) ? codec : "unknown",
                  g_config.hw_accel_enabled ? "on" : "off");
     } else {
-        // Jika sudah H264, hanya butuh audio (Direct stream/Remuxing)
-        snprintf(combined_buf, sizeof(combined_buf), 
-                 "ffmpeg:%s#audio=%s", 
-                 encoded_stream_id, audio_codec);
-    }
-    
-    // Alokasi memori hanya sekali untuk gabungan ini
-    sources[num_sources] = strdup(combined_buf);
-    if (sources[num_sources] != NULL) {
-        combined_idx = num_sources;
-        num_sources++;
-        log_info("Stream %s: Combined producer added (audio=%s, h264_detected=%s)", 
-                 encoded_stream_id, audio_codec, is_h264 ? "yes" : "no");
-    } else {
-    log_warn("Stream %s: Failed to allocate combined producer source; proceeding without audio/H.264 fallback", encoded_stream_id);
+        log_info("Stream %s codec=h264; no transcoding fallback needed", stream_id);
     }
 
     bool result;
@@ -289,14 +273,14 @@ bool go2rtc_stream_register(const char *stream_id, const char *stream_url,
     } else {
         result = go2rtc_api_add_stream(stream_id, modified_url);
     }
-    
+
     if (result) {
         log_info("Successfully registered stream %s with go2rtc (%d source%s)",
                  stream_id, num_sources, num_sources == 1 ? "" : "s");
     } else {
         log_error("Failed to register stream %s with go2rtc", stream_id);
     }
-    
+
     // Intentionally do NOT preload here.
     //
     // Registration happens during startup for every enabled stream.  Preloading
