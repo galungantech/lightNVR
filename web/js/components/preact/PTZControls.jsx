@@ -262,7 +262,7 @@ export function PTZControls({
       clientX - position.x;
 
     dragData.current.offsetY =
-      clientY - position.y;
+      clientY + position.y;
 
     e.preventDefault();
 
@@ -284,7 +284,7 @@ export function PTZControls({
       clientX - dragData.current.offsetX;
 
     let newY =
-      clientY - dragData.current.offsetY;
+      dragData.current.offsetY - clientY;
 
     const clamped =
       clampPosition(newX, newY);
@@ -458,8 +458,8 @@ export function PTZControls({
       style={{
         position: 'absolute',
         left: `${position.x}px`,
-        top: `${position.y}px`,
-        backgroundColor: 'rgba(0, 0, 0, 0.75)',
+        bottom: `${position.y}px`,
+        backgroundColor: 'rgba(0, 0, 0, 0.25)',
         borderRadius: '8px',
         padding: '12px',
         zIndex: 10,
