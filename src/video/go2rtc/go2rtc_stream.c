@@ -104,12 +104,15 @@ bool go2rtc_stream_register(const char *stream_id, const char *stream_url,
         return false;
     }
 
-    // Log the input parameters for debugging
-    // Sanitize the stream name so it can be safely used in a URL. Note that URL-encoding
-    // the spaces results in go2rtc complaining with "source with spaces may be insecure",
-    // so we strip any problematic characters from the string.
-    char encoded_stream_id[URL_BUFFER_SIZE * 3];
-    simple_url_escape(stream_id, encoded_stream_id, URL_BUFFER_SIZE * 3);
+    // Use the raw stream_id for registration. The go2rtc API client
+    // (go2rtc_api_add_stream / _multi) URL-escapes the name itself when it
+    // builds the ?name= query parameter, exactly like every other API call
+    // (unregister, webrtc-url, preload, exists) and the recording consumer.
+    // Pre-escaping it here would double-encode the name (e.g. "Front Cam" ->
+    // "Front%2520Cam"), registering the stream under a name that none of the
+    // later lookups can match. The ffmpeg fallback sources below likewise
+    // reference the stream by its raw name; go2rtc_api_add_stream_multi()
+    // escapes each source string as a whole before sending it.
 
     // Ensure go2rtc is running
     if (!go2rtc_stream_is_ready()) {
@@ -188,21 +191,28 @@ bool go2rtc_stream_register(const char *stream_id, const char *stream_url,
     /*
      * Compose the multi-source list for go2rtc.
      *
-     * Source 0 is always the primary RTSP URL. We optionally append:
+     * Source 0 is always the primary source URL. We optionally append:
      *
-     *   - ffmpeg:<id>#audio=aac   when record_audio is true, so the MP4
-     *     muxer has a persistent AAC producer. go2rtc still transcodes to
-     *     OPUS on demand for WebRTC viewers without a second ffmpeg.
+     *   - ffmpeg:<id>#audio=aac#audio=opus   when record_audio is true.
+     *     A single ffmpeg process emits two audio tracks:
+     *       * AAC  feeds the MP4 recorder and the MPEG-TS HLS consumer.
+     *       * OPUS is what WebRTC needs. go2rtc's pure-Go build does NOT
+     *         transcode AAC -> OPUS: its WebRTC consumer only repackages
+     *         OPUS/PCMU/PCMA (no AAC decode) and codec matching is name-exact
+     *         (pkg/core/codec.go Codec.Match). Without an OPUS producer the
+     *         browser negotiates an opus track in the SDP that never carries
+     *         any audio — the exact "speaker icon but no sound" symptom. (#429)
      *
-     *   - ffmpeg:<id>#video=h264#hardware   when the source codec is
+     *   - ffmpeg:<id>#video=h264[#hardware]   when the source codec is
      *     anything other than "h264" (including unknown/empty). Browsers'
      *     WebRTC stacks don't accept H.265, so go2rtc needs a transcoded
      *     fallback to negotiate with them — this one only spawns its
      *     ffmpeg process when a consumer actually asks for H.264 and the
      *     primary doesn't supply it (H.264 sources leave it idle).
-     *     #hardware lets go2rtc pick VAAPI/NVENC/v4l2m2m if the host has
-     *     it and fall back to libx264.
-     *     (Neither #video=copy on the AAC source nor transcoding from
+     *     #hardware (VAAPI/NVENC/v4l2m2m) is only appended when
+     *     hw_accel_enabled is set; otherwise we force software libx264 so a
+     *     broken host encoder can't crash the producer. (#429)
+     *     (Neither #video=copy on the audio source nor transcoding from
      *     the AAC feed — each ffmpeg: entry opens its own producer.)
      *
      * codec may be NULL/empty on first registration since the detection
@@ -218,23 +228,38 @@ bool go2rtc_stream_register(const char *stream_id, const char *stream_url,
     
     // 1. Tambahkan primary URL (Tidak perlu di-free)
     sources[num_sources++] = modified_url;
-    
-    // 2. Logika Gabungan (Audio + Video dalam 1 string)
-    char combined_buf[URL_BUFFER_SIZE];
-    int combined_idx = -1;
-    
-    // Tentukan codec & parameter
-    const char *audio_codec = ends_with(encoded_stream_id, "_sub") ? "opus" : "aac";
 
-    // Deteksi h264 yang akurat dan aman (Tahan terhadap variasi metadata)
-    bool is_h264 = (codec != NULL && strcasecmp(codec, "h264") == 0);
-    
-    // Kita buat satu string gabungan yang efisien
+    char ffmpeg_audio_source[URL_BUFFER_SIZE];
+    if (record_audio) {
+        // Emit AAC (for MP4 recording + MPEG-TS HLS) and OPUS (for WebRTC)
+        // from one ffmpeg process — go2rtc cannot transcode AAC->OPUS itself,
+        // so the OPUS track is what actually makes audio audible in the
+        // browser's WebRTC player. (#429)
+        snprintf(ffmpeg_audio_source, sizeof(ffmpeg_audio_source),
+                 "ffmpeg:%s#audio=aac#audio=opus", stream_id);
+        sources[num_sources++] = ffmpeg_audio_source;
+    }
+
+    bool is_h264 = (codec && codec[0] != '\0' && strcasecmp(codec, "h264") == 0);
+    char ffmpeg_h264_source[URL_BUFFER_SIZE];
     if (!is_h264) {
-        // Jika bukan H264, kita paksa transcoding video ke H264 dengan hardware
-        snprintf(combined_buf, sizeof(combined_buf), 
-                 "ffmpeg:%s#video=h264#audio=%s#hardware", 
-                 encoded_stream_id, audio_codec);
+        // Only ask go2rtc for the #hardware encoder when the operator opted in
+        // via hw_accel_enabled. Some hosts (e.g. LXC containers where vainfo
+        // probes succeed but VAAPI encoding fails with "Function not
+        // implemented") have a broken hardware encoder that crashes the ffmpeg
+        // producer, leaving go2rtc with a null consumer and a 404 stream.
+        // Falling back to software libx264 keeps the WebRTC fallback working. (#429)
+        if (g_config.hw_accel_enabled) {
+            snprintf(ffmpeg_h264_source, sizeof(ffmpeg_h264_source),
+                     "ffmpeg:%s#video=h264#hardware", stream_id);
+        } else {
+            snprintf(ffmpeg_h264_source, sizeof(ffmpeg_h264_source),
+                     "ffmpeg:%s#video=h264", stream_id);
+        }
+        sources[num_sources++] = ffmpeg_h264_source;
+        log_info("Stream %s codec=%s; adding ffmpeg H.264 fallback source for WebRTC (hw_accel=%s)",
+                 stream_id, (codec && codec[0]) ? codec : "unknown",
+                 g_config.hw_accel_enabled ? "on" : "off");
     } else {
         // Jika sudah H264, hanya butuh audio (Direct stream/Remuxing)
         snprintf(combined_buf, sizeof(combined_buf), 
@@ -252,30 +277,24 @@ bool go2rtc_stream_register(const char *stream_id, const char *stream_url,
     } else {
     log_warn("Stream %s: Failed to allocate combined producer source; proceeding without audio/H.264 fallback", encoded_stream_id);
     }
-    
-    // 3. Registrasi ke go2rtc
-    bool result = false;
-    if (num_sources > 0) {
-        if (num_sources > 1) {
-            result = go2rtc_api_add_stream_multi(stream_id, sources, num_sources);
-            if (!result) {
-                log_warn("Failed to register stream %s with multiple sources; retrying with primary source only", encoded_stream_id);
-                result = go2rtc_api_add_stream(stream_id, modified_url);
-            }
-        } else {
+
+    bool result;
+    if (num_sources > 1) {
+        result = go2rtc_api_add_stream_multi(stream_id, sources, num_sources);
+        if (!result) {
+            log_error("Failed to register stream %s with go2rtc (%d sources); falling back to primary-only",
+                      stream_id, num_sources);
             result = go2rtc_api_add_stream(stream_id, modified_url);
         }
+    } else {
+        result = go2rtc_api_add_stream(stream_id, modified_url);
     }
     
     if (result) {
-        log_info("Successfully registered stream %s", encoded_stream_id);
+        log_info("Successfully registered stream %s with go2rtc (%d source%s)",
+                 stream_id, num_sources, num_sources == 1 ? "" : "s");
     } else {
-        log_error("Failed to register stream %s", encoded_stream_id);
-    }
-    
-    // 4. CLEANUP: Hanya bebaskan jika alokasi berhasil
-    if (combined_idx != -1) {
-        free((void*)sources[combined_idx]);
+        log_error("Failed to register stream %s with go2rtc", stream_id);
     }
     
     // Intentionally do NOT preload here.
@@ -290,7 +309,7 @@ bool go2rtc_stream_register(const char *stream_id, const char *stream_url,
     // is already listening.
     if (result) {
         log_debug("Registered stream %s with go2rtc without preloading; startup paths will preload on demand",
-                  encoded_stream_id);
+                  stream_id);
     }
 
     return result;
