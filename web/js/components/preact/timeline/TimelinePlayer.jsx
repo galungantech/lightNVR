@@ -898,7 +898,7 @@ export function TimelinePlayer({ videoElementRef = null, autoFullscreen = false 
               top: 0,
               left: 0,
               right: 0,
-              bottom: '40px',
+              bottom: '60px',
               zIndex: 1,
             }}
             onDblClick={() => handleToggleFullscreen()}
