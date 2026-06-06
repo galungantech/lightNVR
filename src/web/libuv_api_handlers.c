@@ -41,6 +41,8 @@
 extern int libuv_serve_file(libuv_connection_t *conn, const char *path,
                             const char *content_type, const char *extra_headers);
 extern const char *libuv_get_mime_type(const char *path);
+extern void handle_post_system_export(const http_request_t *req, http_response_t *res);
+extern void handle_post_system_restore(const http_request_t *req, http_response_t *res);
 
 /**
  * @brief Register all API handlers with the libuv server
@@ -127,6 +129,8 @@ int register_all_libuv_handlers(http_server_handle_t server) {
     http_server_register_handler(server, "/api/system/shutdown", "POST", handle_post_system_shutdown);
     http_server_register_handler(server, "/api/system/logs/clear", "POST", handle_post_system_logs_clear);
     http_server_register_handler(server, "/api/system/backup", "POST", handle_post_system_backup);
+    http_server_register_handler(server, "/api/system/export", "POST", handle_post_system_export);
+    http_server_register_handler(server, "/api/system/restore", "POST", handle_post_system_restore);
     http_server_register_handler(server, "/api/system/status", "GET", handle_get_system_status);
     http_server_register_handler(server, "/api/system/go2rtc/effective-config", "GET",
                                  handle_get_system_go2rtc_effective_config);

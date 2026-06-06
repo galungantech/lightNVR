@@ -9,7 +9,6 @@ import { ContentLoader } from './LoadingIndicator.jsx';
 import { useQuery, useMutation, fetchJSON } from '../../query-client.js';
 import { validateSession } from '../../utils/auth-utils.js';
 import { useI18n } from '../../i18n.js';
-
 // Import system components
 import { SystemControls } from './system/SystemControls.jsx';
 import { SystemInfo } from './system/SystemInfo.jsx';
@@ -33,60 +32,22 @@ import { formatBytes, formatUptime, log_level_meets_minimum } from './system/Sys
  */
 export function SystemView() {
   const { t } = useI18n();
+  const fileInputRef = useRef(null);
 
   // Define all state variables first
   const [systemInfo, setSystemInfo] = useState({
-    version: '',
-    uptime: '',
-    cpu: {
-      model: '',
-      cores: 0,
-      usage: 0
-    },
-    memory: {
-      total: 0,
-      used: 0,
-      free: 0
-    },
-    go2rtcMemory: {
-      total: 0,
-      used: 0,
-      free: 0
-    },
-    detectorMemory: {
-      total: 0,
-      used: 0,
-      free: 0
-    },
-    systemMemory: {
-      total: 0,
-      used: 0,
-      free: 0
-    },
-    disk: {
-      total: 0,
-      used: 0,
-      free: 0
-    },
-    systemDisk: {
-      total: 0,
-      used: 0,
-      free: 0
-    },
-    network: {
-      interfaces: []
-    },
-    streams: {
-      active: 0,
-      total: 0
-    },
-    recordings: {
-      count: 0,
-      size: 0
-    },
-    versions: {
-      items: []
-    }
+    version: '', uptime: '',
+    cpu: { model: '', cores: 0, usage: 0 },
+    memory: { total: 0, used: 0, free: 0 },
+    go2rtcMemory: { total: 0, used: 0, free: 0 },
+    detectorMemory: { total: 0, used: 0, free: 0 },
+    systemMemory: { total: 0, used: 0, free: 0 },
+    disk: { total: 0, used: 0, free: 0 },
+    systemDisk: { total: 0, used: 0, free: 0 },
+    network: { interfaces: [] },
+    streams: { active: 0, total: 0 },
+    recordings: { count: 0, size: 0 },
+    versions: { items: [] }
   });
   const [logs, setLogs] = useState([]);
   const [logLevel, setLogLevel] = useState(() => localStorage.getItem('lightnvr_system_logLevel') || 'debug');
@@ -100,9 +61,10 @@ export function SystemView() {
   const [showClearLogsModal, setShowClearLogsModal] = useState(false);
   const [hasData, setHasData] = useState(false);
   const [activeTab, setActiveTab] = useState('system');
-
-  // User role state for permission-based UI
   const [userRole, setUserRole] = useState(null);
+
+  // Ref penampung fungsi state internal anak
+  const setControlsModalRef = useRef(null);
 
   // Fetch user role on mount
   useEffect(() => {
@@ -122,82 +84,33 @@ export function SystemView() {
     fetchUserRole();
   }, []);
 
-  // Role is still loading if null
   const roleLoading = userRole === null;
-  // Only admin can restart/shutdown system; default to false while loading
   const canControlSystem = !roleLoading && userRole === 'admin';
 
-  // Define all query hooks next
-  const {
-    data: systemInfoData,
-    isLoading
-  } = useQuery(
-    ['systemInfo'],
-    '/api/system/info',
-    {
-      timeout: 15000,
-      retries: 2,
-      retryDelay: 1000
-    }
+  // Query Hook
+  const { data: systemInfoData, isLoading } = useQuery(
+    ['systemInfo'], '/api/system/info', { timeout: 15000, retries: 2, retryDelay: 1000 }
   );
 
-  // Define all mutation hooks next
+  // Clear Logs Mutation
   const clearLogsMutation = useMutation({
     mutationKey: ['clearLogs'],
     mutationFn: async () => {
-      return await fetchJSON('/api/system/logs/clear', {
-        method: 'POST',
-        timeout: 10000,
-        retries: 1
-      });
+      return await fetchJSON('/api/system/logs/clear', { method: 'POST', timeout: 10000, retries: 1 });
     },
     onSuccess: () => {
       showStatusMessage(t('system.logsCleared'));
       setLogs([]);
     },
     onError: (error) => {
-      console.error('Error clearing logs:', error);
       showStatusMessage(t('system.logsClearError', { message: error.message }));
     }
   });
 
-  // Then define all handler functions
-  const handleSetLogLevel = (newLevel) => {
-    console.log(`SystemView: Setting log level from ${logLevel} to ${newLevel}`);
-    setLogLevel(newLevel);
-    logLevelRef.current = newLevel;
-    localStorage.setItem('lightnvr_system_logLevel', newLevel);
-  };
-
-  const handleSetPollingInterval = (newInterval) => {
-    setPollingInterval(newInterval);
-    localStorage.setItem('lightnvr_system_pollingInterval', String(newInterval));
-  };
-
-  // useCallback with [] because it only reads logLevelRef.current (a ref, not state),
-  // giving a stable reference that won't trigger downstream effects on every render.
-  const handleLogsReceived = useCallback((newLogs) => {
-    console.log('SystemView received new logs:', newLogs.length);
-    const currentLogLevel = logLevelRef.current;
-    const filteredLogs = newLogs.filter(log => log_level_meets_minimum(log.level, currentLogLevel));
-    setLogs(filteredLogs);
-  }, []);
-
-  // Update hasData based on systemInfoData
-  useEffect(() => {
-    if (systemInfoData) {
-      setHasData(true);
-    }
-  }, [systemInfoData]);
-
   // Restart system mutation
   const restartSystemMutation = useMutation({
     mutationFn: async () => {
-      return await fetchJSON('/api/system/restart', {
-        method: 'POST',
-        timeout: 30000, // 30 second timeout for system restart
-        retries: 0      // No retries for system restart
-      });
+      return await fetchJSON('/api/system/restart', { method: 'POST', timeout: 30000, retries: 0 });
     },
     onMutate: () => {
       setIsRestarting(true);
@@ -205,161 +118,255 @@ export function SystemView() {
     },
     onSuccess: () => {
       showStatusMessage(t('system.systemRestartingWait'));
-      // Don't auto-reload here - let the RestartModal handle reconnection detection
     },
     onError: (error) => {
-      console.error('Error restarting system:', error);
-      // Only show error and reset state if it's not a network error
-      // (network errors are expected during restart)
       if (error.message && !error.message.includes('fetch') && !error.message.includes('network')) {
         showStatusMessage(t('system.restartError', { message: error.message }));
         setIsRestarting(false);
       }
-      // Otherwise, the restart was likely initiated successfully and the server is shutting down
     }
   });
 
-  // Update systemInfo state when data is loaded
-  useEffect(() => {
-    if (systemInfoData) {
-      setSystemInfo(systemInfoData);
+  // Export/Backup Mutation
+  const exportMigrationMutation = useMutation({
+    mutationFn: async () => {
+      showStatusMessage(
+        'Preparing system backup file, please wait...'
+      );
+  
+      // Trigger backend generate backup
+      const response = await fetch(
+        '/api/system/export',
+        {
+          method: 'POST'
+        }
+      );
+  
+      if (!response.ok) {
+        throw new Error(
+          'Failed to generate backup.'
+        );
+      }
+  
+      const result = await response.json();
+      
+      if (result.status !== 'success') {
+        throw new Error(
+          result.message ||
+          'Failed to generate backup.'
+        );
+      }
+      
+      const downloadUrl =
+        result.downloadUrl;
+  
+      // Tunggu file benar-benar siap
+      let fileReady = false;
+  
+      for (let i = 0; i < 20; i++) {
+        const headResponse = await fetch(
+          `${downloadUrl}?t=${Date.now()}`,
+          {
+            method: 'HEAD',
+            cache: 'no-store'
+          }
+        );
+  
+        const contentLength =
+          headResponse.headers.get(
+            'content-length'
+          );
+  
+        if (
+          headResponse.ok &&
+          contentLength &&
+          parseInt(contentLength) > 1024
+        ) {
+          fileReady = true;
+          break;
+        }
+  
+        await new Promise(resolve =>
+          setTimeout(resolve, 1000)
+        );
+      }
+  
+      if (!fileReady) {
+        throw new Error(
+          'Backup file is not ready.'
+        );
+      }
+  
+      // Timestamp nama download
+      const now = new Date();
+  
+      const timestamp =
+        `${now.getFullYear()}-` +
+        `${String(now.getMonth() + 1).padStart(2, '0')}-` +
+        `${String(now.getDate()).padStart(2, '0')}_` +
+        `${String(now.getHours()).padStart(2, '0')}-` +
+        `${String(now.getMinutes()).padStart(2, '0')}`;
+  
+      // Native browser download
+      const a = document.createElement('a');
+  
+      a.href =
+        `${downloadUrl}?download=${Date.now()}`;
+  
+      a.download =
+        `lightnvr-backup-config_${timestamp}.tar.gz`;
+  
+      document.body.appendChild(a);
+  
+      a.click();
+  
+      document.body.removeChild(a);
+  
+      return {
+        status: 'success',
+        message:
+          'Backup file successfully downloaded!'
+      };
+    },
+  
+    onSuccess: (data) => {
+      showStatusMessage(
+        data.message,
+        'success'
+      );
+    },
+  
+    onError: (err) => {
+      showStatusMessage(
+        `Export failed: ${err.message}`,
+        'error'
+      );
     }
-  }, [systemInfoData]);
+  });
 
-  // Component cleanup on unmount
-  useEffect(() => {
-    return () => {
-      console.log('SystemView component unmounting');
-    };
+  // Restore Mutation
+  const restoreSystemMutation = useMutation({
+    mutationFn: async (file) => {
+      showStatusMessage('Uploading and restoring system, please wait...');
+      const response = await fetch('/api/system/restore', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/octet-stream' },
+        body: file
+      });
+      if (!response.ok) throw new Error('Failed to upload backup file.');
+      return await response.json();
+    },
+    onSuccess: () => {
+      showStatusMessage('Restore successful! System will be restarted...', 'success');
+      
+      setTimeout(() => {
+        showStatusMessage(t('system.restartingSystem') || 'Initiating system restart...', 'info');
+        
+        if (setControlsModalRef.current) {
+          setControlsModalRef.current(true);
+        }
+        setIsRestarting(true);
+
+        setTimeout(() => {
+          fetch('/api/system/restart', { method: 'POST' })
+            .then(() => console.log('Reboot signal accepted.'))
+            .catch(() => console.log('Disconnected for reboot.'));
+        }, 1500);
+
+      }, 2500);
+    },
+    onError: (err) => {
+      showStatusMessage(`Restore error: ${err.message}`, 'error');
+    }
+  });
+
+  const handleFileChange = (event) => {
+    const file = event.target.files[0];
+    if (!file) return;
+    const confirmed = window.confirm(
+      "Are you sure you want to restore the system? This will overwrite existing configurations and database. This action cannot be undone."
+    );
+    if (confirmed) {
+      restoreSystemMutation.mutate(file);
+    } else {
+      showStatusMessage('Restore cancelled by user.', 'info');
+    }
+    event.target.value = '';
+  };
+
+  const handleSetLogLevel = (newLevel) => {
+    setLogLevel(newLevel);
+    logLevelRef.current = newLevel;
+    localStorage.setItem('lightnvr_system_logLevel', newLevel);
+  };
+
+  const handleLogsReceived = useCallback((newLogs) => {
+    const currentLogLevel = logLevelRef.current;
+    const filteredLogs = newLogs.filter(log => log_level_meets_minimum(log.level, currentLogLevel));
+    setLogs(filteredLogs);
   }, []);
 
-  // Clear logs function
-  const clearLogs = () => {
-    setShowClearLogsModal(true);
-  };
+  useEffect(() => { if (systemInfoData) setHasData(true); }, [systemInfoData]);
+  useEffect(() => { if (systemInfoData) setSystemInfo(systemInfoData); }, [systemInfoData]);
 
-  const handleClearLogsConfirm = () => {
-    clearLogsMutation.mutate();
-  };
-
-  // Restart system function (called when user confirms in modal)
   const handleRestartConfirm = () => {
     restartSystemMutation.mutate();
   };
-
-  // Component initialization
-  useEffect(() => {
-    console.log('SystemView component initialized');
-  }, []);
 
   return (
     <section id="system-page" className="page">
       <SystemControls
         onRestartConfirm={handleRestartConfirm}
+        onExportConfirm={() => exportMigrationMutation.mutate()}
+        onRestoreConfirm={() => fileInputRef.current?.click()}
         isRestarting={isRestarting}
         canControlSystem={canControlSystem}
+        onComponentLoad={(setModalState) => { setControlsModalRef.current = setModalState; }} // Ikat fungsi state di sini
       />
 
+      <input ref={fileInputRef} type="file" accept=".tar.gz" onChange={handleFileChange} style={{ display: 'none' }} />
+
       <ContentLoader
-        isLoading={isLoading}
-        hasData={hasData}
-        loadingMessage={t('system.loadingSystemInformation')}
-        emptyMessage={t('system.systemInformationUnavailable')}
+        isLoading={isLoading} hasData={hasData}
+        loadingMessage={t('system.loadingSystemInformation')} emptyMessage={t('system.systemInformationUnavailable')}
       >
-        <div className="mb-4 border-b border-border" role="tablist" aria-label={t('system.sections')}>
+        <div className="mb-4 border-b border-border" role="tablist">
           <div className="flex gap-2">
-            <button
-              type="button"
-              id="system-tab"
-              role="tab"
-              data-testid="system-tab"
-              aria-selected={activeTab === 'system'}
-              aria-controls="system-panel"
-              className={`rounded-t-lg px-4 py-2 text-sm font-medium transition-colors ${
-                activeTab === 'system'
-                  ? 'bg-card text-card-foreground border border-border border-b-0 -mb-px'
-                  : 'text-muted-foreground hover:text-foreground'
-              }`}
-              onClick={() => setActiveTab('system')}
-            >
+            <button type="button" className={`rounded-t-lg px-4 py-2 text-sm font-medium ${activeTab === 'system' ? 'bg-card border border-border border-b-0 -mb-px' : 'text-muted-foreground'}`} onClick={() => setActiveTab('system')}>
               {t('system.system')}
             </button>
-            <button
-              type="button"
-              id="versions-tab"
-              role="tab"
-              data-testid="versions-tab"
-              aria-selected={activeTab === 'versions'}
-              aria-controls="versions-panel"
-              className={`rounded-t-lg px-4 py-2 text-sm font-medium transition-colors ${
-                activeTab === 'versions'
-                  ? 'bg-card text-card-foreground border border-border border-b-0 -mb-px'
-                  : 'text-muted-foreground hover:text-foreground'
-              }`}
-              onClick={() => setActiveTab('versions')}
-            >
+            <button type="button" className={`rounded-t-lg px-4 py-2 text-sm font-medium ${activeTab === 'versions' ? 'bg-card border border-border border-b-0 -mb-px' : 'text-muted-foreground'}`} onClick={() => setActiveTab('versions')}>
               {t('system.versions')}
             </button>
           </div>
         </div>
 
         {activeTab === 'system' ? (
-          <div role="tabpanel" id="system-panel" aria-labelledby="system-tab">
+          <div>
             <div className="grid grid-cols-1 md:grid-cols-2 gap-4 mb-4">
               <SystemInfo systemInfo={systemInfo} formatUptime={formatUptime} />
               <MemoryStorage systemInfo={systemInfo} formatBytes={formatBytes} />
             </div>
-
             <div className="grid grid-cols-1 md:grid-cols-2 gap-4 mb-4">
               <StreamsInfo systemInfo={systemInfo} formatBytes={formatBytes} />
               <StorageHealth formatBytes={formatBytes} />
             </div>
-
             <div className="mb-4">
               <StreamStorage systemInfo={systemInfo} formatBytes={formatBytes} />
             </div>
-
             <div className="grid grid-cols-1 md:grid-cols-2 gap-4 mb-4">
               <NetworkInfo systemInfo={systemInfo} />
               <WebServiceInfo systemInfo={systemInfo} />
             </div>
-
-            <LogsView
-              logs={logs}
-              logLevel={logLevel}
-              logCount={logCount}
-              pollingInterval={pollingInterval}
-              setLogLevel={handleSetLogLevel}
-              setLogCount={setLogCount}
-              setPollingInterval={handleSetPollingInterval}
-              loadLogs={() => {
-                // Trigger a manual log refresh
-                console.log('Manually triggering log refresh');
-                const event = new CustomEvent('refresh-logs');
-                window.dispatchEvent(event);
-              }}
-              clearLogs={clearLogs}
-            />
-
-            <LogsPoller
-              logLevel={logLevel}
-              logCount={logCount}
-              pollingInterval={pollingInterval}
-              onLogsReceived={handleLogsReceived}
-            />
+            <LogsView logs={logs} logLevel={logLevel} logCount={logCount} pollingInterval={pollingInterval} setLogLevel={handleSetLogLevel} setLogCount={setLogCount} setPollingInterval={setPollingInterval} loadLogs={() => window.dispatchEvent(new CustomEvent('refresh-logs'))} clearLogs={() => setShowClearLogsModal(true)} />
+            <LogsPoller logLevel={logLevel} logCount={logCount} pollingInterval={pollingInterval} onLogsReceived={handleLogsReceived} />
           </div>
         ) : (
-          <div role="tabpanel" id="versions-panel" aria-labelledby="versions-tab">
-            <VersionsTable versions={systemInfo.versions} />
-          </div>
+          <VersionsTable versions={systemInfo.versions} />
         )}
       </ContentLoader>
 
-      <ClearLogsModal
-        isOpen={showClearLogsModal}
-        onClose={() => setShowClearLogsModal(false)}
-        onConfirm={handleClearLogsConfirm}
-      />
+      <ClearLogsModal isOpen={showClearLogsModal} onClose={() => setShowClearLogsModal(false)} onConfirm={() => clearLogsMutation.mutate()} />
     </section>
   );
 }

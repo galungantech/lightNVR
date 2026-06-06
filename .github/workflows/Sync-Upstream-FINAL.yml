@@ -1,0 +1,247 @@
+name: Sync Upstream FINAL
+
+on:
+  workflow_dispatch:
+    inputs:
+      target_branch:
+        description: "Pilih branch tujuan sync"
+        required: true
+        type: choice
+        options:
+          - sycn-main
+        default: "-"
+
+permissions:
+  contents: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+
+    steps:
+      # =========================================================
+      # CHECKOUT PAT_WORKFLOW : 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
+      # =========================================================
+      - name: Checkout destination repo
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.target_branch }}
+          token: ${{ secrets.PAT_WORKFLOW }}
+          fetch-depth: 0
+
+      # =========================================================
+      # SETUP GIT
+      # =========================================================
+      - name: Setup Git
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      # =========================================================
+      # FETCH UPSTREAM
+      # =========================================================
+      - name: Add upstream and fetch
+        run: |
+          git remote remove upstream || true
+          git remote add upstream https://github.com/rivandraa/lightnvr-modif.git
+          git fetch upstream main
+
+      # =========================================================
+      # GET COMMIT RANGE
+      # =========================================================
+      - name: Get upstream commits
+        id: commits
+        run: |
+          LATEST=$(git rev-parse upstream/main)
+
+          if [ -f .last-upstream-commit ]; then
+            LAST=$(cat .last-upstream-commit)
+          else
+            LAST=$(git rev-parse upstream/main~1)
+          fi
+
+          echo "latest=$LATEST" >> $GITHUB_OUTPUT
+          echo "last=$LAST" >> $GITHUB_OUTPUT
+
+      # =========================================================
+      # DETERMINE CHANGED FILES
+      # =========================================================
+      - name: Determine changed files
+        id: changed
+        run: |
+          git diff --name-only \
+            ${{ steps.commits.outputs.last }} \
+            ${{ steps.commits.outputs.latest }} \
+            > changed_files.txt || true
+
+          echo "Changed files:"
+          cat changed_files.txt || true
+
+          if [ ! -s changed_files.txt ]; then
+            echo "no_changes=true" >> $GITHUB_OUTPUT
+          else
+            echo "no_changes=false" >> $GITHUB_OUTPUT
+          fi
+
+      # =========================================================
+      # MERGE FILE BY FILE (SAFE)
+      # =========================================================
+      - name: Merge upstream changes safely
+        if: steps.changed.outputs.no_changes == 'false'
+        run: |
+          HAS_CONFLICTS="false"
+
+          while IFS= read -r file || [ -n "$file" ]; do
+
+            [ -z "$file" ] && continue
+
+            echo "🔄 Processing: $file"
+
+            LOCAL_FILE="$file"
+
+            BASE_FILE=".git/base.tmp"
+            UPSTREAM_FILE=".git/upstream.tmp"
+
+            mkdir -p "$(dirname "$LOCAL_FILE")"
+
+            # BASE (old upstream version)
+            git show "${{ steps.commits.outputs.last }}:$file" \
+              > "$BASE_FILE" 2>/dev/null || touch "$BASE_FILE"
+
+            # UPSTREAM (new upstream version)
+            git show "upstream/main:$file" \
+              > "$UPSTREAM_FILE" 2>/dev/null || true
+
+            # FILE BARU DARI UPSTREAM
+            if [ ! -f "$LOCAL_FILE" ]; then
+              cp "$UPSTREAM_FILE" "$LOCAL_FILE"
+              echo "🆕 New file from upstream"
+              continue
+            fi
+
+            # FILE DIHAPUS DI UPSTREAM
+            if [ ! -s "$UPSTREAM_FILE" ]; then
+              echo "❌ Deleted upstream file: $file"
+              rm -f "$LOCAL_FILE"
+              continue
+            fi
+
+            # MERGE MANUAL
+            if ! git merge-file -p \
+              -L LOCAL \
+              -L BASE \
+              -L UPSTREAM \
+              "$LOCAL_FILE" \
+              "$BASE_FILE" \
+              "$UPSTREAM_FILE" \
+              > "$LOCAL_FILE.merged"; then
+
+              echo "⚠️ Conflict detected: $file"
+              HAS_CONFLICTS="true"
+            fi
+
+            mv "$LOCAL_FILE.merged" "$LOCAL_FILE"
+
+          done < changed_files.txt
+
+          echo "HAS_CONFLICTS=$HAS_CONFLICTS" >> $GITHUB_ENV
+
+      # =========================================================
+      # SAVE LAST UPSTREAM COMMIT
+      # =========================================================
+      - name: Save latest upstream commit
+        if: steps.changed.outputs.no_changes == 'false'
+        run: |
+          echo "${{ steps.commits.outputs.latest }}" > .last-upstream-commit
+
+      # =========================================================
+      # COMMIT
+      # =========================================================
+      - name: Commit changes
+        if: steps.changed.outputs.no_changes == 'false'
+        run: |
+          git add -A
+
+          if git diff --cached --quiet; then
+            echo "No changes to commit"
+            exit 0
+          fi
+
+          if grep -qr '<<<<<<< LOCAL' .; then
+            COMMIT_MSG="⚠️ Sync upstream with conflicts"
+          else
+            COMMIT_MSG="Sync upstream"
+          fi
+
+          git commit -m "$COMMIT_MSG"
+
+      # =========================================================
+      # PUSH
+      # =========================================================
+      - name: Push changes
+        if: steps.changed.outputs.no_changes == 'false'
+        run: |
+          git remote set-url origin \
+          https://x-access-token:${{ secrets.PAT_WORKFLOW }}@github.com/${{ github.repository }}.git
+
+          git push origin HEAD:${{ github.event.inputs.target_branch }}
+
+      # =========================================================
+      # TELEGRAM
+      # =========================================================
+      - name: Notify Telegram
+        if: always()
+        run: |
+          REPO_URL="https://github.com/${{ github.repository }}"
+          BRANCH="${{ github.event.inputs.target_branch }}"
+
+          FILES=$(git diff --name-status \
+            ${{ steps.commits.outputs.last }} \
+            ${{ steps.commits.outputs.latest }} \
+            | grep -v "^.github/workflows/" || true)
+
+          if [ -z "$FILES" ]; then
+            MSG=$(printf "🛎️ Sync selesai\n\nTidak ada update dari upstream.")
+          else
+
+            MSG=$(printf "🛎️ *Sync dari upstream selesai*\n")
+            
+            CURRENT_FOLDER=""
+            
+            while read status path; do
+            
+              [ -z "$path" ] && continue
+            
+              FOLDER=$(dirname "$path")
+              FILE=$(basename "$path")
+            
+              [ "$FOLDER" = "." ] && FOLDER="root"
+            
+              case "$status" in
+                A*) ICON="🆕";;
+                M*) ICON="✏️";;
+                D*) ICON="❌";;
+                *)  ICON="📄";;
+              esac
+            
+              # Folder baru
+              if [ "$FOLDER" != "$CURRENT_FOLDER" ]; then
+                MSG+=$'\n'
+                MSG+="📁 $FOLDER/ :"$'\n'
+                CURRENT_FOLDER="$FOLDER"
+              fi
+            
+              MSG+="$ICON [$FILE]($REPO_URL/blob/$BRANCH/$path)"$'\n'
+            
+            done <<< "$FILES"
+
+            if [ "$HAS_CONFLICTS" = "true" ]; then
+              MSG+=$(printf "\n⚠️ *Conflict marker detected*")
+            fi
+          fi
+
+          curl -s -X POST \
+            "https://api.telegram.org/bot${{ secrets.TELEGRAM_TOKEN }}/sendMessage" \
+            -d chat_id="${{ secrets.TELEGRAM_CHAT_ID }}" \
+            --data-urlencode "text=$MSG" \
+            -d parse_mode="Markdown"
