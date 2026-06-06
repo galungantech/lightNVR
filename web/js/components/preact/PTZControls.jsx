@@ -259,7 +259,7 @@ export function PTZControls({
       : e.clientY;
 
     dragData.current.offsetX =
-      clientX - position.x;
+      clientX + position.x;
 
     dragData.current.offsetY =
       clientY + position.y;
@@ -281,7 +281,7 @@ export function PTZControls({
       : e.clientY;
 
     let newX =
-      clientX - dragData.current.offsetX;
+      dragData.current.offsetX - clientX;
 
     let newY =
       dragData.current.offsetY - clientY;
@@ -457,7 +457,7 @@ export function PTZControls({
       className="ptz-controls"
       style={{
         position: 'absolute',
-        left: `${position.x}px`,
+        right: `${position.x}px`,
         bottom: `${position.y}px`,
         backgroundColor: 'rgba(0, 0, 0, 0.25)',
         borderRadius: '8px',
