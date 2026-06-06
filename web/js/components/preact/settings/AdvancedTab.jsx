@@ -7,38 +7,6 @@
  */
 
 export function AdvancedTab({ settings, handleInputChange, canModifySettings, t }) {
-
-  // ==========================================
-  // LOGIKA BACKUP & RESTORE BERBASIS API C
-  // ==========================================
-  const handleBackupConfig = async () => {
-    try {
-      const response = await fetch('/api/system/backup', { method: 'POST' });
-      const data = await response.json();
-      alert(data.message);
-    } catch (err) {
-      alert('Gagal menghubungi server untuk memproses backup.');
-    }
-  };
-
-  const handleRestoreConfig = async () => {
-    const confirmMessage = t('settings.restoreConfirm') !== 'settings.restoreConfirm' 
-      ? t('settings.restoreConfirm') 
-      : "⚠️ PERINGATAN: Seluruh konfigurasi aktif saat ini akan ditimpa! Sistem akan restart otomatis setelah restore. Lanjutkan?";
-
-    if (confirm(confirmMessage)) {
-      try {
-        const response = await fetch('/api/system/restore', { method: 'POST' });
-        const data = await response.json();
-        alert(data.message);
-        // Refresh halaman otomatis setelah 6 detik saat service backend sudah UP kembali
-        setTimeout(() => { window.location.reload(); }, 6000);
-      } catch (err) {
-        alert('Gagal mengirim perintah restore ke server backend.');
-      }
-    }
-  };
-
   return (
     <div class="space-y-6">
       {/* Memory optimization */}
@@ -216,35 +184,6 @@ export function AdvancedTab({ settings, handleInputChange, canModifySettings, t 
           </div>
         </div>
       </div>
-
-      {/* New Panel: Maintenance Backup & Restore Konfigurasi */}
-      <div class="settings-group bg-card text-card-foreground rounded-lg shadow p-6 mb-6" data-setting-label="backup restore maintenance konfigurasi">
-        <h3 class="text-lg font-semibold mb-4 pb-2 border-b border-border flex items-center gap-2">
-          <span>🛠️</span> {t('settings.maintenanceTitle') !== 'settings.maintenanceTitle' ? t('settings.maintenanceTitle') : 'Maintenance Konfigurasi'}
-        </h3>
-        <p class="text-sm text-muted-foreground mb-4">
-          {t('settings.maintenanceDesc') !== 'settings.maintenanceDesc' 
-            ? t('settings.maintenanceDesc') 
-            : 'Cadangkan database utama beserta file konfigurasi ke folder /root, atau pulihkan dari cadangan terakhir yang tersedia.'}
-        </p>
-        <div class="flex flex-wrap gap-4">
-          <button 
-            type="button"
-            onClick={handleBackupConfig} 
-            class="px-5 py-2.5 bg-blue-600 hover:bg-blue-700 text-white rounded font-medium text-sm transition-colors duration-200 min-h-11 shadow-sm focus:outline-none focus:ring-2 focus:ring-blue-500 focus:ring-offset-2"
-          >
-            📦 Backup
-          </button>
-          <button 
-            type="button"
-            onClick={handleRestoreConfig} 
-            class="px-5 py-2.5 bg-destructive hover:bg-destructive/90 text-destructive-foreground rounded font-medium text-sm transition-colors duration-200 min-h-11 shadow-sm focus:outline-none focus:ring-2 focus:ring-destructive focus:ring-offset-2"
-          >
-            🔄 Restore
-          </button>
-        </div>
-      </div>
-
     </div>
   );
 }
