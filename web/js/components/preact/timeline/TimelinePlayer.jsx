@@ -471,12 +471,12 @@ export function TimelinePlayer({ videoElementRef = null, autoFullscreen = false 
       return;
     }
 
-    // === POSISI KODE BARU YANG HARUS KAMU MASUKKAN ===
-//    if (video.playbackRate > 1) {
-//      updateTimeDisplay(currentTime, segment);
-//      lastTimeUpdateRef.current = currentTime;
-//      return; // Berhenti di sini, jangan update state global timeline
-//    }
+    // Bypass global state updates during fast-forward to optimize UI performance
+    if (video.playbackRate > 1) {
+      updateTimeDisplay(currentTime, segment);
+      lastTimeUpdateRef.current = currentTime;
+      return;
+    }
     
     // Update timeline state with the current time
     timelineState.setState({
