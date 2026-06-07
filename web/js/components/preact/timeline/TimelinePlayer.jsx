@@ -912,12 +912,19 @@ export function TimelinePlayer({ videoElementRef = null, autoFullscreen = false 
               const videoEl = e.currentTarget.parentElement?.querySelector('video');
               if (!videoEl) return;
           
-              // Sekali klik langsung instan Play atau Pause
-              if (videoEl.paused) {
-                videoEl.play().catch(err => console.log("Play error:", err));
-              } else {
-                videoEl.pause();
+              // Biarkan klik-klik cepat (multi-tap) lolos ke elemen video di bawahnya
+              // untuk memicu fitur maju/mundur bawaan browser yang sudah kamu sukai
+              if (e.detail === 1) {
+                if (videoEl.paused) {
+                  videoEl.play().catch(err => console.log("Play error:", err));
+                } else {
+                  videoEl.pause();
+                }
               }
+            }}
+            onDblClick={() => {
+              // Menyamakan fungsi double click fullscreen agar lancar seperti UI.jsx
+              handleToggleFullscreen();
             }}
           />
           
