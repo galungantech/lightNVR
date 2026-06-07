@@ -898,129 +898,25 @@ export function TimelinePlayer({ videoElementRef = null, autoFullscreen = false 
               since the video's own ondblclick is shadowed by this guard.
               The guard stops just above the native controls bar (~40 px) so
               play/pause, seek, and volume controls remain accessible. */}
-<div 
+          <div 
             style={{
               position: 'absolute', 
               top: 0, 
               left: 0, 
-              width: '100%',
-              height: 'calc(100% - 45px)', 
+              right: 0, 
+              bottom: '65px', 
               zIndex: 1,
-              cursor: 'pointer',
-              touchAction: 'none',
-              // === TAMBAHKAN DUA BARIS CSS INI ===
-              WebkitTouchCallout: 'none', // Mematikan menu pop-up download di iOS / Safari
-              userSelect: 'none'          // Mematikan seleksi elemen di Android / Chrome
+              cursor: 'pointer'
             }} 
-            // === TAMBAHKAN EVENT INI UNTUK MEMBLOKIR DOWNLOAD DI ANDROID ===
-            onContextMenu={(e) => {
-              e.preventDefault(); // Mematikan menu klik kanan / menu download saat ditahan
-            }}
             onClick={(e) => {
               const videoEl = e.currentTarget.parentElement?.querySelector('video');
               if (!videoEl) return;
-              
-              if (e.currentTarget.wasHolding) {
-                e.currentTarget.wasHolding = false;
-                return;
-              }
           
+              // Sekali klik langsung instan Play atau Pause
               if (videoEl.paused) {
                 videoEl.play().catch(err => console.log("Play error:", err));
               } else {
                 videoEl.pause();
-              }
-            }}
-            
-            // --- LOGIKA UTAMA KLIK DAN TAHAN (MUNDUR / MAJU 4X) ---
-            onTouchStart={(e) => {
-              // Blokir perilaku default browser seluler agar tidak memicu download
-              if (e.cancelable) e.preventDefault(); 
-              
-              const rect = e.currentTarget.getBoundingClientRect();
-              const touchX = e.touches[0].clientX - rect.left;
-              const isRightSide = touchX > rect.width / 2;
-              
-              const videoEl = e.currentTarget.parentElement?.querySelector('video');
-              if (!videoEl) return;
-          
-              e.currentTarget.holdTimer = setTimeout(() => {
-                e.currentTarget.isHolding = true;
-                e.currentTarget.wasHolding = true;
-          
-                if (isRightSide) {
-                  videoEl.playbackRate = 4;
-                } else {
-                  videoEl.pause();
-                  e.currentTarget.rewindInterval = setInterval(() => {
-                    videoEl.currentTime = Math.max(0, videoEl.currentTime - 1.5);
-                  }, 120);
-                }
-              }, 350); 
-            }}
-
-            onTouchEnd={(e) => {
-              clearTimeout(e.currentTarget.holdTimer);
-              if (e.currentTarget.rewindInterval) {
-                clearInterval(e.currentTarget.rewindInterval);
-              }
-              const videoEl = e.currentTarget.parentElement?.querySelector('video');
-              if (videoEl) {
-                videoEl.playbackRate = 1;
-                if (e.currentTarget.isHolding) {
-                  videoEl.play().catch(() => {});
-                  e.currentTarget.isHolding = false;
-                }
-              }
-            }}
-
-            onMouseDown={(e) => {
-              const rect = e.currentTarget.getBoundingClientRect();
-              const clickX = e.clientX - rect.left;
-              const isRightSide = clickX > rect.width / 2;
-              const videoEl = e.currentTarget.parentElement?.querySelector('video');
-              if (!videoEl) return;
-
-              e.currentTarget.holdTimer = setTimeout(() => {
-                e.currentTarget.isHolding = true;
-                e.currentTarget.wasHolding = true;
-
-                if (isRightSide) {
-                  videoEl.playbackRate = 4;
-                } else {
-                  videoEl.pause();
-                  e.currentTarget.rewindInterval = setInterval(() => {
-                    videoEl.currentTime = Math.max(0, videoEl.currentTime - 1.5);
-                  }, 120);
-                }
-              }, 350);
-            }}
-
-            onMouseUp={(e) => {
-              clearTimeout(e.currentTarget.holdTimer);
-              if (e.currentTarget.rewindInterval) {
-                clearInterval(e.currentTarget.rewindInterval);
-              }
-              const videoEl = e.currentTarget.parentElement?.querySelector('video');
-              if (videoEl) {
-                videoEl.playbackRate = 1;
-                if (e.currentTarget.isHolding) {
-                  videoEl.play().catch(() => {});
-                  e.currentTarget.isHolding = false;
-                }
-              }
-            }}
-
-            onMouseLeave={(e) => {
-              clearTimeout(e.currentTarget.holdTimer);
-              if (e.currentTarget.rewindInterval) {
-                clearInterval(e.currentTarget.rewindInterval);
-              }
-              const videoEl = e.currentTarget.parentElement?.querySelector('video');
-              if (videoEl && e.currentTarget.isHolding) {
-                videoEl.playbackRate = 1;
-                videoEl.play().catch(() => {});
-                e.currentTarget.isHolding = false;
               }
             }}
           />
