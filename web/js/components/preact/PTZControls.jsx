@@ -194,7 +194,7 @@ export function PTZControls({
 
   const [position, setPosition] = useState({
     x: 10,
-    y: 60
+    y: 65
   });
 
   const dragData = useRef({
