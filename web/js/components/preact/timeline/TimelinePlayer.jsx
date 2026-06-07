@@ -901,14 +901,32 @@ export function TimelinePlayer({ videoElementRef = null, autoFullscreen = false 
               play/pause, seek, and volume controls remain accessible. */}
           <div
             style={{
-              position: 'absolute',
-              top: 0,
-              left: 0,
-              right: 0,
-              bottom: '60px',
+              position: 'absolute', 
+              top: 0, 
+              left: 0, 
+              right: 0, 
+              bottom: '40px', 
               zIndex: 1,
-            }}
-            onDblClick={() => handleToggleFullscreen()}
+              cursor: 'pointer'
+            }} 
+            onClick={(e) => {
+              // Jika komponen video tidak ditemukan, hentikan proses
+              const videoEl = e.currentTarget.parentElement?.querySelector('video');
+              if (!videoEl) return;
+          
+              // Logika pendeteksi Double Click / Double Tap manual
+              if (e.detail === 1) {
+                // Ketuk 1 kali: Cek status video, jika sedang pause maka PLAY, jika sedang jalan maka PAUSE
+                if (videoEl.paused) {
+                  videoEl.play().catch(err => console.log("Play error:", err));
+                } else {
+                  videoEl.pause();
+                }
+              } else if (e.detail === 2) {
+                // Ketuk 2 kali (Double Click): Picu fungsi Fullscreen bawaan aplikasi
+                handleToggleFullscreen();
+              }
+            }} 
           />
 
           {/* Detection overlay canvas */}
