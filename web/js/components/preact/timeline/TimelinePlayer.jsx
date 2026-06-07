@@ -882,6 +882,7 @@ export function TimelinePlayer({ videoElementRef = null, autoFullscreen = false 
               ref={setVideoRefs}
               className="w-full h-full object-contain"
               controls
+              ondblclick={() => handleToggleFullscreen()}
               autoPlay={false}
               muted={false}
               playsInline
@@ -891,43 +892,6 @@ export function TimelinePlayer({ videoElementRef = null, autoFullscreen = false 
               onTimeUpdate={handleTimeUpdate}
           ></video>
 
-          {/* Click guard — sits above the video surface to intercept Firefox's
-              native click-to-play/pause behaviour.  pointerdown events still
-              propagate to the document so the fine-mode keyboard-nav handler
-              works normally.  Double-click forwards to the fullscreen toggle
-              since the video's own ondblclick is shadowed by this guard.
-              The guard stops just above the native controls bar (~40 px) so
-              play/pause, seek, and volume controls remain accessible. */}
-          <div 
-            style={{
-              position: 'absolute', 
-              top: 0, 
-              left: 0, 
-              right: 0, 
-              bottom: '65px', 
-              zIndex: 1,
-              cursor: 'pointer'
-            }} 
-            onClick={(e) => {
-              const videoEl = e.currentTarget.parentElement?.querySelector('video');
-              if (!videoEl) return;
-          
-              // Biarkan klik-klik cepat (multi-tap) lolos ke elemen video di bawahnya
-              // untuk memicu fitur maju/mundur bawaan browser yang sudah kamu sukai
-              if (e.detail === 1) {
-                if (videoEl.paused) {
-                  videoEl.play().catch(err => console.log("Play error:", err));
-                } else {
-                  videoEl.pause();
-                }
-              }
-            }}
-            onDblClick={() => {
-              // Menyamakan fungsi double click fullscreen agar lancar seperti UI.jsx
-              handleToggleFullscreen();
-            }}
-          />
-          
           {/* Detection overlay canvas */}
           {detectionOverlayEnabled && (
             <canvas
