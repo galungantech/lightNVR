@@ -882,7 +882,6 @@ export function TimelinePlayer({ videoElementRef = null, autoFullscreen = false 
               ref={setVideoRefs}
               className="w-full h-full object-contain"
               controls
-              controlsList="nofullscreen"
               autoPlay={false}
               muted={false}
               playsInline
@@ -900,41 +899,121 @@ export function TimelinePlayer({ videoElementRef = null, autoFullscreen = false 
               The guard stops just above the native controls bar (~40 px) so
               play/pause, seek, and volume controls remain accessible. */}
           <div 
-            style={{
-              position: 'absolute', 
-              top: 0, 
-              left: 0, 
-              right: 0, 
-              bottom: '40px', 
-              zIndex: 1,
-              cursor: 'pointer'
-            }} 
-            onClick={(e) => {
-              const videoEl = e.currentTarget.parentElement?.querySelector('video');
-              if (!videoEl) return;
-          
-              // Ambil atau inisialisasi timer di elemen untuk menyimpan status jeda
-              if (!e.currentTarget.clickTimer) {
-                e.currentTarget.clickTimer = setTimeout(() => {
-                  // --- JIKA HANYA KETUK 1 KALI ---
-                  if (videoEl.paused) {
-                    videoEl.play().catch(err => console.log("Play error:", err));
+              style={{
+                position: 'absolute', 
+                top: 0, 
+                left: 0, 
+                right: 0, 
+                bottom: '40px', 
+                zIndex: 1,
+                cursor: 'pointer'
+              }} 
+              onClick={(e) => {
+                // Pastikan klik biasa (tap cepat) tetap berfungsi sebagai Play/Pause instan
+                const videoEl = e.currentTarget.parentElement?.querySelector('video');
+                if (!videoEl) return;
+                
+                // Cegah trigger jika baru saja selesai melakukan tekan-tahan (agar video tidak ter-pause otomatis)
+                if (e.currentTarget.wasHolding) {
+                  e.currentTarget.wasHolding = false;
+                  return;
+                }
+            
+                if (videoEl.paused) {
+                  videoEl.play().catch(err => console.log("Play error:", err));
+                } else {
+                  videoEl.pause();
+                }
+              }}
+              
+              // --- LOGIKA UTAMA KLIK DAN TAHAN (PRESS AND HOLD) ---
+              onTouchStart={(e) => {
+                const rect = e.currentTarget.getBoundingClientRect();
+                const touchX = e.touches[0].clientX - rect.left;
+                const isRightSide = touchX > rect.width / 2;
+                
+                const videoEl = e.currentTarget.parentElement?.querySelector('video');
+                if (!videoEl) return;
+            
+                // Setel timer: jika ditahan lebih dari 400ms, aktifkan mode cepat
+                e.currentTarget.holdTimer = setTimeout(() => {
+                  e.currentTarget.isHolding = true;
+                  e.currentTarget.wasHolding = true; // Flag agar onClick biasa tidak terpicu saat dilepas
+            
+                  if (isRightSide) {
+                    // Tahan di KANAN: Percepat video ke 4x
+                    videoEl.playbackRate = 4;
+                  } else {
+                    // Tahan di KIRI: Mundur cepat secara berkala (Setiap 100ms mundur 1 detik)
+                    videoEl.pause(); // Di-pause dulu agar proses mundurnya tidak tabrakan dengan video yang jalan maju
+                    e.currentTarget.rewindInterval = setInterval(() => {
+                      videoEl.currentTime = Math.max(0, videoEl.currentTime - 1);
+                    }, 100);
+                  }
+                }, 400);
+              }}
+  
+              onTouchEnd={(e) => {
+                clearTimeout(e.currentTarget.holdTimer);
+                if (e.currentTarget.rewindInterval) {
+                  clearInterval(e.currentTarget.rewindInterval);
+                }
+                const videoEl = e.currentTarget.parentElement?.querySelector('video');
+                if (videoEl && e.currentTarget.isHolding) {
+                  videoEl.playbackRate = 1;
+                  videoEl.play().catch(() => {}); // Jalankan lagi setelah dilepas dari mode mundur
+                  e.currentTarget.isHolding = false;
+                }
+              }}
+  
+              onMouseDown={(e) => {
+                const rect = e.currentTarget.getBoundingClientRect();
+                const clickX = e.clientX - rect.left;
+                const isRightSide = clickX > rect.width / 2;
+                const videoEl = e.currentTarget.parentElement?.querySelector('video');
+                if (!videoEl) return;
+  
+                e.currentTarget.holdTimer = setTimeout(() => {
+                  e.currentTarget.isHolding = true;
+                  e.currentTarget.wasHolding = true;
+  
+                  if (isRightSide) {
+                    videoEl.playbackRate = 4;
                   } else {
                     videoEl.pause();
+                    e.currentTarget.rewindInterval = setInterval(() => {
+                      videoEl.currentTime = Math.max(0, videoEl.currentTime - 1);
+                    }, 100);
                   }
-                  // Hapus timer setelah dieksekusi
-                  e.currentTarget.clickTimer = null;
-                }, 250); // Jeda waktu menunggu ketukan kedua (250 milidetik)
-              } else {
-                // --- JIKA KETUKAN KEDUA MASUK SEBELUM 250MS (DOUBLE CLICK) ---
-                clearTimeout(e.currentTarget.clickTimer);
-                e.currentTarget.clickTimer = null;
-                
-                // Jalankan fullscreen saja tanpa mengganggu Play/Pause video
-                handleToggleFullscreen();
-              }
-            }} 
-          />
+                }, 400);
+              }}
+  
+              onMouseUp={(e) => {
+                clearTimeout(e.currentTarget.holdTimer);
+                if (e.currentTarget.rewindInterval) {
+                  clearInterval(e.currentTarget.rewindInterval);
+                }
+                const videoEl = e.currentTarget.parentElement?.querySelector('video');
+                if (videoEl && e.currentTarget.isHolding) {
+                  videoEl.playbackRate = 1;
+                  videoEl.play().catch(() => {});
+                  e.currentTarget.isHolding = false;
+                }
+              }}
+  
+              onMouseLeave={(e) => {
+                clearTimeout(e.currentTarget.holdTimer);
+                if (e.currentTarget.rewindInterval) {
+                  clearInterval(e.currentTarget.rewindInterval);
+                }
+                const videoEl = e.currentTarget.parentElement?.querySelector('video');
+                if (videoEl && e.currentTarget.isHolding) {
+                  videoEl.playbackRate = 1;
+                  videoEl.play().catch(() => {});
+                  e.currentTarget.isHolding = false;
+                }
+              }}
+            />
 
           {/* Detection overlay canvas */}
           {detectionOverlayEnabled && (
