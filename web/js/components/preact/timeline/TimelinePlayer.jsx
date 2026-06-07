@@ -764,23 +764,28 @@ export function TimelinePlayer({ videoElementRef = null, autoFullscreen = false 
     };
   }, [detectionOverlayEnabled, drawTimelineDetections]);
 
-  const handleToggleFullscreen = useCallback(async () => {
+  const handleToggleFullscreen = useCallback(() => {
     const container = videoContainerRef.current;
     if (!container) return;
-
+  
     try {
       const fullscreenElement = document.fullscreenElement || document.webkitFullscreenElement;
+      
       if (fullscreenElement === container) {
         if (document.exitFullscreen) {
-          await document.exitFullscreen();
+          document.exitFullscreen().catch(err => console.error(err));
         } else if (document.webkitExitFullscreen) {
           document.webkitExitFullscreen();
         }
         return;
       }
-
+  
+      // Bagian ini yang diubah: Menghapus 'await' dan menggantinya dengan '.catch()'
       if (container.requestFullscreen) {
-        await container.requestFullscreen();
+        container.requestFullscreen().catch(error => {
+          console.error('Error requesting fullscreen:', error);
+          showStatusMessage(t('timeline.couldNotToggleFullscreen', { message: error.message }), 'error');
+        });
       } else if (container.webkitRequestFullscreen) {
         container.webkitRequestFullscreen();
       } else if (container.msRequestFullscreen) {
@@ -793,7 +798,7 @@ export function TimelinePlayer({ videoElementRef = null, autoFullscreen = false 
       showStatusMessage(t('timeline.couldNotToggleFullscreen', { message: error.message }), 'error');
     }
   }, [t]);
-
+  
   // Get current segment ID
   const currentSegmentId = (currentSegmentIndex >= 0 && segments.length > 0 && currentSegmentIndex < segments.length)
     ? segments[currentSegmentIndex].id : null;
