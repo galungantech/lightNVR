@@ -899,7 +899,7 @@ export function TimelinePlayer({ videoElementRef = null, autoFullscreen = false 
               since the video's own ondblclick is shadowed by this guard.
               The guard stops just above the native controls bar (~40 px) so
               play/pause, seek, and volume controls remain accessible. */}
-          <div
+          <div 
             style={{
               position: 'absolute', 
               top: 0, 
@@ -910,20 +910,27 @@ export function TimelinePlayer({ videoElementRef = null, autoFullscreen = false 
               cursor: 'pointer'
             }} 
             onClick={(e) => {
-              // Jika komponen video tidak ditemukan, hentikan proses
               const videoEl = e.currentTarget.parentElement?.querySelector('video');
               if (!videoEl) return;
           
-              // Logika pendeteksi Double Click / Double Tap manual
-              if (e.detail === 1) {
-                // Ketuk 1 kali: Cek status video, jika sedang pause maka PLAY, jika sedang jalan maka PAUSE
-                if (videoEl.paused) {
-                  videoEl.play().catch(err => console.log("Play error:", err));
-                } else {
-                  videoEl.pause();
-                }
-              } else if (e.detail === 2) {
-                // Ketuk 2 kali (Double Click): Picu fungsi Fullscreen bawaan aplikasi
+              // Ambil atau inisialisasi timer di elemen untuk menyimpan status jeda
+              if (!e.currentTarget.clickTimer) {
+                e.currentTarget.clickTimer = setTimeout(() => {
+                  // --- JIKA HANYA KETUK 1 KALI ---
+                  if (videoEl.paused) {
+                    videoEl.play().catch(err => console.log("Play error:", err));
+                  } else {
+                    videoEl.pause();
+                  }
+                  // Hapus timer setelah dieksekusi
+                  e.currentTarget.clickTimer = null;
+                }, 250); // Jeda waktu menunggu ketukan kedua (250 milidetik)
+              } else {
+                // --- JIKA KETUKAN KEDUA MASUK SEBELUM 250MS (DOUBLE CLICK) ---
+                clearTimeout(e.currentTarget.clickTimer);
+                e.currentTarget.clickTimer = null;
+                
+                // Jalankan fullscreen saja tanpa mengganggu Play/Pause video
                 handleToggleFullscreen();
               }
             }} 
