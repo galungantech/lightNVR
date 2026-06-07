@@ -866,7 +866,6 @@ export function VideoModal({ isOpen, onClose, videoUrl, title, downloadUrl }) {
                 ref={videoRef}
                 className={isFullscreen ? 'w-full h-full object-contain' : 'w-full h-full max-w-full max-h-full object-contain'}
                 controls
-                controlsList="nofullscreen"
                 key={videoUrl} /* Add key to force re-render when URL changes */
                 onError={(e) => {
                   console.error('Video error:', e);
