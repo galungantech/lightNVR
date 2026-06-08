@@ -882,7 +882,7 @@ export function TimelinePlayer({ videoElementRef = null, autoFullscreen = false 
               ref={setVideoRefs}
               className="w-full h-full object-contain"
               controls
-              ondblclick={() => handleToggleFullscreen()}
+              onDblClick={() => handleToggleFullscreen()}
               autoPlay={false}
               muted={false}
               playsInline
