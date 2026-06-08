@@ -767,31 +767,33 @@ export function TimelinePlayer({ videoElementRef = null, autoFullscreen = false 
   const handleToggleFullscreen = useCallback(async () => {
     const container = videoContainerRef.current;
     if (!container) return;
-  
+
     try {
-      if (document.fullscreenElement) {
-        await document.exitFullscreen();
+      const fullscreenElement = document.fullscreenElement || document.webkitFullscreenElement;
+      if (fullscreenElement === container) {
+        if (document.exitFullscreen) {
+          await document.exitFullscreen();
+        } else if (document.webkitExitFullscreen) {
+          document.webkitExitFullscreen();
+        }
         return;
       }
-  
-      await container.requestFullscreen({
-        navigationUI: 'hide'
-      });
-  
+
+      if (container.requestFullscreen) {
+        await container.requestFullscreen();
+      } else if (container.webkitRequestFullscreen) {
+        container.webkitRequestFullscreen();
+      } else if (container.msRequestFullscreen) {
+        container.msRequestFullscreen();
+      } else {
+        showStatusMessage(t('timeline.fullscreenNotSupported'), 'warning');
+      }
     } catch (error) {
-      console.error('Fullscreen error:', {
-        name: error.name,
-        message: error.message,
-        error
-      });
-  
-      showStatusMessage(
-        `Fullscreen error: ${error.message}`,
-        'error'
-      );
+      console.error('Error toggling fullscreen:', error);
+      showStatusMessage(t('timeline.couldNotToggleFullscreen', { message: error.message }), 'error');
     }
   }, [t]);
-  
+
   // Get current segment ID
   const currentSegmentId = (currentSegmentIndex >= 0 && segments.length > 0 && currentSegmentIndex < segments.length)
     ? segments[currentSegmentIndex].id : null;
@@ -880,6 +882,7 @@ export function TimelinePlayer({ videoElementRef = null, autoFullscreen = false 
               ref={setVideoRefs}
               className="w-full h-full object-contain"
               controls
+              controlsList="nofullscreen"
               autoPlay={false}
               muted={false}
               playsInline
