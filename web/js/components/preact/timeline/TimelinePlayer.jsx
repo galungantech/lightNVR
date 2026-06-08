@@ -764,6 +764,19 @@ export function TimelinePlayer({ videoElementRef = null, autoFullscreen = false 
     };
   }, [detectionOverlayEnabled, drawTimelineDetections]);
 
+  useEffect(() => {
+    const video = videoRef.current;
+    if (!video) return;
+  
+    video.ondblclick = () => {
+      handleToggleFullscreen();
+    };
+  
+    return () => {
+      video.ondblclick = null;
+    };
+  }, [handleToggleFullscreen]);
+
   const handleToggleFullscreen = useCallback(async () => {
     const container = videoContainerRef.current;
     if (!container) return;
@@ -882,7 +895,6 @@ export function TimelinePlayer({ videoElementRef = null, autoFullscreen = false 
               ref={setVideoRefs}
               className="w-full h-full object-contain"
               controls
-              onDblClick={() => handleToggleFullscreen()}
               autoPlay={false}
               muted={false}
               playsInline
