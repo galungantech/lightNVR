@@ -912,7 +912,7 @@ export function TimelinePlayer({ videoElementRef = null, autoFullscreen = false 
             <div
               className="absolute inset-0 flex items-center justify-center cursor-pointer rounded-lg"
               style={{ zIndex: 10, backgroundColor: 'rgba(0, 0, 0, 0.65)' }}
-              onClick={async () => {
+              onClick={() => {
                 setShowFullscreenPrompt(false);
                 handleToggleFullscreen();
               }}
