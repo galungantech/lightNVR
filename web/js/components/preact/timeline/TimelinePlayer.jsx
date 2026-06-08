@@ -54,12 +54,6 @@ export function TimelinePlayer({ videoElementRef = null, autoFullscreen = false 
   const setVideoRefs = useCallback((node) => {
     videoRef.current = node;
 
-    if (node) {
-      node.ondblclick = () => {
-        handleToggleFullscreen();
-      };
-    }
-    
     if (!videoElementRef) {
       return;
     }
@@ -889,6 +883,7 @@ export function TimelinePlayer({ videoElementRef = null, autoFullscreen = false 
               autoPlay={false}
               muted={false}
               playsInline
+              onDoubleClick={handleToggleFullscreen}
               onPlay={handlePlay}
               onPause={handlePause}
               onEnded={handleEnded}
