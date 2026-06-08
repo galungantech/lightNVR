@@ -875,6 +875,7 @@ export function TimelinePlayer({ videoElementRef = null, autoFullscreen = false 
           data-testid="timeline-video-container"
           className="relative w-full bg-black rounded-lg shadow-md"
           style={isFullscreen ? { width: '100vw', height: '100vh' } : { aspectRatio: '16/9' }}
+          onDoubleClick={handleToggleFullscreen}
         >
           <video
               ref={setVideoRefs}
@@ -883,7 +884,6 @@ export function TimelinePlayer({ videoElementRef = null, autoFullscreen = false 
               autoPlay={false}
               muted={false}
               playsInline
-              onDoubleClick={handleToggleFullscreen}
               onPlay={handlePlay}
               onPause={handlePause}
               onEnded={handleEnded}
