@@ -764,28 +764,23 @@ export function TimelinePlayer({ videoElementRef = null, autoFullscreen = false 
     };
   }, [detectionOverlayEnabled, drawTimelineDetections]);
 
-  const handleToggleFullscreen = useCallback(() => {
+  const handleToggleFullscreen = useCallback(async () => {
     const container = videoContainerRef.current;
     if (!container) return;
-  
+
     try {
       const fullscreenElement = document.fullscreenElement || document.webkitFullscreenElement;
-      
       if (fullscreenElement === container) {
         if (document.exitFullscreen) {
-          document.exitFullscreen().catch(err => console.error(err));
+          await document.exitFullscreen();
         } else if (document.webkitExitFullscreen) {
           document.webkitExitFullscreen();
         }
         return;
       }
-  
-      // Bagian ini yang diubah: Menghapus 'await' dan menggantinya dengan '.catch()'
+
       if (container.requestFullscreen) {
-        container.requestFullscreen().catch(error => {
-          console.error('Error requesting fullscreen:', error);
-          showStatusMessage(t('timeline.couldNotToggleFullscreen', { message: error.message }), 'error');
-        });
+        await container.requestFullscreen();
       } else if (container.webkitRequestFullscreen) {
         container.webkitRequestFullscreen();
       } else if (container.msRequestFullscreen) {
@@ -912,9 +907,9 @@ export function TimelinePlayer({ videoElementRef = null, autoFullscreen = false 
             <div
               className="absolute inset-0 flex items-center justify-center cursor-pointer rounded-lg"
               style={{ zIndex: 10, backgroundColor: 'rgba(0, 0, 0, 0.65)' }}
-              onClick={() => {
+              onClick={async () => {
                 setShowFullscreenPrompt(false);
-                handleToggleFullscreen();
+                await handleToggleFullscreen();
               }}
             >
               <div className="flex flex-col items-center gap-3 text-white pointer-events-none select-none">
