@@ -882,7 +882,6 @@ export function TimelinePlayer({ videoElementRef = null, autoFullscreen = false 
               ref={setVideoRefs}
               className="w-full h-full object-contain"
               controls
-              controlsList="nofullscreen"
               autoPlay={false}
               muted={false}
               playsInline
