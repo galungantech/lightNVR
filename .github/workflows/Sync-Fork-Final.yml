@@ -82,13 +82,13 @@ jobs:
           BRANCH="${{ github.event.inputs.target_branch }}"
 
           if [ "${{ job.status }}" != "success" ]; then
-            MSG="❌ *Sync Fork Gagal*"
+            MSG=$(printf "❌ *Sync Fork Gagal*")
 
           elif [ "${{ steps.check.outputs.has_updates }}" = "false" ]; then
-            MSG="🛎️ *Sync Fork Selesai*%0A%0ATidak ada update dari upstream."
+            MSG=$(printf "🛎️ *Sync Fork Selesai*\n\nTidak ada update dari upstream.")
 
           else
-            MSG="🛎️ *Sync Fork Berhasil*"
+            MSG=$(printf "🛎️ *Sync Fork Berhasil*")
 
             CURRENT_FOLDER=""
 
@@ -109,11 +109,13 @@ jobs:
               esac
 
               if [ "$FOLDER" != "$CURRENT_FOLDER" ]; then
-                MSG="${MSG}%0A%0A📁 ${FOLDER}/"
+                MSG+=$'\n\n'
+                MSG+="📁 $FOLDER/"
                 CURRENT_FOLDER="$FOLDER"
               fi
 
-              MSG="${MSG}%0A${ICON} ${FILE}"
+              MSG+=$'\n'
+              MSG+="$ICON $FILE"
             done < changes.txt
           fi
 
