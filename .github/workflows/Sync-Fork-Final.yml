@@ -75,24 +75,35 @@ jobs:
           git diff --name-status \
             ${{ steps.before.outputs.sha }} HEAD > changes.txt
 
-      - name: Telegram Notification
+      # =========================================================
+      # TELEGRAM
+      # =========================================================
+      - name: Notify Telegram
         if: always()
         run: |
           REPO_URL="https://github.com/${{ github.repository }}"
           BRANCH="${{ github.event.inputs.target_branch }}"
 
           if [ "${{ job.status }}" != "success" ]; then
+
             MSG=$(printf "❌ *Sync Fork Gagal*")
 
           elif [ "${{ steps.check.outputs.has_updates }}" = "false" ]; then
+
             MSG=$(printf "🛎️ *Sync Fork Selesai*\n\nTidak ada update dari upstream.")
 
           else
-            MSG=$(printf "🛎️ *Sync Fork Berhasil*")
+
+            FILES=$(git diff --name-status \
+              ${{ steps.before.outputs.sha }} HEAD \
+              | grep -v "^.github/workflows/" || true)
+
+            MSG=$(printf "🛎️ *Sync Fork Berhasil*\n")
 
             CURRENT_FOLDER=""
 
             while read -r status path; do
+
               [ -z "$path" ] && continue
 
               FOLDER=$(dirname "$path")
@@ -105,7 +116,7 @@ jobs:
                 M*) ICON="✏️" ;;
                 D*) ICON="❌" ;;
                 R*) ICON="🔄" ;;
-                *) ICON="📄" ;;
+                *)  ICON="📄" ;;
               esac
 
               if [ "$FOLDER" != "$CURRENT_FOLDER" ]; then
@@ -115,8 +126,10 @@ jobs:
               fi
 
               MSG+=$'\n'
-              MSG+="$ICON $FILE"
-            done < changes.txt
+              MSG+="$ICON [$FILE]($REPO_URL/blob/$BRANCH/$path)"
+
+            done <<< "$FILES"
+
           fi
 
           curl -s -X POST \
