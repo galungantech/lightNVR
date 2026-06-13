@@ -157,9 +157,31 @@ export function StreamsView() {
   const [orderedStreams, setOrderedStreams] = useState([]);
 
   // Sinkronisasi data ketika API selesai memuat data streams
+// Sinkronisasi data dan membaca urutan dari localStorage saat pertama kali dimuat
   useEffect(() => {
-    if (streams.length > 0 && orderedStreams.length === 0) {
-      setOrderedStreams(streams);
+    if (streams.length > 0) {
+      const savedOrder = localStorage.getItem('lightnvr_camera_order');
+      
+      if (savedOrder) {
+        try {
+          const orderArray = JSON.parse(savedOrder);
+          // Susun kamera berdasarkan catatan yang tersimpan di memori browser
+          const sorted = [...streams].sort((a, b) => {
+            const indexA = orderArray.indexOf(a.name);
+            const indexB = orderArray.indexOf(b.name);
+            if (indexA === -1 && indexB === -1) return 0;
+            if (indexA === -1) return 1;
+            if (indexB === -1) return -1;
+            return indexA - indexB;
+          });
+          setOrderedStreams(sorted);
+        } catch (e) {
+          console.error("Gagal membaca memori urutan:", e);
+          setOrderedStreams(streams);
+        }
+      } else {
+        setOrderedStreams(streams);
+      }
     }
   }, [streams]);
   
@@ -217,21 +239,23 @@ export function StreamsView() {
     e.preventDefault(); // Diperlukan agar drop target bisa menerima elemen
   };
 
-  const handleDrop = (e, targetIndex) => {
+const handleDrop = (e, targetIndex) => {
     e.preventDefault();
     const sourceIndex = parseInt(e.dataTransfer.getData('text/plain'), 10);
-    
     if (sourceIndex === targetIndex) return;
 
     const items = Array.from(sortedStreams);
     const [reorderedItem] = items.splice(sourceIndex, 1);
     items.splice(targetIndex, 0, reorderedItem);
 
-    // Update state lokal agar posisi bertukar di layar
+    // 1. Update kartu di layar secara instan
     setOrderedStreams(items);
 
+    // 2. Ambil semua susunan nama CCTV yang baru
     const orderedNames = items.map(stream => stream.name);
-    console.log("Urutan baru CCTV:", orderedNames);
+
+    // 3. Kunci dan Simpan langsung di memori browser Anda
+    localStorage.setItem('lightnvr_camera_order', JSON.stringify(orderedNames));
   };
   // ----------------------------------------
   
