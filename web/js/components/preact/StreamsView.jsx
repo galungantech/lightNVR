@@ -20,6 +20,8 @@ import {
   fetchJSON
 } from '../../query-client.js';
 import { useI18n } from '../../i18n.js';
+// Tambahkan ini di bagian paling atas bersama import lainnya
+import { DragDropContext, Droppable, Draggable } from '@hello-pangea/dnd';
 
 /**
  * StreamsView component
@@ -153,6 +155,16 @@ export function StreamsView() {
   // Process the response to handle both array and object formats
   const streams = Array.isArray(streamsResponse) ? streamsResponse : (streamsResponse.streams || []);
 
+  // State untuk menyimpan urutan kamera lokal hasil drag
+  const [orderedStreams, setOrderedStreams] = useState([]);
+
+  // Sinkronisasi data ketika API selesai memuat data streams
+  useEffect(() => {
+    if (streams.length > 0 && orderedStreams.length === 0) {
+      setOrderedStreams(streams);
+    }
+  }, [streams]);
+  
   // Sorting state for the streams table
   const DEFAULT_SORT_COLUMN = null;
   const [sortColumn, setSortColumn] = useState(DEFAULT_SORT_COLUMN);
@@ -168,8 +180,8 @@ export function StreamsView() {
   };
 
   const sortedStreams = (() => {
-    if (sortColumn === DEFAULT_SORT_COLUMN) return streams;
-    return [...streams].sort((a, b) => {
+      if (sortColumn === DEFAULT_SORT_COLUMN) return orderedStreams;
+      return [...orderedStreams].sort((a, b) => {
       let aVal, bVal;
       if (sortColumn === 'name') {
         aVal = (a.name || '').toLowerCase();
@@ -198,6 +210,21 @@ export function StreamsView() {
     });
   })();
 
+  const handleOnDragEnd = (result) => {
+    if (!result.destination) return;
+
+    const items = Array.from(sortedStreams);
+    const [reorderedItem] = items.splice(result.source.index, 1);
+    items.splice(result.destination.index, 0, reorderedItem);
+
+    // Update state lokal agar kartu langsung bertukar posisi di layar
+    setOrderedStreams(items);
+
+    // Ambil susunan nama untuk dikirim ke Backend/API jika diperlukan kelak
+    const orderedNames = items.map(stream => stream.name);
+    console.log("Urutan baru CCTV:", orderedNames);
+  };
+  
   // Default stream state
   const [currentStream, setCurrentStream] = useState({
     name: '',
@@ -1445,31 +1472,50 @@ export function StreamsView() {
               caps at 4 columns on ultra-wide (≥1536 px) displays while
               still reflowing down to 1 column at ≤640 px (PRD §5.5 /
               #399). */}
-          <div
-            id="streams-grid"
-            className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 2xl:grid-cols-4 gap-4"
-            role="list"
-            aria-label={t('nav.streams')}
-          >
-            {sortedStreams.map(stream => (
-              <div role="listitem" key={stream.name}>
-                <StreamCard
-                  stream={stream}
-                  canModifyStreams={canModifyStreams}
-                  shouldHideCredentials={shouldHideCredentials}
-                  selectionMode={selectionMode}
-                  isSelected={selectedStreams.has(stream.name)}
-                  onToggleSelect={toggleSelect}
-                  onEdit={openEditStreamModal}
-                  onClone={openCloneStreamModal}
-                  onOpenDelete={openDeleteModal}
-                  onEnable={enableStreamFromCard}
-                  onDisable={disableStreamFromCard}
-                  t={t}
-                />
-              </div>
-            ))}
-          </div>
+<DragDropContext onDragEnd={handleOnDragEnd}>
+            <Droppable droppableId="streams-drop-zone" direction="horizontal">
+              {(provided) => (
+                <div
+                  id="streams-grid"
+                  className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 2xl:grid-cols-4 gap-4"
+                  role="list"
+                  aria-label={t('nav.streams')}
+                  {...provided.droppableProps}
+                  ref={provided.innerRef}
+                >
+                  {sortedStreams.map((stream, index) => (
+                    <Draggable key={stream.name} draggableId={stream.name} index={index}>
+                      {(provided, snapshot) => (
+                        <div
+                          role="listitem"
+                          ref={provided.innerRef}
+                          {...provided.draggableProps}
+                          {...provided.dragHandleProps}
+                          className={`${snapshot.isDragging ? 'opacity-70 scale-105 z-50 transition-all duration-200' : ''}`}
+                        >
+                          <StreamCard
+                            stream={stream}
+                            canModifyStreams={canModifyStreams}
+                            shouldHideCredentials={shouldHideCredentials}
+                            selectionMode={selectionMode}
+                            isSelected={selectedStreams.has(stream.name)}
+                            onToggleSelect={toggleSelect}
+                            onEdit={openEditStreamModal}
+                            onClone={openCloneStreamModal}
+                            onOpenDelete={openDeleteModal}
+                            onEnable={enableStreamFromCard}
+                            onDisable={disableStreamFromCard}
+                            t={t}
+                          />
+                        </div>
+                      )}
+                    </Draggable>
+                  ))}
+                  {provided.placeholder}
+                </div>
+              )}
+            </Droppable>
+          </DragDropContext>
         </div>
       </ContentLoader>
         </div>
