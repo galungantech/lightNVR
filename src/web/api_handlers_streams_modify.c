@@ -1892,15 +1892,6 @@ void handle_delete_stream(const http_request_t *req, http_response_t *res) {
 
     log_info("Handling DELETE /api/streams/%s request", stream_id);
 
-    // ==========================================
-    // SEGERA HAPUS DARI DATABASE (INSTAN)
-    // ==========================================
-    if (stream_id[0] != '\0') {
-        log_info("Memaksa pembersihan instan dari database untuk stream: %s", stream_id);
-        delete_stream_config(stream_id);
-    }
-    // ==========================================
-   
     // Check if permanent delete is requested
     bool permanent_delete = false;
     char permanent_param[16] = {0};
