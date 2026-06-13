@@ -80,7 +80,6 @@ int register_all_libuv_handlers(http_server_handle_t server) {
     http_server_register_handler(server, "/api/streams", "GET", handle_get_streams);
     http_server_register_handler(server, "/api/streams", "POST", handle_post_stream);
     http_server_register_handler(server, "/api/streams/test", "POST", handle_test_stream);
-    http_server_register_handler(server, "/api/streams/reorder", "POST", handle_post_streams_reorder);
 
     // Stream-specific routes (must come before /api/streams/# wildcard)
     // Detection Zones API
