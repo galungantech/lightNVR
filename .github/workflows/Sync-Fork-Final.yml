@@ -61,19 +61,14 @@ jobs:
       - name: Sync with upstream
         if: steps.check.outputs.has_updates == 'true'
         run: |
-          git merge upstream/main --no-edit
-
+          git fetch upstream
+          git checkout ${{ github.event.inputs.target_branch }}
+          git reset --hard upstream/main
+      
       - name: Push changes
         if: steps.check.outputs.has_updates == 'true'
         run: |
-          git push origin ${{ github.event.inputs.target_branch }}
-
-      - name: Generate change list
-        if: steps.check.outputs.has_updates == 'true'
-        id: changes
-        run: |
-          git diff --name-status \
-            ${{ steps.before.outputs.sha }} HEAD > changes.txt
+          git push origin HEAD:${{ github.event.inputs.target_branch }} --force
 
       # =========================================================
       # TELEGRAM
