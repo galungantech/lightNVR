@@ -1429,9 +1429,6 @@ bool go2rtc_integration_register_all_streams(void) {
 
             // Register sub-stream if configured (low-res for grid view) —
             // always via API, even when main stream uses config override.
-            // Sub-streams are a video-only viewing optimization; do not attach
-            // audio producers here or each camera can add another persistent
-            // ffmpeg AAC/OPUS worker during preload (#437).
             if (streams[i].sub_stream_url[0] != '\0') {
                 char sub_name[MAX_STREAM_NAME + 8];
                 snprintf(sub_name, sizeof(sub_name), "%s_sub", streams[i].name);
@@ -1546,8 +1543,7 @@ bool go2rtc_sync_streams_from_database(void) {
         }
 
         // Register sub-stream if configured — always via API,
-        // even when main stream uses config override. Keep it video-only; the
-        // main stream handles audio when recording/WebRTC needs it (#437).
+        // even when main stream uses config override.
         if (db_streams[i].sub_stream_url[0] != '\0') {
             char sub_name[MAX_STREAM_NAME + 8];
             snprintf(sub_name, sizeof(sub_name), "%s_sub", db_streams[i].name);
@@ -1955,8 +1951,7 @@ bool go2rtc_integration_register_stream(const char *stream_name) {
     }
 
     // Register sub-stream if configured — always via API,
-    // even when main stream uses config override. Keep sub-stream registration
-    // video-only to avoid duplicate always-on audio transcoders (#437).
+    // even when main stream uses config override.
     if (config.sub_stream_url[0] != '\0') {
         char sub_name[MAX_STREAM_NAME + 8];
         snprintf(sub_name, sizeof(sub_name), "%s_sub", stream_name);
