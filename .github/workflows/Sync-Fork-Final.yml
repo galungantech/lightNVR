@@ -62,10 +62,8 @@ jobs:
         if: steps.check.outputs.has_updates == 'true'
         run: |
           git fetch upstream
-      
-          git checkout --detach upstream/main
-      
-          git push origin HEAD:refs/heads/${{ github.event.inputs.target_branch }} --force
+          git checkout ${{ github.event.inputs.target_branch }}
+          git reset --hard upstream/main
       
       - name: Push changes
         if: steps.check.outputs.has_updates == 'true'
