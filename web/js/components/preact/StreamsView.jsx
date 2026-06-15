@@ -153,6 +153,38 @@ export function StreamsView() {
   // Process the response to handle both array and object formats
   const streams = Array.isArray(streamsResponse) ? streamsResponse : (streamsResponse.streams || []);
 
+  // State untuk menyimpan urutan kamera lokal hasil drag
+  const [orderedStreams, setOrderedStreams] = useState([]);
+
+  // Sinkronisasi data ketika API selesai memuat data streams
+// Sinkronisasi data dan membaca urutan dari localStorage saat pertama kali dimuat
+  useEffect(() => {
+    if (streams.length > 0) {
+      const savedOrder = localStorage.getItem('lightnvr_camera_order');
+      
+      if (savedOrder) {
+        try {
+          const orderArray = JSON.parse(savedOrder);
+          // Susun kamera berdasarkan catatan yang tersimpan di memori browser
+          const sorted = [...streams].sort((a, b) => {
+            const indexA = orderArray.indexOf(a.name);
+            const indexB = orderArray.indexOf(b.name);
+            if (indexA === -1 && indexB === -1) return 0;
+            if (indexA === -1) return 1;
+            if (indexB === -1) return -1;
+            return indexA - indexB;
+          });
+          setOrderedStreams(sorted);
+        } catch (e) {
+          console.error("Gagal membaca memori urutan:", e);
+          setOrderedStreams(streams);
+        }
+      } else {
+        setOrderedStreams(streams);
+      }
+    }
+  }, [streams]);
+  
   // Sorting state for the streams table
   const DEFAULT_SORT_COLUMN = null;
   const [sortColumn, setSortColumn] = useState(DEFAULT_SORT_COLUMN);
@@ -168,8 +200,8 @@ export function StreamsView() {
   };
 
   const sortedStreams = (() => {
-    if (sortColumn === DEFAULT_SORT_COLUMN) return streams;
-    return [...streams].sort((a, b) => {
+      if (sortColumn === DEFAULT_SORT_COLUMN) return orderedStreams;
+      return [...orderedStreams].sort((a, b) => {
       let aVal, bVal;
       if (sortColumn === 'name') {
         aVal = (a.name || '').toLowerCase();
@@ -198,6 +230,35 @@ export function StreamsView() {
     });
   })();
 
+// --- GANTI LOGIKA DRAG LAMA DENGAN INI ---
+  const handleDragStart = (e, index) => {
+    e.dataTransfer.setData('text/plain', index);
+  };
+
+  const handleDragOver = (e) => {
+    e.preventDefault(); // Diperlukan agar drop target bisa menerima elemen
+  };
+
+const handleDrop = (e, targetIndex) => {
+    e.preventDefault();
+    const sourceIndex = parseInt(e.dataTransfer.getData('text/plain'), 10);
+    if (sourceIndex === targetIndex) return;
+
+    const items = Array.from(sortedStreams);
+    const [reorderedItem] = items.splice(sourceIndex, 1);
+    items.splice(targetIndex, 0, reorderedItem);
+
+    // 1. Update kartu di layar secara instan
+    setOrderedStreams(items);
+
+    // 2. Ambil semua susunan nama CCTV yang baru
+    const orderedNames = items.map(stream => stream.name);
+
+    // 3. Kunci dan Simpan langsung di memori browser Anda
+    localStorage.setItem('lightnvr_camera_order', JSON.stringify(orderedNames));
+  };
+  // ----------------------------------------
+  
   // Default stream state
   const [currentStream, setCurrentStream] = useState({
     name: '',
@@ -1446,32 +1507,40 @@ export function StreamsView() {
               still reflowing down to 1 column at ≤640 px (PRD §5.5 /
               #399). */}
           <div
-            id="streams-grid"
-            className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 2xl:grid-cols-4 gap-4"
-            role="list"
-            aria-label={t('nav.streams')}
-          >
-            {sortedStreams.map(stream => (
-              <div role="listitem" key={stream.name}>
-                <StreamCard
-                  stream={stream}
-                  canModifyStreams={canModifyStreams}
-                  shouldHideCredentials={shouldHideCredentials}
-                  selectionMode={selectionMode}
-                  isSelected={selectedStreams.has(stream.name)}
-                  onToggleSelect={toggleSelect}
-                  onEdit={openEditStreamModal}
-                  onClone={openCloneStreamModal}
-                  onOpenDelete={openDeleteModal}
-                  onEnable={enableStreamFromCard}
-                  onDisable={disableStreamFromCard}
-                  t={t}
-                />
-              </div>
-            ))}
+              id="streams-grid"
+              className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 2xl:grid-cols-4 gap-4"
+              role="list"
+              aria-label={t('nav.streams')}
+            >
+              {sortedStreams.map((stream, index) => (
+                <div
+                  role="listitem"
+                  key={stream.name}
+                  draggable={true}
+                  onDragStart={(e) => handleDragStart(e, index)}
+                  onDragOver={handleDragOver}
+                  onDrop={(e) => handleDrop(e, index)}
+                  className="cursor-grab active:cursor-grabbing transition-all duration-200 hover:shadow-md rounded-lg"
+                >
+                  <StreamCard
+                    stream={stream}
+                    canModifyStreams={canModifyStreams}
+                    shouldHideCredentials={shouldHideCredentials}
+                    selectionMode={selectionMode}
+                    isSelected={selectedStreams.has(stream.name)}
+                    onToggleSelect={toggleSelect}
+                    onEdit={openEditStreamModal}
+                    onClone={openCloneStreamModal}
+                    onOpenDelete={openDeleteModal}
+                    onEnable={enableStreamFromCard}
+                    onDisable={disableStreamFromCard}
+                    t={t}
+                  />
+                </div>
+              ))}
+            </div>
           </div>
-        </div>
-      </ContentLoader>
+        </ContentLoader>
         </div>
       )}
 

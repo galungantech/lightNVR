@@ -48,6 +48,8 @@ export function HLSVideoCell({
   const [isPlaying, setIsPlaying] = useState(false);
   const [retryCount, setRetryCount] = useState(0);
   const [showRefreshConfirm, setShowRefreshConfirm] = useState(false);
+  // HLS-style connection quality indicator
+  const [connectionQuality, setConnectionQuality] = useState('unknown');
 
   // Privacy mode state
   // showPrivacyConfirm: whether the "pause for privacy" confirmation overlay is visible
@@ -555,7 +557,7 @@ export function HLSVideoCell({
     setRetryCount(prev => prev + 1);
   };
 
-  // Auto-retry while the error overlay is visible — see WebRTCVideoCell for rationale.
+  // Auto-retry while the error overlay is visible — see HLSVideoCell for rationale.
   const autoRetryCountdown = useAutoRetry(error, handleRetry);
 
   /**
@@ -603,6 +605,61 @@ export function HLSVideoCell({
     }
   };
 
+	// HLS connection quality monitoring
+	useEffect(() => {
+	  if (!isPlaying || !videoRef.current) return;
+
+	  const interval = setInterval(() => {
+		const video = videoRef.current;
+
+		if (!video) return;
+
+		let quality = 'unknown';
+
+		try {
+		  if (video.buffered && video.buffered.length > 0) {
+			const bufferedEnd =
+			  video.buffered.end(video.buffered.length - 1);
+
+			const currentTime = video.currentTime;
+
+			const bufferAhead = bufferedEnd - currentTime;
+
+			// Similar feeling to HLS quality levels
+			if (bufferAhead >= 3) {
+			  quality = 'good';
+			} else if (bufferAhead >= 2) {
+			  quality = 'fair';
+			} else if (bufferAhead >= 1) {
+			  quality = 'poor';
+			} else {
+			  quality = 'bad';
+			}
+
+			console.log(
+			  `[HLS ${stream.name}] Buffer ahead: ${bufferAhead.toFixed(2)}s ? ${quality}`
+			);
+		  }
+
+		  if (quality !== connectionQuality) {
+			console.log(
+			  `[HLS ${stream.name}] Connection quality changed to ${quality}`
+			);
+
+			setConnectionQuality(quality);
+		  }
+
+		} catch (err) {
+		  console.warn(
+			`[HLS ${stream.name}] Quality monitor error:`,
+			err
+		  );
+		}
+	  }, 10000);
+
+	  return () => clearInterval(interval);
+	}, [isPlaying, connectionQuality, stream.name]);
+  
   // Player telemetry (TTFF, rebuffer tracking)
   useEffect(() => {
     const video = videoRef.current;
@@ -705,15 +762,26 @@ export function HLSVideoCell({
             }`}
           />
           {stream.name}
-          <span style={{
-            fontSize: '10px',
-            padding: '1px 4px',
-            borderRadius: '3px',
-            backgroundColor: hlsMode === 'go2rtc' ? 'rgba(0, 150, 255, 0.7)' : 'rgba(100, 100, 100, 0.7)',
-            color: 'white'
-          }}>
-            {hlsMode === 'go2rtc' ? 'go2rtc' : 'HLS'}
-          </span>
+
+		  {/* Connection quality indicator */}
+          {connectionQuality !== 'unknown' && (
+            <div
+              className={`connection-quality-indicator quality-${connectionQuality}`}
+              style={{
+                width: '10px',
+                height: '10px',
+                borderRadius: '50%',
+                backgroundColor:
+					connectionQuality === 'good' ? '#10B981' :  // Green
+					connectionQuality === 'fair' ? '#FBBF24' :  // Yellow
+					connectionQuality === 'poor' ? '#F97316' :  // Orange
+					connectionQuality === 'bad' ? '#EF4444' :   // Red
+					'#6B7280',   
+                boxShadow: '0 0 4px rgba(0, 0, 0, 0.3)',
+                flexShrink: 0
+              }}
+            />
+          )}
         </div>
       )}
 
@@ -1191,7 +1259,6 @@ export function HLSVideoCell({
             zIndex: 10,
             pointerEvents: 'none'
           }}
-          title={t('live.mseLowLatencyStreaming')}
         >
           HLS
         </div>
