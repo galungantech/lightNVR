@@ -82,7 +82,7 @@ jobs:
           VERSION="${{ steps.version.outputs.version }}"
           DEB_ARCH="${{ matrix.deb_arch }}"
           DEBIAN_SUITE="${{ matrix.debian_suite }}"
-          PKG_NAME="lightnvr_${VERSION}_${DEBIAN_SUITE}_${DEB_ARCH}"
+          PKG_NAME="lightnvr-modded_${VERSION}_${DEBIAN_SUITE}_${DEB_ARCH}"
           PKG_DIR="$(pwd)/pkg/${PKG_NAME}"
 
           # ── Directory structure ──────────────────────────────────────────────
