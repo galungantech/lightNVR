@@ -151,7 +151,6 @@ export function HLSVideoCell({
 
       if (forceNative) {
         hlsStreamUrl = `/hls/${encodeURIComponent(stream.name)}/index.m3u8`;
-        usingGo2rtc = false;
         setHlsMode('native');
         console.log(`[HLS ${stream.name}] Force native HLS enabled, using: ${hlsStreamUrl}`);
       } else {
@@ -206,14 +205,12 @@ export function HLSVideoCell({
           // go2rtc is not enabled - use native lightNVR HLS
           console.warn(`[HLS ${stream.name}] go2rtc is not available, using native lightNVR HLS`);
           hlsStreamUrl = `/hls/${encodeURIComponent(stream.name)}/index.m3u8`;
-          usingGo2rtc = false;
           setHlsMode('native');
           console.log(`[HLS ${stream.name}] Using native lightNVR HLS: ${hlsStreamUrl}`);
         }
       } else if (effectiveMode === 'native') {
         // Use lightNVR's FFmpeg-based HLS endpoint directly
         hlsStreamUrl = `/hls/${encodeURIComponent(stream.name)}/index.m3u8`;
-        usingGo2rtc = false;
         console.log(`[HLS ${stream.name}] Using native lightNVR HLS: ${hlsStreamUrl}`);
       } else {
         // Mode is 'failed' - don't attempt anything
