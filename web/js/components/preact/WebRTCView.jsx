@@ -134,14 +134,13 @@ export function WebRTCView({ isWebRTCDisabled, isHlsDisabled, isMseDisabled }) {
   // True when we're in single-stream mode
   const isSingleStream = maxStreams === 1;
 
-  // Toggle a body class so the page can lock to viewport height and avoid
-  // scroll when a single 1x1 stream is displayed. Fullscreen mode has its own
-  // sizing, so skip when fullscreen is active.
+  // Let desktop CSS size the live grid against the viewport instead of the
+  // static fallback height. Mobile/tablet keep their natural page scroll.
   useEffect(() => {
-    if (!isSingleStream || isFullscreen) return;
-    document.body.classList.add('live-single-stream');
-    return () => document.body.classList.remove('live-single-stream');
-  }, [isSingleStream, isFullscreen]);
+    if (isFullscreen) return;
+    document.body.classList.add('live-view-page');
+    return () => document.body.classList.remove('live-view-page');
+  }, [isFullscreen]);
 
   // Initialize selectedStream from URL or sessionStorage if available
   const [selectedStream, setSelectedStream] = useState(() => {
@@ -188,7 +187,10 @@ export function WebRTCView({ isWebRTCDisabled, isHlsDisabled, isMseDisabled }) {
     checkGo2rtc();
   }, []);
 
-  // Fetch streams using preact-query
+  // Fetch streams using preact-query, and periodically refresh so stream
+  // status (Running / Reconnecting / Stopped etc.) stays up-to-date — the
+  // video cells use status transitions to auto-retry when a camera that was
+  // offline comes back.
   const {
     data: streamsData,
     isLoading: isLoadingStreams,
@@ -200,6 +202,9 @@ export function WebRTCView({ isWebRTCDisabled, isHlsDisabled, isMseDisabled }) {
       timeout: 15000, // 15 second timeout
       retries: 2,     // Retry twice
       retryDelay: 1000 // 1 second between retries
+    },
+    {
+      refetchInterval: 30000 // Re-poll stream list (and status) every 30 s
     }
   );
 
@@ -683,7 +688,7 @@ export function WebRTCView({ isWebRTCDisabled, isHlsDisabled, isMseDisabled }) {
         </div>
       </div>
 
-      <div className="flex flex-col space-y-4 h-full">
+      <div className="live-grid-frame flex flex-col space-y-4 h-full">
         <div
           id="video-grid"
           className="video-container"
@@ -728,11 +733,13 @@ export function WebRTCView({ isWebRTCDisabled, isHlsDisabled, isMseDisabled }) {
               <a href="streams.html" className="btn-primary">{t('live.configureStreams')}</a>
             </div>
           ) : (
-            // Render video cells with staggered initialization to avoid
-            // overwhelming go2rtc with concurrent WebRTC offers
+            // Render video cells. Connection concurrency is bounded by the
+            // shared stream connection gate (see stream-connection-gate.js),
+            // which replaced the old fixed per-index stagger: healthy cameras
+            // connect as fast as slots free up, and offline cameras fail fast
+            // instead of pinning browser connections.
             streamsToShow.map((stream, index) => {
               const globalIndex = currentPage * maxStreams + index;
-              const initDelay = index * 300; // 300ms stagger per stream
               return (
                 <div
                   key={stream.name}
@@ -765,7 +772,6 @@ export function WebRTCView({ isWebRTCDisabled, isHlsDisabled, isMseDisabled }) {
                     useSubStream={!isSingleStream && fullscreenCellStream !== stream.name && !!stream.sub_stream_url}
                     onToggleFullscreen={toggleStreamFullscreen}
                     streamId={stream.name}
-                    initDelay={initDelay}
                     showLabels={showLabels}
                     showControls={showControls}
                     globalShowDetections={showDetections}

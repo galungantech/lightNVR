@@ -1225,7 +1225,11 @@ const handleDrop = (e, targetIndex) => {
       audio_voice_enhancement: false,
       backchannel_enabled: false,
       // Backend expects camelCase key 'isOnvif'
-      isOnvif: true
+      isOnvif: true,
+      onvif_username: onvifCredentials.username || '',
+      onvif_password: onvifCredentials.password || '',
+      onvif_profile: selectedProfile.token || '',
+      onvif_port: 0
     };
 
     // Use mutation to save stream
@@ -1233,7 +1237,11 @@ const handleDrop = (e, targetIndex) => {
       onSuccess: () => {
         setIsAddingStream(false);
         setShowCustomNameInput(false);
-        setOnvifModalVisible(false);
+        // Keep the discovery modal open with its device list intact so
+        // additional cameras can be added without re-running discovery;
+        // only reset the per-device selection.
+        setSelectedProfile(null);
+        setCustomStreamName('');
       },
       onError: () => {
         setIsAddingStream(false);
