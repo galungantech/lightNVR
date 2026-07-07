@@ -471,6 +471,13 @@ export function TimelinePlayer({ videoElementRef = null, autoFullscreen = false 
       return;
     }
 
+    // Bypass global state updates during fast-forward to optimize UI performance
+    if (video.playbackRate > 1) {
+      updateTimeDisplay(currentTime, segment);
+      lastTimeUpdateRef.current = currentTime;
+      return;
+    }
+    
     // Update timeline state with the current time
     timelineState.setState({
       currentTime: currentTime,
@@ -875,7 +882,6 @@ export function TimelinePlayer({ videoElementRef = null, autoFullscreen = false 
               ref={setVideoRefs}
               className="w-full h-full object-contain"
               controls
-              controlsList="nofullscreen"
               autoPlay={false}
               muted={false}
               playsInline
@@ -884,25 +890,6 @@ export function TimelinePlayer({ videoElementRef = null, autoFullscreen = false 
               onEnded={handleEnded}
               onTimeUpdate={handleTimeUpdate}
           ></video>
-
-          {/* Click guard — sits above the video surface to intercept Firefox's
-              native click-to-play/pause behaviour.  pointerdown events still
-              propagate to the document so the fine-mode keyboard-nav handler
-              works normally.  Double-click forwards to the fullscreen toggle
-              since the video's own ondblclick is shadowed by this guard.
-              The guard stops just above the native controls bar (~40 px) so
-              play/pause, seek, and volume controls remain accessible. */}
-          <div
-            style={{
-              position: 'absolute',
-              top: 0,
-              left: 0,
-              right: 0,
-              bottom: '40px',
-              zIndex: 1,
-            }}
-            onDblClick={() => handleToggleFullscreen()}
-          />
 
           {/* Detection overlay canvas */}
           {detectionOverlayEnabled && (

@@ -4,6 +4,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <ctype.h>
 #include <unistd.h>
 #include <sys/utsname.h>
@@ -174,7 +175,7 @@ static void add_versions_to_json(cJSON *info) {
     } else {
         snprintf(details, sizeof(details), "Build date %s", LIGHTNVR_BUILD_DATE);
     }
-    add_version_entry(items, "LightNVR", "Application", LIGHTNVR_VERSION_STRING, details);
+    add_version_entry(items, "LightNVR-Modded", "Application", LIGHTNVR_VERSION_STRING, details);
 
     struct utsname system_info;
     if (uname(&system_info) == 0) {
@@ -1628,4 +1629,119 @@ void handle_get_system_status(const http_request_t *req, http_response_t *res) {
     cJSON_Delete(status);
 
     log_info("Successfully handled GET /api/system/status request");
+}
+
+/**
+ * @brief Direct handler for POST /api/system/export
+ */
+void handle_post_system_export(const http_request_t *req, http_response_t *res) {
+    (void)req;
+
+    if (!res) return;
+
+    // Hapus backup lama
+    system("rm -f /var/lib/lightnvr/www/lightnvr-backup-config_*.tar.gz");
+
+    // Timestamp
+    time_t t = time(NULL);
+
+    struct tm tm_info;
+
+    localtime_r(&t, &tm_info);
+
+    char filename[256];
+
+    strftime(
+        filename,
+        sizeof(filename),
+        "lightnvr-backup-config_%Y-%m-%d_%H-%M.tar.gz",
+        &tm_info
+    );
+
+    // Full path
+    char filepath[512];
+
+    snprintf(
+        filepath,
+        sizeof(filepath),
+        "/var/lib/lightnvr/www/%s",
+        filename
+    );
+
+    // Command backup
+    char cmd[4096];
+
+    snprintf(
+        cmd,
+        sizeof(cmd),
+        "tar czf \"%s\" "
+        "--exclude='database/lightnvr.db.backups' "
+        "--exclude='database/*.db-wal' "
+        "--exclude='database/*.db-shm' "
+        "--exclude='etc/lightnvr/go2rtc.yaml' " // Tambahkan baris ini
+        "-C /var/lib/lightnvr/data database "
+        "-C /etc lightnvr "
+        "> /dev/null 2>&1",
+        filepath
+    );
+
+    int status = system(cmd);
+
+    if (status != 0) {
+        http_response_set_json(
+            res,
+            500,
+            "{\"status\":\"error\",\"message\":\"Failed to create backup\"}"
+        );
+        return;
+    }
+
+    // Response JSON
+    char json[1024];
+
+    snprintf(
+        json,
+        sizeof(json),
+        "{\"status\":\"success\",\"downloadUrl\":\"/%s\"}",
+        filename
+    );
+
+    http_response_set_json(res, 200, json);
+}
+
+/**
+ * @brief Restore System (Gunakan fungsi yang sudah ada)
+ */
+void handle_post_system_restore(const http_request_t *req, http_response_t *res) {
+    log_info("Handling POST /api/system/restore request");
+    
+    if (!req || !res) return;
+
+    const char *data = req->body; 
+    size_t len = req->body_len;
+
+    if (data && len > 0) {
+        FILE *f = fopen("/tmp/lightnvr-backup-config.tar.gz", "wb");
+        if (f) {
+            fwrite(data, 1, len, f);
+            fclose(f);
+        } else {
+            http_response_set_json(res, 500, "{\"status\":\"error\",\"message\":\"Failed to write file.\"}");
+            return;
+        }
+    } else {
+        http_response_set_json(res, 400, "{\"status\":\"error\",\"message\":\"No data received.\"}");
+        return;
+    }
+
+    const char *restore_cmd = "( rm -rf /tmp/database /tmp/lightnvr && "
+                              "tar xzvf /tmp/lightnvr-backup-config.tar.gz -C /tmp && "
+                              "rm -rf /var/lib/lightnvr/data/database && "
+                              "rm -rf /etc/lightnvr && "
+                              "mv /tmp/database /var/lib/lightnvr/data/ && "
+                              "mv /tmp/lightnvr /etc/ && "
+                              "rm -f /tmp/lightnvr-backup-config.tar.gz ) &";
+
+    system(restore_cmd);
+    http_response_set_json(res, 200, "{\"status\":\"success\",\"message\":\"Restore triggered.\"}");
 }

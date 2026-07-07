@@ -489,4 +489,3 @@ jobs:
 
           # Clean up test artifacts
           rm -rf /tmp/lightnvr-test
-
