@@ -8,6 +8,9 @@
 #include <signal.h>
 #include <unistd.h>
 #include <time.h>
+#include <dirent.h>
+#include <limits.h>
+#include <sys/stat.h>
 #include <mosquitto.h>
 #include <cjson/cJSON.h>
 
@@ -339,6 +342,110 @@ static void on_log(struct mosquitto *m, void *userdata, int level, const char *s
     }
 }
 
+// Cap on saved event snapshots per stream; oldest are pruned on each save.
+// Timestamped filenames sort lexicographically, so "oldest" == smallest name.
+#define MAX_DETECTION_SNAPSHOTS_PER_STREAM 100
+
+/**
+ * Prune oldest snapshots in a stream's snapshot directory so at most
+ * MAX_DETECTION_SNAPSHOTS_PER_STREAM files remain after the next save.
+ */
+static void prune_detection_snapshots(const char *dir_path) {
+    DIR *dir = opendir(dir_path);
+    if (!dir) {
+        return;
+    }
+
+    // Two passes: count first, then delete the N oldest.  Directories are
+    // capped at ~100 entries so the rescan is cheap and avoids allocating
+    // a full file list.
+    int count = 0;
+    struct dirent *ent;
+    while ((ent = readdir(dir)) != NULL) {
+        if (ent->d_name[0] != '.' && strstr(ent->d_name, ".jpg")) {
+            count++;
+        }
+    }
+
+    while (count >= MAX_DETECTION_SNAPSHOTS_PER_STREAM) {
+        rewinddir(dir);
+        char oldest[NAME_MAX + 1] = "";
+        while ((ent = readdir(dir)) != NULL) {
+            if (ent->d_name[0] == '.' || !strstr(ent->d_name, ".jpg")) {
+                continue;
+            }
+            if (oldest[0] == '\0' || strcmp(ent->d_name, oldest) < 0) {
+                safe_strcpy(oldest, ent->d_name, sizeof(oldest), 0);
+            }
+        }
+        if (oldest[0] == '\0') {
+            break;
+        }
+        char victim[MAX_PATH_LENGTH];
+        snprintf(victim, sizeof(victim), "%s/%s", dir_path, oldest);
+        if (unlink(victim) != 0) {
+            break;  // don't loop forever on an undeletable file
+        }
+        count--;
+    }
+
+    closedir(dir);
+}
+
+/**
+ * Save a detection event snapshot to
+ * {storage_path}/snapshots/{safe_stream}/{YYYYmmdd_HHMMSS}.jpg.
+ *
+ * On success fills out_path with the absolute file path and out_url with the
+ * relative URL served by the /api/snapshots endpoint.  Returns 0 on success.
+ */
+static int save_detection_snapshot(const char *safe_name, time_t timestamp,
+                                   const unsigned char *jpeg_data, size_t jpeg_size,
+                                   char *out_path, size_t out_path_size,
+                                   char *out_url, size_t out_url_size) {
+    if (!mqtt_config || mqtt_config->storage_path[0] == '\0') {
+        return -1;
+    }
+
+    char dir_path[MAX_PATH_LENGTH];
+    snprintf(dir_path, sizeof(dir_path), "%s/snapshots/%s",
+             mqtt_config->storage_path, safe_name);
+    if (ensure_dir(dir_path) != 0) {
+        log_error("MQTT: Failed to create snapshot directory %s", dir_path);
+        return -1;
+    }
+
+    prune_detection_snapshots(dir_path);
+
+    char ts_str[32];
+    struct tm tm_buf;
+    localtime_r(&timestamp, &tm_buf);
+    strftime(ts_str, sizeof(ts_str), "%Y%m%d_%H%M%S", &tm_buf);
+
+    char file_path[MAX_PATH_LENGTH];
+    snprintf(file_path, sizeof(file_path), "%s/%s.jpg", dir_path, ts_str);
+
+    // Write to a temp file first so a reader never sees a partial JPEG
+    char tmp_path[MAX_PATH_LENGTH];
+    snprintf(tmp_path, sizeof(tmp_path), "%s/.%s.jpg.tmp", dir_path, ts_str);
+    FILE *f = fopen(tmp_path, "wb");
+    if (!f) {
+        log_error("MQTT: Failed to open snapshot file %s: %s", tmp_path, strerror(errno));
+        return -1;
+    }
+    size_t written = fwrite(jpeg_data, 1, jpeg_size, f);
+    fclose(f);
+    if (written != jpeg_size || rename(tmp_path, file_path) != 0) {
+        log_error("MQTT: Failed to write snapshot %s", file_path);
+        unlink(tmp_path);
+        return -1;
+    }
+
+    snprintf(out_path, out_path_size, "%s", file_path);
+    snprintf(out_url, out_url_size, "/api/snapshots/%s/%s.jpg", safe_name, ts_str);
+    return 0;
+}
+
 /**
  * Publish a detection event to MQTT
  */
@@ -364,6 +471,35 @@ int mqtt_publish_detection(const char *stream_name, const detection_result_t *re
     snprintf(topic, sizeof(topic), "%s/detections/%s",
              mqtt_config->mqtt_topic_prefix, safe_name);
 
+    // Capture an event snapshot so automations can attach the image to
+    // notifications (issue #449).  The JPEG is published to a companion
+    // topic *before* the JSON event (so it's available when the event
+    // arrives) and saved to disk; the JSON payload then references it by
+    // local path, relative URL, and topic.  All of this is best-effort:
+    // if go2rtc is unavailable the event is simply published without
+    // snapshot fields.
+    char snapshot_path[MAX_PATH_LENGTH] = "";
+    char snapshot_url[MAX_PATH_LENGTH] = "";
+    char snapshot_topic[MAX_TOPIC_LENGTH] = "";
+    {
+        unsigned char *jpeg_data = NULL;
+        size_t jpeg_size = 0;
+        if (go2rtc_get_snapshot(stream_name, &jpeg_data, &jpeg_size) &&
+            jpeg_data && jpeg_size > 0) {
+            save_detection_snapshot(safe_name, timestamp, jpeg_data, jpeg_size,
+                                    snapshot_path, sizeof(snapshot_path),
+                                    snapshot_url, sizeof(snapshot_url));
+
+            snprintf(snapshot_topic, sizeof(snapshot_topic), "%s/detections/%s/snapshot",
+                     mqtt_config->mqtt_topic_prefix, safe_name);
+            if (mqtt_publish_binary(snapshot_topic, jpeg_data, jpeg_size,
+                                    mqtt_config->mqtt_retain) != 0) {
+                snapshot_topic[0] = '\0';  // don't advertise a topic we failed to publish
+            }
+        }
+        free(jpeg_data);
+    }
+
     // Build JSON payload
     cJSON *root = cJSON_CreateObject();
     if (!root) {
@@ -374,6 +510,16 @@ int mqtt_publish_detection(const char *stream_name, const detection_result_t *re
     cJSON_AddStringToObject(root, "stream", stream_name);
     cJSON_AddNumberToObject(root, "timestamp", (double)timestamp);
     cJSON_AddNumberToObject(root, "count", result->count);
+
+    if (snapshot_path[0] != '\0') {
+        cJSON_AddStringToObject(root, "snapshot_path", snapshot_path);
+    }
+    if (snapshot_url[0] != '\0') {
+        cJSON_AddStringToObject(root, "snapshot_url", snapshot_url);
+    }
+    if (snapshot_topic[0] != '\0') {
+        cJSON_AddStringToObject(root, "snapshot_topic", snapshot_topic);
+    }
 
     cJSON *detections = cJSON_CreateArray();
     if (!detections) {
@@ -1075,11 +1221,14 @@ typedef enum {
     MQTT_OP_LIB_CLEANUP
 } mqtt_cleanup_op_t;
 
-// Thread argument structure - uses a simple volatile flag for completion
+// Thread argument structure for timeout-aware cleanup worker
 typedef struct {
     struct mosquitto *mosq;
     mqtt_cleanup_op_t op;
-    volatile int *done_flag;  // Pointer to completion flag
+    pthread_mutex_t mutex;
+    pthread_cond_t cond;
+    bool done;
+    bool timed_out;
 } mqtt_cleanup_arg_t;
 
 /**
@@ -1088,7 +1237,6 @@ typedef struct {
 static void *mqtt_cleanup_thread(void *arg) {
     log_set_thread_context("MQTT", NULL);
     mqtt_cleanup_arg_t *cleanup_arg = (mqtt_cleanup_arg_t *)arg;
-    volatile int *done_flag = cleanup_arg->done_flag;
 
     switch (cleanup_arg->op) {
         case MQTT_OP_LOOP_STOP:
@@ -1102,58 +1250,105 @@ static void *mqtt_cleanup_thread(void *arg) {
             break;
     }
 
-    // Signal completion by setting the flag
-    // Note: cleanup_arg is on the stack of the caller and remains valid
-    // until the caller returns (after timeout or completion)
-    *done_flag = 1;
+    pthread_mutex_lock(&cleanup_arg->mutex);
+    cleanup_arg->done = true;
+    pthread_cond_signal(&cleanup_arg->cond);
+    bool timed_out = cleanup_arg->timed_out;
+    pthread_mutex_unlock(&cleanup_arg->mutex);
+
+    // On timeout, caller detached and returned; worker owns cleanup.
+    if (timed_out) {
+        pthread_cond_destroy(&cleanup_arg->cond);
+        pthread_mutex_destroy(&cleanup_arg->mutex);
+        free(cleanup_arg);
+    }
 
     return NULL;
 }
 
 /**
  * Run a mosquitto cleanup operation with a timeout
- * Uses simple polling with usleep - portable across glibc and musl
+ * Uses a timed condition wait with a worker thread
  * Returns true if completed within timeout, false if timed out
  */
 static bool mqtt_run_with_timeout(struct mosquitto *m, mqtt_cleanup_op_t op, int timeout_sec, const char *op_name) {
     pthread_t thread;
-    volatile int done_flag = 0;
+    mqtt_cleanup_arg_t *arg = (mqtt_cleanup_arg_t *)calloc(1, sizeof(mqtt_cleanup_arg_t));
 
-    // Argument structure on stack - valid for duration of this function
-    mqtt_cleanup_arg_t arg;
-    arg.mosq = m;
-    arg.op = op;
-    arg.done_flag = &done_flag;
-
-    // Create thread to run the operation
-    if (pthread_create(&thread, NULL, mqtt_cleanup_thread, &arg) != 0) {
-        log_warn("MQTT: Failed to create thread for %s", op_name);
+    if (arg == NULL) {
+        log_warn("MQTT: Failed to allocate resources for %s", op_name);
         return false;
     }
 
-    // Detach the thread so it cleans up automatically if we timeout
-    pthread_detach(thread);
-
-    // Poll for completion with 50ms intervals
-    int timeout_ms = timeout_sec * 1000;
-    int elapsed_ms = 0;
-    const int poll_interval_ms = 50;
-
-    while (elapsed_ms < timeout_ms) {
-        if (done_flag) {
-            // Operation completed successfully
-            return true;
-        }
-        usleep(poll_interval_ms * 1000);
-        elapsed_ms += poll_interval_ms;
+    if (pthread_mutex_init(&arg->mutex, NULL) != 0) {
+        free(arg);
+        log_warn("MQTT: Failed to initialize synchronization objects for %s", op_name);
+        return false;
+    }
+    if (pthread_cond_init(&arg->cond, NULL) != 0) {
+        pthread_mutex_destroy(&arg->mutex);
+        free(arg);
+        log_warn("MQTT: Failed to initialize synchronization objects for %s", op_name);
+        return false;
     }
 
-    // Timeout - the thread is still running but we'll return anyway
-    // The thread will eventually complete (or process will exit)
+    arg->mosq = m;
+    arg->op = op;
+
+    // Create thread to run the operation
+    if (pthread_create(&thread, NULL, mqtt_cleanup_thread, arg) != 0) {
+        log_warn("MQTT: Failed to create thread for %s", op_name);
+        pthread_cond_destroy(&arg->cond);
+        pthread_mutex_destroy(&arg->mutex);
+        free(arg);
+        return false;
+    }
+
+    struct timespec ts;
+    if (clock_gettime(CLOCK_REALTIME, &ts) != 0) {
+        log_warn("MQTT: Failed to get clock time for %s timeout", op_name);
+        pthread_mutex_lock(&arg->mutex);
+        arg->timed_out = true;
+        pthread_mutex_unlock(&arg->mutex);
+        pthread_detach(thread);
+        return false;
+    }
+    ts.tv_sec += timeout_sec;
+
+    pthread_mutex_lock(&arg->mutex);
+    int wait_rc = 0;
+    while (!arg->done && wait_rc != ETIMEDOUT) {
+        wait_rc = pthread_cond_timedwait(&arg->cond, &arg->mutex, &ts);
+    }
+    bool completed = arg->done;
+    if (!completed) {
+        arg->timed_out = true;
+    }
+    pthread_mutex_unlock(&arg->mutex);
+
+    if (completed) {
+        // Operation completed successfully; caller reclaims resources.
+        if (pthread_join(thread, NULL) != 0) {
+            log_warn("MQTT: Failed to join thread for %s", op_name);
+        }
+        pthread_cond_destroy(&arg->cond);
+        pthread_mutex_destroy(&arg->mutex);
+        free(arg);
+        return true;
+    }
+
+    // Timeout - detach so worker can finish and free its resources.
+    pthread_detach(thread);
+
     // Use write() first to ensure we see the timeout even if logger is blocked
     char timeout_msg[128];
-    snprintf(timeout_msg, sizeof(timeout_msg), "[MQTT DEBUG] %s timed out after %d seconds\n", op_name, timeout_sec);
-    (void)write(STDERR_FILENO, timeout_msg, strlen(timeout_msg));
+    int written = snprintf(timeout_msg, sizeof(timeout_msg), "[MQTT DEBUG] %s timed out after %d seconds\n", op_name, timeout_sec);
+    if (written >= 0) {
+        size_t msg_len = ((size_t)written < sizeof(timeout_msg)) ? (size_t)written : sizeof(timeout_msg) - 1;
+        if (msg_len > 0) {
+            (void)write(STDERR_FILENO, timeout_msg, msg_len);
+        }
+    }
     log_warn("MQTT: %s timed out after %d seconds", op_name, timeout_sec);
     return false;
 }
@@ -1347,4 +1542,3 @@ int mqtt_reinit(const config_t *config) {
 }
 
 #endif /* ENABLE_MQTT */
-

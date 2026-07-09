@@ -18,7 +18,9 @@
 #include "web/api_handlers_system.h"
 #include "web/api_handlers_zones.h"
 #include "web/api_handlers_ptz.h"
+#include "web/api_handlers_imaging.h"
 #include "web/api_handlers_detection.h"
+#include "web/api_handlers_detection_results.h"
 #include "web/api_handlers_recordings_playback.h"
 #include "web/api_handlers_recordings_thumbnail.h"
 #include "web/api_handlers_recordings.h"
@@ -106,6 +108,13 @@ int register_all_libuv_handlers(http_server_handle_t server) {
     http_server_register_handler(server, "/api/streams/#/ptz/goto-preset", "POST", handle_ptz_goto_preset);
     http_server_register_handler(server, "/api/streams/#/ptz/preset", "PUT", handle_ptz_set_preset);
 
+    // ONVIF Imaging API
+    http_server_register_handler(server, "/api/streams/#/imaging/settings", "GET", handle_imaging_get_settings);
+    http_server_register_handler(server, "/api/streams/#/imaging/settings", "PUT", handle_imaging_put_settings);
+    http_server_register_handler(server, "/api/streams/#/imaging/options", "GET", handle_imaging_get_options);
+    http_server_register_handler(server, "/api/streams/#/daynight", "GET", handle_daynight_get);
+    http_server_register_handler(server, "/api/streams/#/daynight", "PUT", handle_daynight_put);
+
     // Stream CRUD (wildcards - must come after specific routes)
     http_server_register_handler(server, "/api/streams/#/full", "GET", handle_get_stream_full);
     http_server_register_handler(server, "/api/streams/#", "GET", handle_get_stream);
@@ -140,6 +149,8 @@ int register_all_libuv_handlers(http_server_handle_t server) {
     // Detection API
     http_server_register_handler(server, "/api/detection/results/#", "GET", handle_get_detection_results);
     http_server_register_handler(server, "/api/detection/models", "GET", handle_get_detection_models);
+    // Detection event snapshots (saved on MQTT publish, see issue #449)
+    http_server_register_handler(server, "/api/snapshots/#/#", "GET", handle_get_detection_snapshot);
 
     // Storage Management API
     http_server_register_handler(server, "/api/storage/health", "GET", handle_get_storage_health);

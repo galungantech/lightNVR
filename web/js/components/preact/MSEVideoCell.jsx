@@ -10,6 +10,7 @@ import { SnapshotButton } from './SnapshotManager.jsx';
 import { LoadingIndicator } from './LoadingIndicator.jsx';
 import { showStatusMessage } from './ToastContainer.jsx';
 import { PTZControls } from './PTZControls.jsx';
+import { DayNightControl } from './DayNightControl.jsx';
 import { getGo2rtcWebSocketUrl } from '../../utils/settings-utils.js';
 import { formatFilenameTimestamp } from '../../utils/date-utils.js';
 import { forceNavigation } from '../../utils/navigation-utils.js';
@@ -18,6 +19,7 @@ import { useI18n } from '../../i18n.js';
 import { useQueryClient } from '../../query-client.js';
 import { createPlayerTelemetry } from '../../utils/player-telemetry.js';
 import { useAutoRetry } from './useAutoRetry.js';
+import { streamConnectionGate, priorityForStreamStatus, isGateTimeout, isGateAbort } from '../../utils/stream-connection-gate.js';
 
 /**
  * MSEVideoCell component
@@ -25,7 +27,6 @@ import { useAutoRetry } from './useAutoRetry.js';
  * @param {Object} props.stream - Stream object
  * @param {Function} props.onToggleFullscreen - Fullscreen toggle handler
  * @param {string} props.streamId - Stream ID for stable reference
- * @param {number} props.initDelay - Delay in ms before initializing MSE (for staggered loading)
  * @returns {JSX.Element} MSEVideoCell component
  */
 export function MSEVideoCell({
@@ -33,7 +34,6 @@ export function MSEVideoCell({
   streamId,
   useSubStream = false,
   onToggleFullscreen,
-  initDelay = 0,
   showLabels = true,
   showControls = true,
   globalShowDetections = true
@@ -81,6 +81,12 @@ export function MSEVideoCell({
   const reconnectTimeoutRef = useRef(null);
   const initTimeoutRef = useRef(null);
   const dataHandlerRef = useRef(null);
+  // Pending stream-connection-gate settle callbacks ({resolve, reject}) —
+  // resolved on first media, rejected on WS error/close/abort so the gate
+  // slot always frees.
+  const gateSettleRef = useRef(null);
+  // Cell-scoped abort: cancels a queued/in-flight gated attempt on unmount
+  const cellAbortRef = useRef(null);
 
   // Constants from go2rtc's video-rtc.js
   const RECONNECT_TIMEOUT = 15000;
@@ -107,10 +113,32 @@ export function MSEVideoCell({
   };
 
   /**
+   * Settle the pending stream-connection-gate promise (if any).
+   * @param {Error} [err] - reject with this error; resolve when omitted
+   */
+  const settleGate = (err) => {
+    const settle = gateSettleRef.current;
+    if (!settle) return;
+    gateSettleRef.current = null;
+    if (err) settle.reject(err);
+    else settle.resolve();
+  };
+
+  /**
    * Initialize MSE and WebSocket connection
    * Follows go2rtc's video-rtc.js onmse() pattern closely.
+   *
+   * The WebSocket is opened through the shared stream connection gate:
+   * go2rtc only dials the camera's RTSP source once we ask for media, so
+   * the gate bounds how many source spin-ups run at once (replaces the old
+   * 200ms per-cell stagger) and fails fast when an offline camera never
+   * delivers media instead of spinning forever.
    */
   const initMSE = async () => {
+    // Bail if the cell was torn down (guards auto-retry timers after unmount)
+    const cellSignal = cellAbortRef.current ? cellAbortRef.current.signal : null;
+    if (!cellSignal || cellSignal.aborted) return;
+
     if (!videoRef.current) {
       initTimeoutRef.current = setTimeout(initMSE, 50);
       return;
@@ -125,70 +153,99 @@ export function MSEVideoCell({
       const effectiveName = useSubStream ? `${stream.name}_sub` : stream.name;
       const wsUrl = `${go2rtcWsUrl}/api/ws?src=${encodeURIComponent(effectiveName)}`;
 
-      // Create WebSocket connection
-      const ws = new WebSocket(wsUrl);
-      ws.binaryType = 'arraybuffer';
-      wsRef.current = ws;
+      await streamConnectionGate.run((signal) => {
+        // Settled by handleMessage (first media = resolve), handleWsError /
+        // handleClose (reject), or the abort listener below.
+        const connected = new Promise((resolve, reject) => {
+          gateSettleRef.current = { resolve, reject };
+        });
 
-      // Create MediaSource — match go2rtc's pattern exactly
-      const MediaSourceClass = window.ManagedMediaSource || window.MediaSource;
-      if (!MediaSourceClass) {
-        throw new Error('MediaSource not supported in this browser');
-      }
-
-      const ms = new MediaSourceClass();
-      mediaSourceRef.current = ms;
-
-      // Helper: send codec negotiation once both WS and MS are ready
-      const sendCodecs = () => {
-        if (ws.readyState === WebSocket.OPEN && ms.readyState === 'open') {
-          ws.send(JSON.stringify({
-            type: 'mse',
-            value: getCodecs(MediaSourceClass.isTypeSupported.bind(MediaSourceClass))
-          }));
-        }
-      };
-
-      // Codec negotiation: go2rtc sends inside sourceopen, but we also
-      // need to handle the case where WS opens after sourceopen
-      if (window.ManagedMediaSource && ms instanceof window.ManagedMediaSource) {
-        ms.addEventListener('sourceopen', sendCodecs, { once: true });
-        videoRef.current.disableRemotePlayback = true;
-        videoRef.current.srcObject = ms;
-      } else {
-        ms.addEventListener('sourceopen', () => {
-          URL.revokeObjectURL(videoRef.current.src);
-          sendCodecs();
+        signal.addEventListener('abort', () => {
+          settleGate(new DOMException('Connection attempt aborted', 'AbortError'));
         }, { once: true });
-        videoRef.current.src = URL.createObjectURL(ms);
-        videoRef.current.srcObject = null;
-      }
 
-      videoRef.current.ondblclick = (e) => onToggleFullscreen(stream.name, e, cellRef.current);
+        // Create WebSocket connection
+        const ws = new WebSocket(wsUrl);
+        ws.binaryType = 'arraybuffer';
+        wsRef.current = ws;
 
-      // Start playback
-      videoRef.current.play().catch(() => {
-        if (videoRef.current && !videoRef.current.muted) {
-          videoRef.current.muted = true;
-          videoRef.current.play().catch(() => {});
+        // Create MediaSource — match go2rtc's pattern exactly
+        const MediaSourceClass = window.ManagedMediaSource || window.MediaSource;
+        if (!MediaSourceClass) {
+          throw new Error('MediaSource not supported in this browser');
         }
-      });
 
-      // WebSocket event handlers
-      ws.addEventListener('open', () => sendCodecs());
+        const ms = new MediaSourceClass();
+        mediaSourceRef.current = ms;
 
-      ws.addEventListener('message', (ev) => {
-        if (typeof ev.data === 'string') {
-          handleMessage(JSON.parse(ev.data), ms, MediaSourceClass);
+        // Helper: send codec negotiation once both WS and MS are ready
+        const sendCodecs = () => {
+          if (ws.readyState === WebSocket.OPEN && ms.readyState === 'open') {
+            ws.send(JSON.stringify({
+              type: 'mse',
+              value: getCodecs(MediaSourceClass.isTypeSupported.bind(MediaSourceClass))
+            }));
+          }
+        };
+
+        // Codec negotiation: go2rtc sends inside sourceopen, but we also
+        // need to handle the case where WS opens after sourceopen
+        if (window.ManagedMediaSource && ms instanceof window.ManagedMediaSource) {
+          ms.addEventListener('sourceopen', sendCodecs, { once: true });
+          videoRef.current.disableRemotePlayback = true;
+          videoRef.current.srcObject = ms;
         } else {
-          handleBinaryData(ev.data);
+          ms.addEventListener('sourceopen', () => {
+            URL.revokeObjectURL(videoRef.current.src);
+            sendCodecs();
+          }, { once: true });
+          videoRef.current.src = URL.createObjectURL(ms);
+          videoRef.current.srcObject = null;
         }
+
+        videoRef.current.ondblclick = (e) => onToggleFullscreen(stream.name, e, cellRef.current);
+
+        // Start playback
+        videoRef.current.play().catch(() => {
+          if (videoRef.current && !videoRef.current.muted) {
+            videoRef.current.muted = true;
+            videoRef.current.play().catch(() => {});
+          }
+        });
+
+        // WebSocket event handlers. Close/error are guarded against stale
+        // sockets so an intentionally-closed connection (cleanup/retry)
+        // can't schedule a rogue reconnect for a superseded attempt.
+        ws.addEventListener('open', () => sendCodecs());
+
+        ws.addEventListener('message', (ev) => {
+          if (typeof ev.data === 'string') {
+            handleMessage(JSON.parse(ev.data), ms, MediaSourceClass);
+          } else {
+            handleBinaryData(ev.data);
+          }
+        });
+
+        ws.addEventListener('close', () => { if (wsRef.current === ws) handleClose(); });
+        ws.addEventListener('error', () => { if (wsRef.current === ws) handleWsError(); });
+
+        return connected;
+      }, {
+        priority: priorityForStreamStatus(stream.status),
+        signal: cellSignal
       });
-
-      ws.addEventListener('close', () => handleClose());
-      ws.addEventListener('error', () => handleWsError());
-
     } catch (err) {
+      if (isGateAbort(err) || err?.handled) {
+        // Unmounted/superseded, or already surfaced by a WS handler
+        return;
+      }
+      if (isGateTimeout(err)) {
+        console.warn(`[MSE ${stream.name}] No media before gate timeout — treating source as unreachable`);
+        cleanup();
+        setError(t('live.cannotConnectToSource'));
+        setIsLoading(false);
+        return;
+      }
       console.error(`[MSE ${stream.name}] Init error:`, err);
       setError(err.message || t('live.failedToInitializeMseStream'));
       setIsLoading(false);
@@ -204,6 +261,10 @@ export function MSEVideoCell({
       if (msg.type === 'error') {
         setError(msg.value || t('live.streamError'));
         setIsLoading(false);
+        // Free the gate slot; mark handled so initMSE doesn't re-report it
+        const gateErr = new Error(msg.value || 'stream error');
+        gateErr.handled = true;
+        settleGate(gateErr);
       }
       return;
     }
@@ -269,10 +330,15 @@ export function MSEVideoCell({
       setIsPlaying(true);
       // Reset auto-retry counter on successful stream setup
       autoRetryCountRef.current = 0;
+      // Media path is established — release the connection-gate slot
+      settleGate();
     } catch (err) {
       console.error(`[MSE ${stream.name}] SourceBuffer error:`, err);
       setError(t('live.failedToCreateMediaBuffer'));
       setIsLoading(false);
+      const gateErr = new Error('SourceBuffer error');
+      gateErr.handled = true;
+      settleGate(gateErr);
     }
   };
 
@@ -292,6 +358,11 @@ export function MSEVideoCell({
    * when multiple streams start simultaneously; a few retries resolve them.
    */
   const handleWsError = () => {
+    // Free the gate slot; retry scheduling below owns recovery from here
+    const gateErr = new Error('WebSocket error');
+    gateErr.handled = true;
+    settleGate(gateErr);
+
     autoRetryCountRef.current += 1;
     if (autoRetryCountRef.current <= MAX_AUTO_RETRIES) {
       // Exponential back-off: 2s, 4s, 8s
@@ -313,6 +384,11 @@ export function MSEVideoCell({
    * Handle WebSocket close and reconnection
    */
   const handleClose = () => {
+    // Free the gate slot if the socket closed before any media arrived
+    const gateErr = new Error('WebSocket closed before media');
+    gateErr.handled = true;
+    settleGate(gateErr);
+
     if (reconnectTimeoutRef.current) return;
 
     reconnectTimeoutRef.current = setTimeout(() => {
@@ -342,10 +418,19 @@ export function MSEVideoCell({
       autoRetryTimeoutRef.current = null;
     }
 
-    // Close WebSocket
+    // Free any pending gate slot for this attempt
+    {
+      const gateErr = new Error('Connection attempt cleaned up');
+      gateErr.handled = true;
+      settleGate(gateErr);
+    }
+
+    // Close WebSocket — null the ref first so the guarded close/error
+    // listeners recognize this as an intentional close and don't reconnect
     if (wsRef.current) {
-      wsRef.current.close();
+      const ws = wsRef.current;
       wsRef.current = null;
+      ws.close();
     }
 
     // Clean up MediaSource
@@ -491,30 +576,23 @@ export function MSEVideoCell({
     }, 'image/jpeg', 0.95);
   };
 
-  // Initialize MSE when component mounts or retry is triggered
+  // Initialize MSE when component mounts or retry is triggered.
+  // Connection concurrency is bounded by the shared stream connection gate,
+  // so no per-cell stagger delay is needed here.
   useEffect(() => {
     if (!stream || !stream.name) return;
 
-    let isMounted = true;
-    let delayTimeout = null;
-
-    const doInit = () => {
-      if (!isMounted) return;
-      initMSE();
-    };
-
-    if (initDelay > 0) {
-      delayTimeout = setTimeout(doInit, initDelay);
-    } else {
-      doInit();
-    }
+    cellAbortRef.current = new AbortController();
+    initMSE();
 
     return () => {
-      isMounted = false;
-      if (delayTimeout) clearTimeout(delayTimeout);
+      if (cellAbortRef.current) {
+        cellAbortRef.current.abort();
+        cellAbortRef.current = null;
+      }
       cleanup();
     };
-  }, [stream?.name, retryCount, initDelay, useSubStream]);
+  }, [stream?.name, retryCount, useSubStream]);
 
   // Auto-retry when stream status transitions back to 'Running' while the
   // error overlay is visible (e.g. camera came back online after an outage).
@@ -1071,7 +1149,115 @@ export function MSEVideoCell({
             <svg xmlns="http://www.w3.org/2000/svg" width="64" height="64" viewBox="0 0 24 24" fill="white" stroke="white" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
               <polygon points="5 3 19 12 5 21 5 3"></polygon>
             </svg>
-          </div>
+          </button>
+
+          {/* Detection overlay toggle button */}
+          {stream.detection_based_recording && stream.detection_model && isPlaying && (
+            <button
+              className={`detection-toggle-btn ${showDetections ? 'active' : ''}`}
+            title={showDetections ? t('live.hideDetections') : t('live.showDetections')}
+              onClick={() => setLocalShowDetections(!localShowDetections)}
+              style={{
+                padding: '8px 12px',
+                backgroundColor: 'rgba(0, 0, 0, 0.7)',
+                color: 'white',
+                border: 'none',
+                borderRadius: '4px',
+                cursor: 'pointer',
+                fontSize: '14px',
+                fontWeight: 'bold',
+                boxShadow: '0 2px 4px rgba(0, 0, 0, 0.3)',
+                transition: 'background-color 0.2s ease'
+              }}
+            >
+              {showDetections ? (
+                <svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="white" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                  <path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/>
+                  <circle cx="12" cy="12" r="3"/>
+                </svg>
+              ) : (
+                <svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="white" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                  <path d="M17.94 17.94A10.07 10.07 0 0 1 12 20c-7 0-11-8-11-8a18.45 18.45 0 0 1 5.06-5.94M9.9 4.24A9.12 9.12 0 0 1 12 4c7 0 11 8 11 8a18.5 18.5 0 0 1-2.16 3.19m-6.72-1.07a3 3 0 1 1-4.24-4.24"/>
+                  <line x1="1" y1="1" x2="23" y2="23"/>
+                </svg>
+              )}
+            </button>
+          )}
+
+          {/* PTZ toggle button */}
+          {stream.ptz_type && stream.ptz_type !== 'none' && (
+            <button
+              className="ptz-toggle-btn"
+              onClick={() => setShowPTZControls(!showPTZControls)}
+              style={{
+                padding: '8px 12px',
+                backgroundColor: showPTZControls ? '#2563eb' : 'rgba(0, 0, 0, 0.7)',
+                color: 'white',
+                border: 'none',
+                borderRadius: '4px',
+                cursor: 'pointer',
+                fontSize: '14px',
+                fontWeight: 'bold',
+                boxShadow: '0 2px 4px rgba(0, 0, 0, 0.3)',
+                transition: 'background-color 0.2s ease'
+              }}
+              title={t('live.togglePtzControls')}
+            >
+              PTZ
+            </button>
+          )}
+
+          {/* Day/Night mode control (ONVIF cameras only; renders nothing otherwise) */}
+          <DayNightControl stream={stream} />
+
+          <button
+            type="button"
+            className="timeline-btn"
+            onClick={(event) => {
+              const fromFullscreen = !!(document.fullscreenElement || document.webkitFullscreenElement);
+              forceNavigation(formatUtils.getTimelineUrl(stream.name, new Date().toISOString(), fromFullscreen), event);
+            }}
+            style={{
+              padding: '8px 12px',
+              backgroundColor: 'rgba(0, 0, 0, 0.7)',
+              color: 'white',
+              border: 'none',
+              borderRadius: '4px',
+              cursor: 'pointer',
+              boxShadow: '0 2px 4px rgba(0, 0, 0, 0.3)',
+              transition: 'background-color 0.2s ease',
+              display: 'flex',
+              alignItems: 'center',
+              justifyContent: 'center'
+            }}
+            title={t('live.viewInTimeline')}
+            aria-label={t('live.viewInTimeline')}
+          >
+            <svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 640 640" fill="white" stroke="white" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+              <path d="M320 128C426 128 512 214 512 320C512 426 426 512 320 512C254.8 512 197.1 479.5 162.4 429.7C152.3 415.2 132.3 411.7 117.8 421.8C103.3 431.9 99.8 451.9 109.9 466.4C156.1 532.6 233 576 320 576C461.4 576 576 461.4 576 320C576 178.6 461.4 64 320 64C234.3 64 158.5 106.1 112 170.7L112 144C112 126.3 97.7 112 80 112C62.3 112 48 126.3 48 144L48 256C48 273.7 62.3 288 80 288L104.6 288C105.1 288 105.6 288 106.1 288L192.1 288C209.8 288 224.1 273.7 224.1 256C224.1 238.3 209.8 224 192.1 224L153.8 224C186.9 166.6 249 128 320 128zM344 216C344 202.7 333.3 192 320 192C306.7 192 296 202.7 296 216L296 320C296 326.4 298.5 332.5 303 337L375 409C384.4 418.4 399.6 418.4 408.9 409C418.2 399.6 418.3 384.4 408.9 375.1L343.9 310.1L343.9 216z"/>
+            </svg>
+          </button>
+
+          {/* Fullscreen button */}
+          <button
+            className="fullscreen-btn"
+            onClick={(e) => onToggleFullscreen(stream.name, e, cellRef.current)}
+            style={{
+              padding: '8px 12px',
+              backgroundColor: 'rgba(0, 0, 0, 0.7)',
+              color: 'white',
+              border: 'none',
+              borderRadius: '4px',
+              cursor: 'pointer',
+              fontSize: '14px',
+              fontWeight: 'bold',
+              boxShadow: '0 2px 4px rgba(0, 0, 0, 0.3)',
+              transition: 'background-color 0.2s ease'
+            }}
+            title={t('live.toggleFullscreen')}
+          >
+            ⛶
+          </button>
         </div>
       )}
 	  
