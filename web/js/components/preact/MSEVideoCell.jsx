@@ -1150,6 +1150,8 @@ export function MSEVideoCell({
               <polygon points="5 3 19 12 5 21 5 3"></polygon>
             </svg>
           </div>
+        </div>
+      )}
 
           {/* Detection overlay toggle button */}
           {stream.detection_based_recording && stream.detection_model && isPlaying && (
