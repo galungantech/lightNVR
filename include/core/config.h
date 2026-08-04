@@ -60,8 +60,8 @@ typedef struct {
     bool backchannel_enabled; // Whether two-way audio is enabled for this stream
 
     // Per-stream retention policy settings
-    int retention_days;              // Regular recordings retention (0 = use global)
-    int detection_retention_days;    // Detection recordings retention (0 = use global)
+    int retention_days;              // -1 = use global, 0 = unlimited, >0 = days
+    int detection_retention_days;    // -1 = use global, 0 = unlimited, >0 = days
     int max_storage_mb;              // Storage quota in MB (0 = unlimited)
 
     // Tiered retention multipliers (applied to base retention_days)
@@ -80,6 +80,8 @@ typedef struct {
     // Recording schedule configuration
     bool record_on_schedule;         // When true, only record during scheduled hours
     uint8_t recording_schedule[168]; // 7 days x 24 hours: [day*24+hour] = 1 to record, 0 to skip
+    bool detection_record_on_schedule;         // Gate detection-triggered recordings independently
+    uint8_t detection_recording_schedule[168]; // 7 days x 24 hours; defaults to all enabled
 
     // Camera tags (comma-separated, e.g. "outdoor,critical,entrance")
     // Replaces the former single group_name field — supports multi-label filtering and RBAC
@@ -124,6 +126,7 @@ typedef struct {
     // full keyframe, eliminating the large inter-frame gap that limits detection
     // accuracy on the main H.264/H.265 RTSP stream.
     char detection_url[MAX_URL_LENGTH];
+    char publish_url[MAX_URL_LENGTH];        // RTMP/RTMPS restream (publish) destination, e.g. YouTube Live ingest URL
 } stream_config_t;
 
 // Size of recording schedule text buffer: 168 values + 167 commas + null terminator
@@ -155,6 +158,17 @@ typedef struct {
     uint64_t max_storage_size; // in bytes
     int retention_days;
     bool auto_delete_oldest;
+
+    // Capacity-based retention (bounds usage by disk size, not just by time).
+    // The cleanup thread keeps at least storage_min_free_pct of the volume free
+    // by evicting the oldest eligible recordings, regardless of retention_days.
+    // This makes the disk self-bounding: "keep as many days as physically fit."
+    int storage_min_free_pct;          // Target free-space headroom to maintain (default 10). 0 disables.
+    // Configurable disk-pressure thresholds (percent of free space remaining).
+    // Defaults mirror the historical hardcoded 20/10/5 values.
+    double storage_pressure_warning_pct;   // Enter WARNING below this % free (default 20)
+    double storage_pressure_critical_pct;  // Enter CRITICAL below this % free (default 10)
+    double storage_pressure_emergency_pct; // Enter EMERGENCY below this % free (default 5)
 
     // Thumbnail/grid view settings
     bool generate_thumbnails;        // Enable grid view with thumbnail previews on recordings page
@@ -255,6 +269,11 @@ typedef struct {
     char go2rtc_stun_server[256];         // Primary STUN server (default: stun.l.google.com:19302)
     char go2rtc_external_ip[64];          // Optional: External IP for NAT (empty = auto-detect)
     char go2rtc_ice_servers[512];         // Optional: Custom ICE servers (comma-separated)
+
+    // Browser-side WebRTC live-view timeouts (milliseconds). Exposed to the web
+    // client via /api/settings so Docker users can tune them without rebuilding.
+    int webrtc_connection_timeout_ms;     // Overall connect timeout before "Connection timeout" (default: 30000)
+    int webrtc_ice_recovery_timeout_ms;   // Grace window after ICE disconnect before "connection lost" (default: 5000)
 
     // TURN server settings for WebRTC relay (exposed to browser)
     bool turn_enabled;                    // Enable TURN relay (default: false)

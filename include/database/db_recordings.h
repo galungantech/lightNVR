@@ -3,6 +3,7 @@
 
 #include <stdint.h>
 #include <stdbool.h>
+#include <string.h>
 #include <time.h>
 
 #include "core/config.h"
@@ -20,12 +21,33 @@ typedef struct {
     int fps;
     char codec[16];
     bool is_complete;
-    char trigger_type[16];  // 'scheduled', 'detection', 'motion', 'manual'
+    char trigger_type[16];  // 'continuous', 'scheduled', 'detection', 'motion', 'manual'
     bool protected;         // If true, recording is protected from automatic deletion
     int retention_override_days;  // Custom retention period override (-1 = use stream default)
     int retention_tier;     // 0=Critical, 1=Important, 2=Standard, 3=Ephemeral
     bool disk_pressure_eligible;  // If true, recording can be deleted under disk pressure
+    int schedule_restricted; // -1 = unknown/legacy, 0 = unrestricted, 1 = schedule-gated
 } recording_metadata_t;
+
+/**
+ * Return the public capture-method value for a recording.
+ *
+ * Older releases stored all always-on and schedule-gated recordings as
+ * "scheduled". Once schedule_restricted metadata became available we can
+ * report known-unrestricted legacy rows accurately without rewriting history.
+ * Rows whose schedule metadata is unknown remain "scheduled".
+ */
+static inline const char *recording_capture_method(
+    const recording_metadata_t *recording) {
+    if (!recording || recording->trigger_type[0] == '\0') {
+        return "scheduled";
+    }
+    if (strcmp(recording->trigger_type, "scheduled") == 0 &&
+        recording->schedule_restricted == 0) {
+        return "continuous";
+    }
+    return recording->trigger_type;
+}
 
 // Retention tier constants
 #define RETENTION_TIER_CRITICAL   0
@@ -269,6 +291,19 @@ int get_recordings_for_tiered_retention(const char *stream_name,
  */
 int get_recordings_for_pressure_cleanup(recording_metadata_t *recordings,
                                         int max_count);
+
+/**
+ * Get recordings still marked incomplete (is_complete = 0) and older than
+ * older_than_seconds — i.e. recordings interrupted by an unclean shutdown.
+ * The caller inspects the on-disk file to finalize or prune each one.
+ *
+ * @param recordings Array to fill with recording metadata
+ * @param max_count Maximum number of recordings to return
+ * @param older_than_seconds Only return rows whose start_time is older than this
+ * @return Number of recordings found, or -1 on error
+ */
+int get_stale_incomplete_recordings(recording_metadata_t *recordings, int max_count,
+                                    int older_than_seconds);
 
 /**
  * Get total storage bytes used by a stream from the database

@@ -7,12 +7,13 @@
 import { useState, useEffect, useRef, useCallback } from 'preact/hooks';
 import { DetectionOverlay, drawDetectionsOnCanvas } from './DetectionOverlay.jsx';
 import { SnapshotButton } from './SnapshotManager.jsx';
+import { ManualRecordingButton } from './ManualRecordingButton.jsx';
 import { LoadingIndicator } from './LoadingIndicator.jsx';
 import { showStatusMessage } from './ToastContainer.jsx';
 import { PTZControls } from './PTZControls.jsx';
 import { DayNightControl } from './DayNightControl.jsx';
 import { ConfirmDialog } from './UI.jsx';
-import { getGo2rtcBaseUrl } from '../../utils/settings-utils.js';
+import { getGo2rtcBaseUrl, getWebRTCTimeouts } from '../../utils/settings-utils.js';
 import { formatFilenameTimestamp } from '../../utils/date-utils.js';
 import { forceNavigation } from '../../utils/navigation-utils.js';
 import { formatUtils } from './recordings/formatUtils.js';
@@ -20,7 +21,9 @@ import { useI18n } from '../../i18n.js';
 import { useQueryClient } from '../../query-client.js';
 import { createPlayerTelemetry } from '../../utils/player-telemetry.js';
 import { useAutoRetry } from './useAutoRetry.js';
+import { useVideoZoom } from './useVideoZoom.js';
 import { streamConnectionGate, priorityForStreamStatus, isGateTimeout, isGateAbort } from '../../utils/stream-connection-gate.js';
+import { shouldFallbackFullscreenToSubStream } from './liveStreamPolicy.js';
 import 'webrtc-adapter';
 
 // Retry configuration for sending WebRTC offers to go2rtc.
@@ -28,8 +31,8 @@ import 'webrtc-adapter';
 // Configuration for detecting lack of incoming video data.
 // MAX_VIDEO_DATA_CHECKS × VIDEO_DATA_CHECK_INTERVAL_MS defines the total
 // time we will wait for video frames before surfacing an error.
-const MAX_VIDEO_DATA_CHECKS = 6; // 6 checks × 15,000 ms (15s) interval = 90s total
-const VIDEO_DATA_CHECK_INTERVAL_MS = 15000; // 15 seconds between checks
+const MAX_VIDEO_DATA_CHECKS = 12; // 12 checks × 5,000 ms = 60s total
+const VIDEO_DATA_CHECK_INTERVAL_MS = 5000; // fail a fullscreen main-stream upgrade fast
 const MIN_NO_DATA_CHECKS_BEFORE_RETRY = 2;
 const MAX_NO_DATA_RECONNECT_ATTEMPTS = 3;
 const MAX_OFFER_RETRIES = 4;
@@ -58,6 +61,9 @@ const CONNECTION_QUALITY_THRESHOLDS = {
  * WebRTCVideoCell component
  * @param {Object} props - Component props
  * @param {Object} props.stream - Stream object
+ * @param {boolean} props.useSubStream - Render the camera's sub-stream instead of the main stream
+ * @param {boolean} props.fullscreenUpgraded - This cell would normally use the sub-stream but has
+ *   been upgraded to the main stream because it is fullscreen. Enables the bandwidth fallback (#468).
  * @param {Function} props.onToggleFullscreen - Fullscreen toggle handler
  * @param {string} props.streamId - Stream ID for stable reference
  * @returns {JSX.Element} WebRTCVideoCell component
@@ -66,6 +72,7 @@ export function WebRTCVideoCell({
   stream,
   streamId,
   useSubStream = false,
+  fullscreenUpgraded = false,
   onToggleFullscreen,
   showLabels = true,
   showControls = true,
@@ -99,6 +106,18 @@ export function WebRTCVideoCell({
   const [retryCount, setRetryCount] = useState(0); // Used to trigger WebRTC re-initialization
   const [showRefreshConfirm, setShowRefreshConfirm] = useState(false);
 
+  // Sub-stream fallback (#468). Entering fullscreen flips the `useSubStream`
+  // prop to false so the cell upgrades to the full-resolution main stream. On a
+  // LAN that is exactly what you want, but over a remote/proxied link the main
+  // stream's bitrate can exceed the available bandwidth: ICE connects, packets
+  // are lost wholesale, and no frames ever decode. Reconnecting to the *same*
+  // main stream can never fix that, so when the no-data watchdog trips while we
+  // are only on the main stream because of fullscreen, drop back to the
+  // sub-stream instead of burning reconnect attempts on a link that cannot
+  // carry it.
+  const [subStreamFallback, setSubStreamFallback] = useState(false);
+  const effectiveUseSubStream = useSubStream || subStreamFallback;
+
   // Backchannel (two-way audio) state
   const [isTalking, setIsTalking] = useState(false);
   const [microphoneError, setMicrophoneError] = useState(null);
@@ -119,6 +138,9 @@ export function WebRTCVideoCell({
   // Detection overlay visibility state (per-camera toggle, constrained by global toggle)
   const [localShowDetections, setLocalShowDetections] = useState(true);
   const showDetections = globalShowDetections && localShowDetections;
+
+  // Digital zoom: scroll to zoom, drag to pan, pinch on touch (#465).
+  const zoom = useVideoZoom();
 
   // Refs
   const videoRef = useRef(null);
@@ -209,6 +231,22 @@ export function WebRTCVideoCell({
     }
   }, [applyAudioPlaybackState, stream?.name, t]);
 
+  // Clear the sub-stream fallback whenever the cell is no longer being forced
+  // onto the main stream (i.e. it left fullscreen and the grid asked for the
+  // sub-stream again) or the cell is pointed at a different camera. Both cases
+  // already leave `effectiveUseSubStream` true, so clearing the flag here does
+  // not itself trigger a reconnect — it just re-arms the fallback for the next
+  // fullscreen attempt.
+  useEffect(() => {
+    if (useSubStream && subStreamFallback) {
+      setSubStreamFallback(false);
+    }
+  }, [useSubStream, subStreamFallback]);
+
+  useEffect(() => {
+    setSubStreamFallback(false);
+  }, [stream?.name]);
+
   // Initialize WebRTC connection when component mounts
   useEffect(() => {
     if (!stream || !stream.name || !videoRef.current) return;
@@ -225,6 +263,13 @@ export function WebRTCVideoCell({
     let videoDataTimeout = null;
     let go2rtcBaseUrl = null;
 
+    // Server-configurable WebRTC timeouts (ms). Populated in initWebRTC from
+    // /api/settings; seeded with the previous hardcoded defaults so behaviour is
+    // unchanged when the server does not supply values. Lets Docker users tune
+    // these via lightnvr.ini / env / settings API without rebuilding the bundle.
+    let webrtcConnectionTimeoutMs = 30000;
+    let webrtcIceRecoveryTimeoutMs = 5000;
+
     // Cell-scoped abort: cancels queued/in-flight gated requests on unmount
     // or when this effect re-runs (retry, sub-stream switch).
     abortControllerRef.current = new AbortController();
@@ -239,6 +284,15 @@ export function WebRTCVideoCell({
       } catch (err) {
         console.warn('Failed to get go2rtc URL from settings, using default:', err);
         go2rtcBaseUrl = `${window.location.origin}/go2rtc`;
+      }
+
+      // Load server-configurable connection timeouts (falls back to defaults)
+      try {
+        const timeouts = await getWebRTCTimeouts();
+        webrtcConnectionTimeoutMs = timeouts.connectionMs;
+        webrtcIceRecoveryTimeoutMs = timeouts.iceRecoveryMs;
+      } catch (err) {
+        console.warn('Failed to load WebRTC timeouts, using defaults:', err);
       }
 
       // Fetch ICE server configuration from API (includes TURN if configured)
@@ -392,14 +446,36 @@ export function WebRTCVideoCell({
                 });
               }
 
-              // After 30 s with ICE connected but no video data, auto-retry
-              // the entire WebRTC connection.  This recovers from go2rtc RTSP
-              // source issues (camera offline, stale state, etc.) without
-              // requiring the user to click Retry manually.  Mirrors the
-              // existing ICE-failure auto-retry at oniceconnectionstatechange.
+              // With ICE connected but no video data, retry this player's
+              // WebRTC connection without restarting the shared source.
               // Uses a dedicated counter (noDataReconnectAttemptsRef) so that
               // the ICE-connected reset of reconnectAttemptsRef doesn't
               // inadvertently allow infinite no-data retries.
+              //
+              // Before spending a reconnect attempt, check whether we are only
+              // on the main stream because this cell is fullscreen (#468). If a
+              // sub-stream exists, ICE is connected and no frames are arriving,
+              // the most likely cause is that the link cannot carry the main
+              // stream's bitrate — reconnecting to the same source would fail
+              // the same way, so step down to the sub-stream instead.
+              if (
+                (iceState === 'connected' || iceState === 'completed') &&
+                shouldFallbackFullscreenToSubStream({
+                  fullscreenUpgraded,
+                  effectiveUseSubStream,
+                  noVideoCheckCount: videoDataCheckCount,
+                })
+              ) {
+                console.log(
+                  `Falling back to sub-stream for fullscreen cell ${stream.name}: ICE connected but ` +
+                  `no video data after ${videoDataCheckCount * VIDEO_DATA_CHECK_INTERVAL_MS / 1000}s ` +
+                  `(main stream bitrate likely exceeds available bandwidth)`
+                );
+                showStatusMessage(t('live.fullscreenSubStreamFallback', { stream: stream.name }), 'warning', 5000);
+                setSubStreamFallback(true);
+                return; // Stop check chain; the effect re-runs against the sub-stream
+              }
+
               if (
                 videoDataCheckCount >= MIN_NO_DATA_CHECKS_BEFORE_RETRY &&
                 (iceState === 'connected' || iceState === 'completed') &&
@@ -409,20 +485,11 @@ export function WebRTCVideoCell({
                 connectionRefreshRequestedRef.current = true;
                 noDataReconnectAttemptsRef.current++;
                 console.log(
-                  `Auto-reconnecting stream ${stream.name}: ICE connected but no video data ` +
+                  `Retrying local WebRTC player for stream ${stream.name}: ICE connected but no video data ` +
                   `after ${videoDataCheckCount * VIDEO_DATA_CHECK_INTERVAL_MS / 1000}s ` +
                   `(attempt ${noDataReconnectAttemptsRef.current}/${MAX_NO_DATA_RECONNECT_ATTEMPTS})`
                 );
-                (async () => {
-                  try {
-                    await refreshStreamRegistration();
-                    // Give go2rtc time to fully re-register the RTSP source
-                    await new Promise(resolve => setTimeout(resolve, 2000));
-                  } catch (err) {
-                    console.error(`Error refreshing stream ${stream.name} during auto-reconnect:`, err);
-                  }
-                  setRetryCount(prev => prev + 1);
-                })();
+                setRetryCount(prev => prev + 1);
                 return; // Stop check chain; the retry useEffect run starts fresh
               }
 
@@ -554,36 +621,14 @@ export function WebRTCVideoCell({
           connectionMonitorRef.current = null;
         }
 
-        // Auto-refresh and retry if we haven't already for this connection attempt
+        // Retry only this player. Restarting the shared go2rtc source from an
+        // automatic client retry disrupts every viewer and can create a
+        // refresh feedback loop on multi-view dashboards (#457).
         if (!connectionRefreshRequestedRef.current && reconnectAttemptsRef.current < 3) {
           connectionRefreshRequestedRef.current = true;
           reconnectAttemptsRef.current++;
-          console.log(`Auto-refreshing go2rtc registration for stream ${stream.name} (attempt ${reconnectAttemptsRef.current}/3)`);
-
-          // Trigger a refresh and retry automatically
-          (async () => {
-            try {
-              const response = await fetch(`/api/streams/${encodeURIComponent(stream.name)}/refresh`, {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-              });
-              if (response.ok) {
-                console.log(`Successfully refreshed go2rtc registration for ${stream.name}, retrying connection...`);
-                // Delay to allow go2rtc to fully process the refresh (longer for slow devices)
-                await new Promise(resolve => setTimeout(resolve, 3000));
-                // Trigger a retry by incrementing retryCount
-                setRetryCount(prev => prev + 1);
-                return;
-              } else {
-                console.warn(`Failed to refresh stream ${stream.name}: ${response.status}`);
-              }
-            } catch (err) {
-              console.error(`Error refreshing stream ${stream.name}:`, err);
-            }
-            // If refresh failed, show the error
-            setError(t('live.webrtcIceConnectionFailed'));
-            setIsLoading(false);
-          })();
+          console.log(`Retrying local WebRTC player for stream ${stream.name} (attempt ${reconnectAttemptsRef.current}/3)`);
+          setRetryCount(prev => prev + 1);
         } else {
           setError(t('live.webrtcIceConnectionFailed'));
           setIsLoading(false);
@@ -617,7 +662,7 @@ export function WebRTCVideoCell({
           } else if (peerConnectionRef.current) {
             console.log(`WebRTC ICE connection recovered for stream ${stream.name}, current state: ${peerConnectionRef.current.iceConnectionState}`);
           }
-        }, 5000); // Wait 5 seconds to see if connection recovers
+        }, webrtcIceRecoveryTimeoutMs); // Grace window to see if connection recovers (configurable)
       } else if (pc.iceConnectionState === 'closed') {
         // Stop monitoring when closed
         if (connectionMonitorRef.current) {
@@ -687,7 +732,7 @@ export function WebRTCVideoCell({
         setError(t('live.connectionTimeoutCheckNetwork'));
         setIsLoading(false);
       }
-    }, 30000); // 30 second timeout
+    }, webrtcConnectionTimeoutMs); // Overall connect timeout (configurable via settings)
 
     // Create and send offer
     pc.createOffer()
@@ -715,7 +760,7 @@ export function WebRTCVideoCell({
         // condition) with exponential backoff; the slot is released between
         // attempts so other cameras aren't starved while we back off.
 
-        const effectiveName = useSubStream ? `${stream.name}_sub` : stream.name;
+        const effectiveName = effectiveUseSubStream ? `${stream.name}_sub` : stream.name;
         const offerGateOpts = {
           priority: priorityForStreamStatus(stream.status),
           signal: cellAbortSignal,
@@ -860,6 +905,19 @@ export function WebRTCVideoCell({
             console.log(`Stats: loss=${lossPercentage.toFixed(2)}%, rtt=${(currentRtt * 1000).toFixed(0)}ms, jitter=${(jitter * 1000).toFixed(0)}ms`);
             setConnectionQuality(quality);
           }
+
+          if (shouldFallbackFullscreenToSubStream({
+            fullscreenUpgraded,
+            effectiveUseSubStream,
+            connectionQuality: quality,
+          })) {
+            console.log(
+              `Falling back to sub-stream for fullscreen cell ${stream.name}: ` +
+              `main-stream WebRTC quality is ${quality}`
+            );
+            showStatusMessage(t('live.fullscreenSubStreamFallback', { stream: stream.name }), 'warning', 5000);
+            setSubStreamFallback(true);
+          }
         }).catch(err => {
           console.warn(`Error getting WebRTC stats for stream ${stream.name}:`, err);
         });
@@ -950,7 +1008,7 @@ export function WebRTCVideoCell({
     // /api/streams status refetch doesn't tear down healthy connections when
     // it produces new object identities every poll cycle.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [stream?.name, retryCount, useSubStream, t, applyAudioPlaybackState]);
+  }, [stream?.name, retryCount, effectiveUseSubStream, t, applyAudioPlaybackState]);
 
   // Auto-retry when stream status transitions back to 'Running' while the
   // error overlay is visible (e.g. camera came back online after an outage).
@@ -1003,8 +1061,9 @@ export function WebRTCVideoCell({
     }
   };
 
-  // Handle retry button click
-  const handleRetry = async () => {
+  // Retry only this browser player. Shared-source refresh is reserved for the
+  // explicitly labelled force-refresh control (#457).
+  const handleRetry = () => {
     console.log(`Retry requested for stream ${stream?.name}`);
 
     // Clean up existing connection
@@ -1030,15 +1089,14 @@ export function WebRTCVideoCell({
     connectionRefreshRequestedRef.current = false;
     noDataReconnectAttemptsRef.current = 0;
 
-    // Refresh the stream's go2rtc registration before retrying
-    // This helps recover from stale go2rtc state that causes WebRTC failures
-    await refreshStreamRegistration();
-
-    // Delay to allow go2rtc to fully re-register the stream (longer for slow devices)
-    await new Promise(resolve => setTimeout(resolve, 2000));
-
     // Increment retry count to trigger useEffect re-run
     setRetryCount(prev => prev + 1);
+  };
+
+  const handleForceRefresh = async () => {
+    await refreshStreamRegistration();
+    await new Promise(resolve => setTimeout(resolve, 2000));
+    handleRetry();
   };
 
   // Auto-retry while the error overlay is visible — recovers unattended
@@ -1264,12 +1322,22 @@ export function WebRTCVideoCell({
       className="video-cell"
       data-stream-name={stream.name}
       data-stream-id={streamId}
-      data-sub-stream={useSubStream ? 'true' : 'false'}
-      ref={cellRef}
+      data-sub-stream={effectiveUseSubStream ? 'true' : 'false'}
+      data-zoom-scale={zoom.isZoomed ? zoom.scale.toFixed(2) : undefined}
+      ref={(el) => {
+        // The cell is already `position: relative; overflow: hidden`, which is
+        // exactly what the zoom viewport needs, so it doubles as the zoom
+        // container. Overlays are siblings of the <video>, so only the video
+        // is transformed — labels and controls stay put and stay legible.
+        cellRef.current = el;
+        zoom.containerRef.current = el;
+      }}
       style={{
         position: 'relative',
         pointerEvents: 'auto',
-        zIndex: 1
+        zIndex: 1,
+        cursor: zoom.isZoomed ? 'move' : undefined,
+        touchAction: zoom.touchAction
       }}
     >
       {/* Video element */}
@@ -1281,11 +1349,20 @@ export function WebRTCVideoCell({
         muted={!audioEnabled}
         disablePictureInPicture
         playsInline
-        style={{ width: '100%', height: '100%', objectFit: 'contain' }}
+        style={{
+          width: '100%',
+          height: '100%',
+          objectFit: 'contain',
+          transform: zoom.transform,
+          transformOrigin: 'center center'
+        }}
       />
 
-      {/* Detection overlay component */}
-      {stream.detection_based_recording && stream.detection_model && showDetections && (
+      {/* Detection overlay component.
+          Hidden while zoomed: the canvas is sized to the cell, not to the
+          transformed video, so its boxes would sit somewhere other than the
+          objects they describe. */}
+      {stream.detection_based_recording && stream.detection_model && showDetections && !zoom.isZoomed && (
         <DetectionOverlay
           ref={detectionOverlayRef}
           streamName={stream.name}
@@ -1293,6 +1370,33 @@ export function WebRTCVideoCell({
           enabled={isPlaying}
           detectionModel={stream.detection_model}
         />
+      )}
+
+      {/* Digital zoom level + reset. Only present while zoomed, so it costs
+          nothing in the normal case and is the obvious way back to 1×. */}
+      {zoom.isZoomed && (
+        <button
+          type="button"
+          onClick={(e) => { e.stopPropagation(); zoom.reset(); }}
+          title={t('live.resetZoom')}
+          aria-label={t('live.resetZoom')}
+          style={{
+            position: 'absolute',
+            bottom: '10px',
+            right: '10px',
+            padding: '4px 8px',
+            backgroundColor: 'rgba(0, 0, 0, 0.6)',
+            color: 'white',
+            border: 'none',
+            borderRadius: '4px',
+            fontSize: '12px',
+            lineHeight: 1.2,
+            cursor: 'pointer',
+            zIndex: 4
+          }}
+        >
+          {zoom.scale.toFixed(1)}× ✕
+        </button>
       )}
 
       {/* Stream name overlay with connection quality indicator */}
@@ -1378,19 +1482,11 @@ export function WebRTCVideoCell({
           borderRadius: '4px'
         }}
       >
-        <div
-          style={{
-            backgroundColor: 'transparent',
-            padding: '5px',
-            borderRadius: '4px'
-          }}
-          onMouseOver={(e) => e.currentTarget.style.backgroundColor = 'rgba(255, 255, 255, 0.2)'}
-          onMouseOut={(e) => e.currentTarget.style.backgroundColor = 'transparent'}
-        >
-          <SnapshotButton
-            streamId={streamId}
-            streamName={stream.name}
-            onSnapshot={() => {
+        <ManualRecordingButton streamName={stream.name} />
+        <SnapshotButton
+          streamId={streamId}
+          streamName={stream.name}
+          onSnapshot={() => {
               if (!videoRef.current) return;
 
               const videoElement = videoRef.current;
@@ -1444,9 +1540,8 @@ export function WebRTCVideoCell({
 
                 showStatusMessage(t('live.snapshotSaved', { fileName }), 'success', 2000);
               }, 'image/jpeg', 0.95);
-            }}
-          />
-        </div>
+          }}
+        />
         {/* Pause for privacy button */}
         <button
           type="button"
@@ -1650,7 +1745,7 @@ export function WebRTCVideoCell({
           <button
             className="force-refresh-btn"
             title={t('live.forceRefreshStream')}
-            onClick={() => stream?.record ? setShowRefreshConfirm(true) : handleRetry()}
+            onClick={() => stream?.record ? setShowRefreshConfirm(true) : handleForceRefresh()}
             style={{
               backgroundColor: 'transparent',
               border: 'none',
@@ -1852,7 +1947,7 @@ export function WebRTCVideoCell({
       <ConfirmDialog
         isOpen={showRefreshConfirm}
         onClose={() => setShowRefreshConfirm(false)}
-        onConfirm={handleRetry}
+        onConfirm={handleForceRefresh}
         title={t('live.forceRefreshStream')}
         message={t('live.forceRefreshWarning')}
         confirmLabel={t('common.refresh')}

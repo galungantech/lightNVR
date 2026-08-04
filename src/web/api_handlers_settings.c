@@ -31,6 +31,7 @@
 #include "video/go2rtc/go2rtc_integration.h"
 #include "video/hls/hls_api.h"
 #include "core/mqtt_client.h"
+#include "storage/storage_manager.h"
 #include "utils/yaml_validate.h"
 
 /**
@@ -417,6 +418,10 @@ void handle_get_settings(const http_request_t *req, http_response_t *res) {
     cJSON_AddNumberToObject(settings, "max_storage_size", (double)g_config.max_storage_size);
     cJSON_AddNumberToObject(settings, "retention_days", g_config.retention_days);
     cJSON_AddBoolToObject(settings, "auto_delete_oldest", g_config.auto_delete_oldest);
+    cJSON_AddNumberToObject(settings, "storage_min_free_pct", g_config.storage_min_free_pct);
+    cJSON_AddNumberToObject(settings, "storage_pressure_warning_pct", g_config.storage_pressure_warning_pct);
+    cJSON_AddNumberToObject(settings, "storage_pressure_critical_pct", g_config.storage_pressure_critical_pct);
+    cJSON_AddNumberToObject(settings, "storage_pressure_emergency_pct", g_config.storage_pressure_emergency_pct);
     cJSON_AddBoolToObject(settings, "generate_thumbnails", g_config.generate_thumbnails);
     cJSON_AddNumberToObject(settings, "thumbnails_per_recording", g_config.thumbnails_per_recording);
     cJSON_AddNumberToObject(settings, "max_streams", g_config.max_streams);
@@ -495,6 +500,8 @@ void handle_get_settings(const http_request_t *req, http_response_t *res) {
     cJSON_AddStringToObject(settings, "go2rtc_stun_server", g_config.go2rtc_stun_server);
     cJSON_AddStringToObject(settings, "go2rtc_external_ip", g_config.go2rtc_external_ip);
     cJSON_AddStringToObject(settings, "go2rtc_ice_servers", g_config.go2rtc_ice_servers);
+    cJSON_AddNumberToObject(settings, "webrtc_connection_timeout_ms", g_config.webrtc_connection_timeout_ms);
+    cJSON_AddNumberToObject(settings, "webrtc_ice_recovery_timeout_ms", g_config.webrtc_ice_recovery_timeout_ms);
     cJSON_AddBoolToObject(settings, "go2rtc_force_native_hls", g_config.go2rtc_force_native_hls);
 
     // go2rtc global config override (stored in system_settings table).
@@ -899,7 +906,14 @@ void handle_post_settings(const http_request_t *req, http_response_t *res) {
     // Retention days
     cJSON *retention_days = cJSON_GetObjectItem(settings, "retention_days");
     if (retention_days && cJSON_IsNumber(retention_days)) {
+        if (retention_days->valueint < 0 || retention_days->valueint > 365) {
+            cJSON_Delete(settings);
+            http_response_set_json_error(res, 400,
+                "retention_days must be between 0 and 365");
+            return;
+        }
         g_config.retention_days = retention_days->valueint;
+        set_retention_days(g_config.retention_days);
         settings_changed = true;
         log_info("Updated retention_days: %d", g_config.retention_days);
     }
@@ -910,6 +924,35 @@ void handle_post_settings(const http_request_t *req, http_response_t *res) {
         g_config.auto_delete_oldest = cJSON_IsTrue(auto_delete_oldest);
         settings_changed = true;
         log_info("Updated auto_delete_oldest: %s", g_config.auto_delete_oldest ? "true" : "false");
+    }
+
+    // Capacity-based retention: minimum free-space headroom to maintain (%)
+    cJSON *min_free_pct = cJSON_GetObjectItem(settings, "storage_min_free_pct");
+    if (min_free_pct && cJSON_IsNumber(min_free_pct)) {
+        int v = min_free_pct->valueint;
+        if (v < 0) v = 0;
+        if (v > 90) v = 90;
+        g_config.storage_min_free_pct = v;
+        settings_changed = true;
+        log_info("Updated storage_min_free_pct: %d", g_config.storage_min_free_pct);
+    }
+
+    // Disk-pressure thresholds (%). Only apply the trio if it stays well-ordered.
+    cJSON *warn = cJSON_GetObjectItem(settings, "storage_pressure_warning_pct");
+    cJSON *crit = cJSON_GetObjectItem(settings, "storage_pressure_critical_pct");
+    cJSON *emerg = cJSON_GetObjectItem(settings, "storage_pressure_emergency_pct");
+    if (warn && crit && emerg && cJSON_IsNumber(warn) && cJSON_IsNumber(crit) && cJSON_IsNumber(emerg)) {
+        double w = warn->valuedouble, c = crit->valuedouble, e = emerg->valuedouble;
+        if (e > 0.0 && c > e && w > c && w <= 100.0) {
+            g_config.storage_pressure_warning_pct = w;
+            g_config.storage_pressure_critical_pct = c;
+            g_config.storage_pressure_emergency_pct = e;
+            settings_changed = true;
+            log_info("Updated disk pressure thresholds: warning=%.1f critical=%.1f emergency=%.1f", w, c, e);
+        } else {
+            log_warn("Ignoring disk pressure thresholds (must satisfy 0 < emergency < critical < warning <= 100): "
+                     "warning=%.1f critical=%.1f emergency=%.1f", w, c, e);
+        }
     }
 
     // Generate thumbnails (grid view)
@@ -1178,6 +1221,24 @@ void handle_post_settings(const http_request_t *req, http_response_t *res) {
         g_config.go2rtc_webrtc_listen_port = go2rtc_webrtc_listen_port->valueint;
         settings_changed = true;
         log_info("Updated go2rtc_webrtc_listen_port: %d", g_config.go2rtc_webrtc_listen_port);
+    }
+
+    cJSON *webrtc_connection_timeout_ms = cJSON_GetObjectItem(settings, "webrtc_connection_timeout_ms");
+    if (webrtc_connection_timeout_ms && cJSON_IsNumber(webrtc_connection_timeout_ms)) {
+        int v = webrtc_connection_timeout_ms->valueint;
+        if (v < 1000) v = 1000;  // Minimum 1s to avoid unusable UI
+        g_config.webrtc_connection_timeout_ms = v;
+        settings_changed = true;
+        log_info("Updated webrtc_connection_timeout_ms: %d", g_config.webrtc_connection_timeout_ms);
+    }
+
+    cJSON *webrtc_ice_recovery_timeout_ms = cJSON_GetObjectItem(settings, "webrtc_ice_recovery_timeout_ms");
+    if (webrtc_ice_recovery_timeout_ms && cJSON_IsNumber(webrtc_ice_recovery_timeout_ms)) {
+        int v = webrtc_ice_recovery_timeout_ms->valueint;
+        if (v < 0) v = 0;
+        g_config.webrtc_ice_recovery_timeout_ms = v;
+        settings_changed = true;
+        log_info("Updated webrtc_ice_recovery_timeout_ms: %d", g_config.webrtc_ice_recovery_timeout_ms);
     }
 
     cJSON *go2rtc_stun_enabled = cJSON_GetObjectItem(settings, "go2rtc_stun_enabled");

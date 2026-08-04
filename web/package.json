@@ -3,47 +3,46 @@
   "version": "1.0.0",
   "description": "LightNVR Web Interface",
   "type": "module",
+  "engines": {
+    "node": ">=24.11.0 <25"
+  },
   "scripts": {
     "start": "vite",
     "build": "vite build",
     "build:maps": "BUILD_SOURCEMAPS=true vite build",
     "preview": "vite preview",
     "test": "jest --config=jest.config.cjs",
-    "test:e2e": "jest tests/e2e --config=jest.config.cjs --runInBand"
+    "test:e2e": "jest --config=jest.e2e.config.cjs --runInBand"
   },
   "author": "",
   "license": "ISC",
   "dependencies": {
     "@preact-signals/query": "^2.1.2",
     "@preact/compat": "^18.3.2",
-    "@tailwindcss/postcss": "^4.3.2",
-    "daisyui": "^5.6.7",
+    "@tailwindcss/postcss": "^4.3.3",
+    "daisyui": "^5.7.14",
     "dayjs": "^1.11.21",
     "hls.js": "^1.6.16",
     "htm": "^3.1.1",
-    "preact": "^10.29.3",
+    "preact": "^10.29.8",
     "qrcode": "^1.5.4",
-    "tailwindcss": "^4.3.2",
+    "tailwindcss": "^4.3.3",
     "tinykeys": "^4.0.0",
     "webrtc-adapter": "^9.0.6"
   },
-  "overrides": {
-    "yauzl": ">=3.2.1"
-  },
   "devDependencies": {
-    "@babel/preset-env": "^7.29.7",
-    "@preact/preset-vite": "^2.10.5",
-    "@vitejs/plugin-legacy": "^8.1.0",
-    "autoprefixer": "^10.5.2",
+    "@babel/core": "^8.0.1",
+    "@babel/preset-env": "^8.0.2",
+    "@prefresh/vite": "^3.0.1",
+    "@vitejs/plugin-legacy": "^8.2.2",
+    "autoprefixer": "^10.5.4",
     "babel-jest": "^30.4.1",
-    "chromedriver": "^150.0.0",
     "esbuild": "^0.28.1",
-    "geckodriver": "^6.1.0",
     "jest": "^30.4.2",
-    "postcss": "^8.5.16",
+    "postcss": "^8.5.25",
     "postcss-import": "^16.1.1",
-    "selenium-webdriver": "^4.45.0",
-    "vite": "^8.1.2",
+    "selenium-webdriver": "^4.46.0",
+    "vite": "^8.2.0",
     "vite-plugin-compression": "^0.5.1"
   }
 }

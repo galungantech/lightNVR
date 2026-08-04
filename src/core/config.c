@@ -107,6 +107,8 @@ static const env_config_mapping_t env_config_mappings[] = {
     {"GO2RTC_EXTERNAL_IP",     CONFIG_TYPE_STRING, CONFIG_OFFSET(go2rtc_external_ip),       64,  "",   0, false},
     {"GO2RTC_ICE_SERVERS",     CONFIG_TYPE_STRING, CONFIG_OFFSET(go2rtc_ice_servers),       512, "",   0, false},
     {"GO2RTC_WEBRTC_LISTEN_PORT", CONFIG_TYPE_INT, CONFIG_OFFSET(go2rtc_webrtc_listen_port), 0,  NULL, 8555, false},
+    {"WEBRTC_CONNECTION_TIMEOUT_MS", CONFIG_TYPE_INT, CONFIG_OFFSET(webrtc_connection_timeout_ms),   0, NULL, 30000, false},
+    {"WEBRTC_ICE_RECOVERY_TIMEOUT_MS", CONFIG_TYPE_INT, CONFIG_OFFSET(webrtc_ice_recovery_timeout_ms), 0, NULL, 5000, false},
 
     // Web server settings
     {"WEB_PORT",           CONFIG_TYPE_INT,    CONFIG_OFFSET(web_port),           0,   NULL, 8080, false},
@@ -324,6 +326,13 @@ void load_default_config(config_t *config) {
     config->retention_days = 30;
     config->auto_delete_oldest = true;
 
+    // Capacity-based retention: keep 10% of the volume free by default so the
+    // disk is self-bounding even when retention_days exceeds what fits.
+    config->storage_min_free_pct = 10;
+    config->storage_pressure_warning_pct = 20.0;
+    config->storage_pressure_critical_pct = 10.0;
+    config->storage_pressure_emergency_pct = 5.0;
+
     // Thumbnail/grid view settings
     config->generate_thumbnails = true;
     config->thumbnails_per_recording = 3;
@@ -430,6 +439,10 @@ void load_default_config(config_t *config) {
     safe_strcpy(config->go2rtc_stun_server, "stun.l.google.com:19302", sizeof(config->go2rtc_stun_server), 0);
     config->go2rtc_external_ip[0] = '\0';  // Empty by default (auto-detect)
     config->go2rtc_ice_servers[0] = '\0';  // Empty by default (use STUN server)
+
+    // Browser-side WebRTC live-view timeouts (see include/core/config.h)
+    config->webrtc_connection_timeout_ms = 30000;  // 30s overall connect timeout
+    config->webrtc_ice_recovery_timeout_ms = 5000; // 5s grace after ICE disconnect
 
     // TURN server settings for WebRTC relay (exposed to browser)
     config->turn_enabled = false;  // Disabled by default
@@ -576,7 +589,28 @@ int validate_config(config_t *config) {
                  config->db_backup_retention_count);
         config->db_backup_retention_count = 0;
     }
-    
+
+    // Clamp capacity/pressure settings to sane ranges. min_free_pct must leave
+    // room to actually record; anything above ~90% would evict everything.
+    if (config->storage_min_free_pct < 0 || config->storage_min_free_pct > 90) {
+        log_warn("storage min_free_pct (%d) out of range [0,90]; clamping",
+                 config->storage_min_free_pct);
+        config->storage_min_free_pct = config->storage_min_free_pct < 0 ? 0 : 90;
+    }
+    if (config->storage_pressure_emergency_pct < 0.0 ||
+        config->storage_pressure_emergency_pct >= config->storage_pressure_critical_pct ||
+        config->storage_pressure_critical_pct >= config->storage_pressure_warning_pct ||
+        config->storage_pressure_warning_pct > 100.0) {
+        log_warn("storage pressure thresholds invalid (emergency=%.1f critical=%.1f warning=%.1f); "
+                 "resetting to defaults 5/10/20",
+                 config->storage_pressure_emergency_pct,
+                 config->storage_pressure_critical_pct,
+                 config->storage_pressure_warning_pct);
+        config->storage_pressure_emergency_pct = 5.0;
+        config->storage_pressure_critical_pct = 10.0;
+        config->storage_pressure_warning_pct = 20.0;
+    }
+
     if (strlen(config->web_root) == 0) {
         log_error("Web root path is required");
         return -1;
@@ -673,6 +707,14 @@ static int config_ini_handler(void* user, const char* section, const char* name,
             config->retention_days = safe_atoi(value, 0);
         } else if (strcmp(name, "auto_delete_oldest") == 0) {
             config->auto_delete_oldest = (strcmp(value, "true") == 0 || strcmp(value, "1") == 0);
+        } else if (strcmp(name, "min_free_pct") == 0) {
+            config->storage_min_free_pct = safe_atoi(value, 10);
+        } else if (strcmp(name, "pressure_warning_pct") == 0) {
+            config->storage_pressure_warning_pct = strtod(value, NULL);
+        } else if (strcmp(name, "pressure_critical_pct") == 0) {
+            config->storage_pressure_critical_pct = strtod(value, NULL);
+        } else if (strcmp(name, "pressure_emergency_pct") == 0) {
+            config->storage_pressure_emergency_pct = strtod(value, NULL);
         } else if (strcmp(name, "record_mp4_directly") == 0) {
             config->record_mp4_directly = (strcmp(value, "true") == 0 || strcmp(value, "1") == 0);
         } else if (strcmp(name, "mp4_path") == 0) {
@@ -898,6 +940,16 @@ static int config_ini_handler(void* user, const char* section, const char* name,
             safe_strcpy(config->go2rtc_external_ip, value, sizeof(config->go2rtc_external_ip), 0);
         } else if (strcmp(name, "ice_servers") == 0) {
             safe_strcpy(config->go2rtc_ice_servers, value, sizeof(config->go2rtc_ice_servers), 0);
+        } else if (strcmp(name, "webrtc_connection_timeout_ms") == 0) {
+            config->webrtc_connection_timeout_ms = safe_atoi(value, 30000);
+            if (config->webrtc_connection_timeout_ms < 1000) {
+                config->webrtc_connection_timeout_ms = 1000;  // Minimum 1s
+            }
+        } else if (strcmp(name, "webrtc_ice_recovery_timeout_ms") == 0) {
+            config->webrtc_ice_recovery_timeout_ms = safe_atoi(value, 5000);
+            if (config->webrtc_ice_recovery_timeout_ms < 0) {
+                config->webrtc_ice_recovery_timeout_ms = 0;
+            }
         } else if (strcmp(name, "force_native_hls") == 0) {
             config->go2rtc_force_native_hls = (strcmp(value, "true") == 0 || strcmp(value, "1") == 0);
         } else if (strcmp(name, "proxy_max_inflight") == 0) {
@@ -1541,7 +1593,12 @@ int save_config(const config_t *config, const char *path) {
     
     fprintf(file, "max_size = %llu  ; 0 means unlimited, otherwise bytes\n", (unsigned long long)config->max_storage_size);
     fprintf(file, "retention_days = %d\n", config->retention_days);
-    fprintf(file, "auto_delete_oldest = %s\n\n", config->auto_delete_oldest ? "true" : "false");
+    fprintf(file, "auto_delete_oldest = %s\n", config->auto_delete_oldest ? "true" : "false");
+    fprintf(file, "min_free_pct = %d  ; keep at least this %% of the volume free (0 disables capacity cap)\n",
+            config->storage_min_free_pct);
+    fprintf(file, "pressure_warning_pct = %.1f\n", config->storage_pressure_warning_pct);
+    fprintf(file, "pressure_critical_pct = %.1f\n", config->storage_pressure_critical_pct);
+    fprintf(file, "pressure_emergency_pct = %.1f\n\n", config->storage_pressure_emergency_pct);
 
     // Write MP4 recording settings
     fprintf(file, "; New recording format options\n");
@@ -1654,6 +1711,8 @@ int save_config(const config_t *config, const char *path) {
     if (config->go2rtc_ice_servers[0] != '\0') {
         fprintf(file, "ice_servers = %s\n", config->go2rtc_ice_servers);
     }
+    fprintf(file, "webrtc_connection_timeout_ms = %d\n", config->webrtc_connection_timeout_ms);
+    fprintf(file, "webrtc_ice_recovery_timeout_ms = %d\n", config->webrtc_ice_recovery_timeout_ms);
     fprintf(file, "force_native_hls = %s\n", config->go2rtc_force_native_hls ? "true" : "false");
     fprintf(file, "proxy_max_inflight = %d\n", config->go2rtc_proxy_max_inflight);
     // TURN server settings

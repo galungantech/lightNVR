@@ -11,6 +11,7 @@ import {
   getClippedSegmentHourRange
 } from './timelineUtils.js';
 import { formatLocalTime } from '../../../utils/date-utils.js';
+import { useI18n } from '../../../i18n.js';
 
 /**
  * TimelineSegments component
@@ -19,6 +20,7 @@ import { formatLocalTime } from '../../../utils/date-utils.js';
  * @returns {JSX.Element} TimelineSegments component
  */
 export function TimelineSegments({ segments: propSegments }) {
+  const { t } = useI18n();
   // Local state
   const [segments, setSegments] = useState(propSegments || []);
   const [startHour, setStartHour] = useState(0);
@@ -194,10 +196,15 @@ export function TimelineSegments({ segments: propSegments }) {
 
     for (let i = 1; i < sorted.length; i++) {
       const seg = sorted[i];
-      if (seg.start_timestamp - cur.end_timestamp <= 1) {
+      // Only merge adjacent segments that share the same detection state, otherwise
+      // a continuous recording collapses into one bar and the has-detection colour is
+      // OR-ed across the whole span — hiding *which* periods actually had detections
+      // (issue #454). Keeping detection and non-detection runs separate preserves the
+      // per-period highlighting the timeline is meant to show.
+      if (seg.start_timestamp - cur.end_timestamp <= 1 &&
+          !!seg.has_detection === !!cur.has_detection) {
         // extend current merged segment
         cur.end_timestamp = Math.max(cur.end_timestamp, seg.end_timestamp);
-        if (seg.has_detection) cur.has_detection = true;
       } else {
         merged.push(cur);
         cur = { ...seg };
@@ -240,7 +247,7 @@ export function TimelineSegments({ segments: propSegments }) {
             left: `${leftPct}%`,
             width: `${Math.max(widthPct, 0.15)}%`,   // min width so tiny segments stay visible
           }}
-          title={`${t0} – ${t1}  (${durLabel})`}
+          title={`${t0} – ${t1}  (${durLabel})${seg.has_detection ? `  • ${t('timeline.detectionEvent')}` : ''}`}
         />
       );
     });

@@ -99,12 +99,17 @@ When you push a tag, GitHub Actions automatically:
 
 1. **Builds Docker images** for multiple architectures:
    - linux/amd64
-   - linux/arm64
-   - linux/arm/v7
+   - linux/arm64 on a native GitHub-hosted ARM64 runner
+   - linux/arm/v7, cross-compiled on x86_64 (QEMU is used only to assemble the
+     target runtime layer)
+
+   Each platform also imports and updates a platform-specific BuildKit cache in
+   GHCR. This avoids rebuilding unchanged package and dependency layers between
+   releases.
 
 2. **Builds web assets** during the Docker build:
-   - Installs Node.js 20.x LTS
-   - Runs `npm ci --omit=dev` to install production dependencies only
+   - Installs Node.js 24.x LTS
+   - Runs `npm ci --ignore-scripts` from the committed lockfile
    - Runs `npm run build` to build with Vite
    - Copies built assets to `/usr/share/lightnvr/web-template/`
 
@@ -206,14 +211,16 @@ If the Docker build fails to find web assets:
 
 ### Local build doesn't match Docker build
 
-This can happen if you have different Node.js versions. The Docker build uses Node.js 20.x LTS. To match locally:
+This can happen if you have different Node.js versions. The Docker build uses Node.js 24.x LTS. To match locally:
 
 ```bash
-# Install Node.js 20.x
-# Then rebuild
+# Install the version pinned in .nvmrc (Node.js 24.x LTS)
+nvm install
+nvm use
+
+# Then rebuild from the committed dependency graph
 cd web
-rm -rf node_modules package-lock.json
-npm install
+npm ci
 npm run build
 ```
 
@@ -253,4 +260,3 @@ The new release process is:
 4. **Clean repository:** No binary assets in git
 
 This ensures consistency, reduces errors, and makes releases faster and more reliable.
-

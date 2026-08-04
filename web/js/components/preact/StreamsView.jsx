@@ -121,7 +121,8 @@ export function StreamsView() {
     motion: false,
     ptz: false,
     advanced: false,
-    go2rtcOverride: false
+    go2rtcOverride: false,
+    restream: false
   });
 
   const toggleSection = (section) => {
@@ -302,18 +303,21 @@ const handleDrop = (e, targetIndex) => {
     ptzMaxZ: 0,
     ptzHasHome: false,
     // Retention policy settings
-    retentionDays: 0,
-    detectionRetentionDays: 0,
+    retentionDays: -1,
+    detectionRetentionDays: -1,
     maxStorageMb: 0,
     // Recording schedule
     recordOnSchedule: false,
     recordingSchedule: Array(168).fill(true),
+    detectionRecordOnSchedule: false,
+    detectionRecordingSchedule: Array(168).fill(true),
     // Tags
     tags: '',
     // Cross-stream motion trigger: name of another stream whose ONVIF motion
     // events trigger recording on this stream (e.g., PTZ slaved to fixed wide lens)
     motionTriggerSource: '',
     go2rtcSourceOverride: '',
+    publishUrl: '',
     subStreamUrl: '',
     detectionUrl: ''
   });
@@ -493,16 +497,6 @@ const handleDrop = (e, targetIndex) => {
     }
   });
 
-  const handleToggleStreamEnabled = (stream) => {
-    if (stream.enabled) {
-      if (window.confirm(t('live.disableStreamConfirm'))) {
-        disableStreamMutation.mutate({ streamId: stream.name });
-      }
-    } else {
-      enableStreamMutation.mutate(stream.name);
-    }
-  };
-
   // Promise-returning variants used by <StreamCard> → <AsyncButton>.
   // AsyncButton handles the destructive-confirm UX itself (via its
   // `confirmText` prop), so these do NOT call `window.confirm`.
@@ -663,14 +657,26 @@ const handleDrop = (e, targetIndex) => {
       detection_object_filter: currentStream.detectionObjectFilter || 'none',
       detection_object_filter_list: currentStream.detectionObjectFilterList || '',
       // Retention policy settings
-      retention_days: parseInt(currentStream.retentionDays, 10) || 0,
-      detection_retention_days: parseInt(currentStream.detectionRetentionDays, 10) || 0,
+      retention_days: Number.isFinite(parseInt(currentStream.retentionDays, 10))
+        ? parseInt(currentStream.retentionDays, 10) : -1,
+      detection_retention_days: Number.isFinite(parseInt(currentStream.detectionRetentionDays, 10))
+        ? parseInt(currentStream.detectionRetentionDays, 10) : -1,
       max_storage_mb: parseInt(currentStream.maxStorageMb, 10) || 0,
+      // Tiered retention weighting
+      tier_critical_multiplier: Number.isFinite(parseFloat(currentStream.tierCriticalMultiplier)) ? parseFloat(currentStream.tierCriticalMultiplier) : 3.0,
+      tier_important_multiplier: Number.isFinite(parseFloat(currentStream.tierImportantMultiplier)) ? parseFloat(currentStream.tierImportantMultiplier) : 2.0,
+      tier_ephemeral_multiplier: Number.isFinite(parseFloat(currentStream.tierEphemeralMultiplier)) ? parseFloat(currentStream.tierEphemeralMultiplier) : 0.25,
+      storage_priority: Math.min(10, Math.max(1, parseInt(currentStream.storagePriority, 10) || 5)),
       // Recording schedule
       record_on_schedule: !!currentStream.recordOnSchedule,
       recording_schedule: normalizeRecordingSchedule(
         currentStream.recordingSchedule,
         currentStream.recordOnSchedule
+      ),
+      detection_record_on_schedule: !!currentStream.detectionRecordOnSchedule,
+      detection_recording_schedule: normalizeRecordingSchedule(
+        currentStream.detectionRecordingSchedule,
+        currentStream.detectionRecordOnSchedule
       ),
       // Tags
       tags: currentStream.tags || '',
@@ -678,6 +684,7 @@ const handleDrop = (e, targetIndex) => {
       motion_trigger_source: currentStream.motionTriggerSource || '',
       // go2rtc source override
       go2rtc_source_override: currentStream.go2rtcSourceOverride || '',
+      publish_url: currentStream.publishUrl || '',
       // Sub-stream URL
       sub_stream_url: currentStream.subStreamUrl || '',
       // Secondary stream used only for detection (e.g. MJPEG sub-stream)
@@ -761,16 +768,19 @@ const handleDrop = (e, targetIndex) => {
       ptzMaxY: 0,
       ptzMaxZ: 0,
       ptzHasHome: false,
-      retentionDays: 0,
-      detectionRetentionDays: 0,
+      retentionDays: -1,
+      detectionRetentionDays: -1,
       maxStorageMb: 0,
       // Recording schedule
       recordOnSchedule: false,
       recordingSchedule: Array(168).fill(true),
+      detectionRecordOnSchedule: false,
+      detectionRecordingSchedule: Array(168).fill(true),
       // Tags
       tags: '',
       motionTriggerSource: '',
       go2rtcSourceOverride: '',
+    publishUrl: '',
       subStreamUrl: '',
       detectionUrl: ''
     });
@@ -835,19 +845,28 @@ const handleDrop = (e, targetIndex) => {
         detectionObjectFilter: stream.detection_object_filter || 'none',
         detectionObjectFilterList: stream.detection_object_filter_list || '',
         // Retention policy settings
-        retentionDays: stream.retention_days || 0,
-        detectionRetentionDays: stream.detection_retention_days || 0,
+        retentionDays: stream.retention_days ?? -1,
+        detectionRetentionDays: stream.detection_retention_days ?? -1,
         maxStorageMb: stream.max_storage_mb || 0,
+        tierCriticalMultiplier: stream.tier_critical_multiplier ?? 3.0,
+        tierImportantMultiplier: stream.tier_important_multiplier ?? 2.0,
+        tierEphemeralMultiplier: stream.tier_ephemeral_multiplier ?? 0.25,
+        storagePriority: stream.storage_priority ?? 5,
         // Recording schedule
         recordOnSchedule: stream.record_on_schedule || false,
         recordingSchedule: (Array.isArray(stream.recording_schedule) && stream.recording_schedule.length === 168)
           ? stream.recording_schedule
+          : Array(168).fill(true),
+        detectionRecordOnSchedule: stream.detection_record_on_schedule || false,
+        detectionRecordingSchedule: (Array.isArray(stream.detection_recording_schedule) && stream.detection_recording_schedule.length === 168)
+          ? stream.detection_recording_schedule
           : Array(168).fill(true),
         // Tags
         tags: stream.tags || '',
         // Cross-stream motion trigger source
         motionTriggerSource: stream.motion_trigger_source || '',
         go2rtcSourceOverride: stream.go2rtc_source_override || '',
+        publishUrl: stream.publish_url || '',
         subStreamUrl: stream.sub_stream_url || '',
         detectionUrl: stream.detection_url || ''
       });
@@ -912,17 +931,22 @@ const handleDrop = (e, targetIndex) => {
         ptzHasHome: stream.ptz_has_home !== undefined ? stream.ptz_has_home : false,
         detectionObjectFilter: stream.detection_object_filter || 'none',
         detectionObjectFilterList: stream.detection_object_filter_list || '',
-        retentionDays: stream.retention_days || 0,
-        detectionRetentionDays: stream.detection_retention_days || 0,
+        retentionDays: stream.retention_days ?? -1,
+        detectionRetentionDays: stream.detection_retention_days ?? -1,
         maxStorageMb: stream.max_storage_mb || 0,
         recordOnSchedule: stream.record_on_schedule || false,
         recordingSchedule: (Array.isArray(stream.recording_schedule) && stream.recording_schedule.length === 168)
           ? stream.recording_schedule
           : Array(168).fill(true),
+        detectionRecordOnSchedule: stream.detection_record_on_schedule || false,
+        detectionRecordingSchedule: (Array.isArray(stream.detection_recording_schedule) && stream.detection_recording_schedule.length === 168)
+          ? stream.detection_recording_schedule
+          : Array(168).fill(true),
         tags: stream.tags || '',
         // Cross-stream motion trigger source
         motionTriggerSource: stream.motion_trigger_source || '',
         go2rtcSourceOverride: stream.go2rtc_source_override || '',
+        publishUrl: stream.publish_url || '',
         subStreamUrl: stream.sub_stream_url || '',
         detectionUrl: stream.detection_url || ''
       });

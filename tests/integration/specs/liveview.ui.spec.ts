@@ -52,14 +52,20 @@ test.describe('Live View Page @ui @liveview', () => {
 
   test.describe('Video Streaming', () => {
     test('should show a stream-starting placeholder while tiles initialize', async ({ page }) => {
-      await page.route('**/api/webrtc?*', async route => {
+      // Hold every stream-media request open for a few seconds so each tile
+      // stays in its loading state long enough to assert the placeholder.
+      // The default Live View tile is HLS, and when go2rtc is enabled (as in
+      // CI) the manifest is fetched from go2rtc's `/api/stream.m3u8` endpoint —
+      // NOT lightNVR's native `/hls/...` path — so that pattern must be stalled
+      // too, otherwise the manifest resolves in milliseconds and the
+      // placeholder disappears before this assertion can observe it.
+      const stallThenAbort = async route => {
         await new Promise(resolve => setTimeout(resolve, 2000));
         await route.abort();
-      });
-      await page.route('**/hls/**', async route => {
-        await new Promise(resolve => setTimeout(resolve, 2000));
-        await route.abort();
-      });
+      };
+      await page.route('**/api/webrtc?*', stallThenAbort);
+      await page.route('**/hls/**', stallThenAbort);
+      await page.route('**/api/stream.m3u8*', stallThenAbort);
 
       const liveView = new LiveViewPage(page);
       await Promise.all([
@@ -91,6 +97,7 @@ test.describe('Live View Page @ui @liveview', () => {
       await sleep(5000);
       
       const status = await liveView.getVideoStatus();
+      expect(status.total).toBeGreaterThan(0);
       console.log(`Video status: ${status.playing}/${status.total} playing`);
       
       // Log the result (may not have playing videos in test environment)
@@ -107,12 +114,39 @@ test.describe('Live View Page @ui @liveview', () => {
       const isHLS = await liveView.isHLSView();
       
       console.log(`View type - WebRTC: ${isWebRTC}, HLS: ${isHLS}`);
+      expect(isWebRTC || isHLS).toBeTruthy();
       
       await page.screenshot({ path: 'test-results/liveview-view-type.png' });
     });
   });
 
   test.describe('Stream Interaction', () => {
+    test('aligns manual recording and snapshot controls (#474)', async ({ page }) => {
+      const liveView = new LiveViewPage(page);
+      await liveView.goto();
+
+      const manual = page.locator('.manual-recording-btn').first();
+      const snapshot = page.locator('.snapshot-btn').first();
+      await expect(manual).toBeVisible();
+      await expect(snapshot).toBeVisible();
+
+      const [manualBox, snapshotBox] = await Promise.all([
+        manual.boundingBox(),
+        snapshot.boundingBox(),
+      ]);
+      expect(manualBox).not.toBeNull();
+      expect(snapshotBox).not.toBeNull();
+      expect(manualBox!.width).toBe(snapshotBox!.width);
+      expect(manualBox!.height).toBe(snapshotBox!.height);
+      expect(Math.abs(manualBox!.y - snapshotBox!.y)).toBeLessThanOrEqual(1);
+
+      const backgrounds = await Promise.all([
+        manual.evaluate(element => getComputedStyle(element).backgroundColor),
+        snapshot.evaluate(element => getComputedStyle(element).backgroundColor),
+      ]);
+      expect(backgrounds).toEqual(['rgba(0, 0, 0, 0)', 'rgba(0, 0, 0, 0)']);
+    });
+
     test('should be able to click on stream containers', async ({ page }) => {
       const liveView = new LiveViewPage(page);
       await liveView.goto();
@@ -134,8 +168,13 @@ test.describe('Live View Page @ui @liveview', () => {
       
       await sleep(2000);
       
-      const hasFullscreen = await liveView.fullscreenButton.isVisible();
-      console.log(`Has fullscreen button: ${hasFullscreen}`);
+      await expect(liveView.fullscreenButton).toBeVisible();
+      await liveView.fullscreenButton.click();
+      await expect(page.locator('#live-page')).toHaveClass(/fullscreen-mode/);
+      await expect.poll(() => page.evaluate(() => document.body.style.overflow)).toBe('hidden');
+
+      await page.keyboard.press('Escape');
+      await expect(page.locator('#live-page')).not.toHaveClass(/fullscreen-mode/);
       
       await page.screenshot({ path: 'test-results/liveview-fullscreen.png' });
     });

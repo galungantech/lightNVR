@@ -39,6 +39,7 @@ static recording_metadata_t make_rec(const char *stream, const char *path, time_
     m.retention_override_days = -1;
     m.retention_tier = RETENTION_TIER_STANDARD;
     m.disk_pressure_eligible = true;
+    m.schedule_restricted = 1;
     return m;
 }
 
@@ -73,6 +74,45 @@ void test_add_and_get_by_id(void) {
     int rc = get_recording_metadata_by_id(id, &got);
     TEST_ASSERT_EQUAL_INT(0, rc);
     TEST_ASSERT_EQUAL_STRING("cam1", got.stream_name);
+}
+
+void test_schedule_restricted_round_trip_and_legacy_null(void) {
+    time_t now = time(NULL);
+    recording_metadata_t scheduled = make_rec(
+        "cam_schedule", "/rec/schedule.mp4", now);
+    scheduled.schedule_restricted = 1;
+    uint64_t id = add_recording_metadata(&scheduled);
+    TEST_ASSERT_TRUE(id > 0);
+
+    recording_metadata_t got;
+    TEST_ASSERT_EQUAL_INT(0, get_recording_metadata_by_id(id, &got));
+    TEST_ASSERT_EQUAL_INT(1, got.schedule_restricted);
+
+    char sql[256];
+    snprintf(sql, sizeof(sql),
+             "UPDATE recordings SET schedule_restricted = NULL WHERE id = %llu;",
+             (unsigned long long)id);
+    TEST_ASSERT_EQUAL_INT(SQLITE_OK,
+        sqlite3_exec(get_db_handle(), sql, NULL, NULL, NULL));
+    TEST_ASSERT_EQUAL_INT(0, get_recording_metadata_by_id(id, &got));
+    TEST_ASSERT_EQUAL_INT(-1, got.schedule_restricted);
+}
+
+void test_capture_method_distinguishes_continuous_scheduled_and_legacy(void) {
+    recording_metadata_t recording = make_rec("cam", "/rec/method.mp4", time(NULL));
+
+    recording.schedule_restricted = 0;
+    TEST_ASSERT_EQUAL_STRING("continuous", recording_capture_method(&recording));
+
+    recording.schedule_restricted = 1;
+    TEST_ASSERT_EQUAL_STRING("scheduled", recording_capture_method(&recording));
+
+    recording.schedule_restricted = -1;
+    TEST_ASSERT_EQUAL_STRING("scheduled", recording_capture_method(&recording));
+
+    safe_strcpy(recording.trigger_type, "continuous",
+                sizeof(recording.trigger_type), 0);
+    TEST_ASSERT_EQUAL_STRING("continuous", recording_capture_method(&recording));
 }
 
 /* update_recording_metadata */
@@ -148,6 +188,32 @@ void test_get_recording_count_supports_multi_value_stream_tag_and_capture_filter
     TEST_ASSERT_EQUAL_INT(2, cnt);
 }
 
+void test_capture_filters_distinguish_continuous_from_scheduled(void) {
+    time_t now = time(NULL);
+    recording_metadata_t continuous = make_rec(
+        "always_on", "/rec/continuous.mp4", now);
+    continuous.schedule_restricted = 0;
+    recording_metadata_t scheduled = make_rec(
+        "scheduled", "/rec/scheduled.mp4", now + 60);
+
+    TEST_ASSERT_TRUE(add_recording_metadata(&continuous) > 0);
+    TEST_ASSERT_TRUE(add_recording_metadata(&scheduled) > 0);
+
+    TEST_ASSERT_EQUAL_INT(1,
+        get_recording_count(0, 0, NULL, 0, NULL, -1, NULL, 0,
+                            NULL, "continuous"));
+    TEST_ASSERT_EQUAL_INT(1,
+        get_recording_count(0, 0, NULL, 0, NULL, -1, NULL, 0,
+                            NULL, "scheduled"));
+
+    recording_metadata_t out[2];
+    int count = get_recording_metadata_paginated(
+        0, 0, NULL, 0, NULL, -1, "id", "asc", out, 2, 0,
+        NULL, 0, NULL, "continuous");
+    TEST_ASSERT_EQUAL_INT(1, count);
+    TEST_ASSERT_EQUAL_STRING("always_on", out[0].stream_name);
+}
+
 /* get_recording_metadata_paginated */
 void test_get_recording_metadata_paginated(void) {
     time_t now = time(NULL);
@@ -220,6 +286,50 @@ void test_set_recording_disk_pressure_eligible(void) {
     TEST_ASSERT_FALSE(got.disk_pressure_eligible);
 }
 
+/* Regression: a new UNPROTECTED recording must be inserted as
+ * disk_pressure_eligible even when the caller memset()s the struct to zero and
+ * never touches the field (as every real creation site does). If this defaults
+ * to 0, the emergency disk-pressure cleanup path has no candidates and the disk
+ * fills to 100% — the exact production incident this hardening addresses. */
+void test_add_recording_defaults_unprotected_to_pressure_eligible(void) {
+    time_t now = time(NULL);
+    recording_metadata_t m;
+    memset(&m, 0, sizeof(m));                 // Simulate the real creation sites.
+    safe_strcpy(m.stream_name, "cam_elig", sizeof(m.stream_name), 0);
+    safe_strcpy(m.file_path, "/rec/elig.mp4", sizeof(m.file_path), 0);
+    m.start_time = now;
+    m.is_complete = true;
+    m.protected = false;
+    m.disk_pressure_eligible = false;         // Left false, as memset would.
+
+    uint64_t id = add_recording_metadata(&m);
+    TEST_ASSERT_TRUE(id > 0);
+
+    recording_metadata_t got;
+    get_recording_metadata_by_id(id, &got);
+    TEST_ASSERT_TRUE(got.disk_pressure_eligible);
+}
+
+/* A protected recording must NOT become pressure-eligible on insert. */
+void test_add_recording_protected_is_not_pressure_eligible(void) {
+    time_t now = time(NULL);
+    recording_metadata_t m;
+    memset(&m, 0, sizeof(m));
+    safe_strcpy(m.stream_name, "cam_prot", sizeof(m.stream_name), 0);
+    safe_strcpy(m.file_path, "/rec/prot.mp4", sizeof(m.file_path), 0);
+    m.start_time = now;
+    m.is_complete = true;
+    m.protected = true;                        // Explicitly protected.
+    m.disk_pressure_eligible = false;
+
+    uint64_t id = add_recording_metadata(&m);
+    TEST_ASSERT_TRUE(id > 0);
+
+    recording_metadata_t got;
+    get_recording_metadata_by_id(id, &got);
+    TEST_ASSERT_FALSE(got.disk_pressure_eligible);
+}
+
 /* set_recording_retention_override */
 void test_set_recording_retention_override(void) {
     time_t now = time(NULL);
@@ -246,15 +356,20 @@ int main(void) {
     }
     UNITY_BEGIN();
     RUN_TEST(test_add_and_get_by_id);
+    RUN_TEST(test_schedule_restricted_round_trip_and_legacy_null);
+    RUN_TEST(test_capture_method_distinguishes_continuous_scheduled_and_legacy);
     RUN_TEST(test_update_recording_metadata);
     RUN_TEST(test_get_recording_metadata_stream_filter);
     RUN_TEST(test_get_recording_metadata_by_path);
     RUN_TEST(test_get_recording_count);
     RUN_TEST(test_get_recording_count_supports_multi_value_stream_tag_and_capture_filters);
+    RUN_TEST(test_capture_filters_distinguish_continuous_from_scheduled);
     RUN_TEST(test_get_recording_metadata_paginated);
     RUN_TEST(test_get_recording_metadata_paginated_supports_multi_value_detection_labels_and_tags);
     RUN_TEST(test_set_recording_retention_tier);
     RUN_TEST(test_set_recording_disk_pressure_eligible);
+    RUN_TEST(test_add_recording_defaults_unprotected_to_pressure_eligible);
+    RUN_TEST(test_add_recording_protected_is_not_pressure_eligible);
     RUN_TEST(test_set_recording_retention_override);
     RUN_TEST(test_get_stream_storage_bytes);
     int result = UNITY_END();
@@ -262,4 +377,3 @@ int main(void) {
     unlink(TEST_DB_PATH);
     return result;
 }
-

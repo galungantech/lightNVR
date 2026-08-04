@@ -502,6 +502,7 @@ export function WebRTCView({ isWebRTCDisabled, isHlsDisabled, isMseDisabled }) {
   return (
     <section
       id="live-page"
+      data-testid="webrtc-view"
       className={`page ${isFullscreen ? 'fullscreen-mode' : ''} ${isSingleStream && !isFullscreen ? 'single-stream' : ''}`}
     >
       {/* Include the SnapshotManager component */}
@@ -770,6 +771,7 @@ export function WebRTCView({ isWebRTCDisabled, isHlsDisabled, isMseDisabled }) {
                   <WebRTCVideoCell
                     stream={stream}
                     useSubStream={!isSingleStream && fullscreenCellStream !== stream.name && !!stream.sub_stream_url}
+                    fullscreenUpgraded={!isSingleStream && fullscreenCellStream === stream.name && !!stream.sub_stream_url}
                     onToggleFullscreen={toggleStreamFullscreen}
                     streamId={stream.name}
                     showLabels={showLabels}

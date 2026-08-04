@@ -8,6 +8,7 @@
 #include <ctype.h>
 #include <unistd.h>
 #include <pthread.h>
+#include <time.h>
 
 #include "web/api_handlers.h"
 #include "web/request_response.h"
@@ -62,6 +63,7 @@ typedef struct {
     bool credentials_changed;                  // Whether ONVIF credentials changed
     bool go2rtc_override_changed;              // Whether go2rtc_source_override changed
     bool sub_stream_changed;                   // Whether sub_stream_url changed
+    bool publish_changed;                      // Whether publish_url (RTMP restream) changed
 } put_stream_task_t;
 
 static void format_stream_capacity_error(char *buf, size_t buf_size,
@@ -242,7 +244,8 @@ static void put_stream_worker(put_stream_task_t *task) {
     }
     // If detection was disabled and now enabled, start the detection thread
     else if (!detection_was_enabled && detection_now_enabled) {
-        if (task->config.detection_model[0] != '\0' && task->config.enabled) {
+        if (task->config.enabled &&
+            is_detection_recording_scheduled(&task->config)) {
             // If continuous recording is also enabled, run detection in annotation-only mode
             bool annotation_only = task->config.record;
             log_info("Detection enabled for stream %s, starting unified detection thread with model %s (annotation_only=%s)",
@@ -265,7 +268,8 @@ static void put_stream_worker(put_stream_task_t *task) {
                 log_info("Successfully started unified detection thread for stream %s", task->config.name);
             }
         } else {
-            log_warn("Detection enabled for stream %s but no model specified or stream disabled", task->config.name);
+            log_info("Detection enabled for stream %s but inactive due to stream state or schedule",
+                     task->config.name);
         }
     }
     // If detection settings changed but detection was already enabled, restart the thread
@@ -276,7 +280,8 @@ static void put_stream_worker(put_stream_task_t *task) {
             log_warn("Failed to stop existing unified detection thread for stream %s", task->config.name);
         }
 
-        if (task->config.detection_model[0] != '\0' && task->config.enabled) {
+        if (task->config.enabled &&
+            is_detection_recording_scheduled(&task->config)) {
             // If continuous recording is also enabled, run detection in annotation-only mode
             bool annotation_only = task->config.record;
             if (start_unified_detection_thread(task->config.name,
@@ -383,6 +388,19 @@ static void put_stream_worker(put_stream_task_t *task) {
             usleep(500000);
         }
 
+        // If the RTMP publish (restream) URL changed, regenerate go2rtc.yaml (which
+        // carries the publish: block) and restart go2rtc so it starts/stops the
+        // RTMP push. Skip if an override restart already happened above.
+        if (task->publish_changed && !task->go2rtc_override_changed) {
+            log_info("Publish URL changed for stream %s, restarting go2rtc to apply restream config", task->config.name);
+            if (go2rtc_integration_restart_process()) {
+                log_info("Successfully restarted go2rtc after publish URL change for stream %s", task->config.name);
+            } else {
+                log_error("Failed to restart go2rtc after publish URL change for stream %s", task->config.name);
+            }
+            usleep(500000);
+        }
+
         // If sub-stream URL changed, register or unregister the {name}_sub stream
         if (task->sub_stream_changed && !task->go2rtc_override_changed) {
             char sub_name[MAX_STREAM_NAME + 8];
@@ -450,6 +468,14 @@ static bool is_allowed_detection_url(const char *u) {
         if (strncasecmp(u, prefixes[i], strlen(prefixes[i])) == 0) return true;
     }
     return false;
+}
+
+/* publish_url is the restream (publish) destination handed to go2rtc's RTMP
+ * publisher. Restrict to the RTMP family so it can't be abused to write to
+ * arbitrary local URLs. An empty string means "no restreaming". */
+static bool is_allowed_publish_url(const char *u) {
+    if (!u || u[0] == '\0') return true;
+    return strncasecmp(u, "rtmp://", 7) == 0 || strncasecmp(u, "rtmps://", 8) == 0;
 }
 
 /**
@@ -528,6 +554,11 @@ void handle_post_stream(const http_request_t *req, http_response_t *res) {
     config.post_detection_buffer = 5;
     config.protocol = STREAM_PROTOCOL_TCP;
     config.record_audio = true; // Default to true for new streams
+    config.retention_days = -1;
+    config.detection_retention_days = -1;
+    memset(config.recording_schedule, 1, sizeof(config.recording_schedule));
+    memset(config.detection_recording_schedule, 1,
+           sizeof(config.detection_recording_schedule));
 
     // Override with provided values
     cJSON *enabled = cJSON_GetObjectItem(stream_json, "enabled");
@@ -641,11 +672,23 @@ void handle_post_stream(const http_request_t *req, http_response_t *res) {
     // Parse retention policy settings
     cJSON *retention_days = cJSON_GetObjectItem(stream_json, "retention_days");
     if (retention_days && cJSON_IsNumber(retention_days)) {
+        if (retention_days->valueint < -1 || retention_days->valueint > 365) {
+            cJSON_Delete(stream_json);
+            http_response_set_json_error(res, 400, "retention_days must be between -1 and 365");
+            return;
+        }
         config.retention_days = retention_days->valueint;
     }
 
     cJSON *detection_retention_days = cJSON_GetObjectItem(stream_json, "detection_retention_days");
     if (detection_retention_days && cJSON_IsNumber(detection_retention_days)) {
+        if (detection_retention_days->valueint < -1 ||
+            detection_retention_days->valueint > 365) {
+            cJSON_Delete(stream_json);
+            http_response_set_json_error(res, 400,
+                "detection_retention_days must be between -1 and 365");
+            return;
+        }
         config.detection_retention_days = detection_retention_days->valueint;
     }
 
@@ -718,9 +761,23 @@ void handle_post_stream(const http_request_t *req, http_response_t *res) {
                 config.recording_schedule[j] = (item && cJSON_IsTrue(item)) ? 1 : 0;
             }
         }
-    } else {
-        // Default: all hours enabled
-        memset(config.recording_schedule, 1, sizeof(config.recording_schedule));
+    }
+
+    cJSON *detection_record_on_schedule =
+        cJSON_GetObjectItem(stream_json, "detection_record_on_schedule");
+    if (detection_record_on_schedule && cJSON_IsBool(detection_record_on_schedule)) {
+        config.detection_record_on_schedule =
+            cJSON_IsTrue(detection_record_on_schedule);
+    }
+    cJSON *detection_recording_schedule =
+        cJSON_GetObjectItem(stream_json, "detection_recording_schedule");
+    if (detection_recording_schedule && cJSON_IsArray(detection_recording_schedule) &&
+        cJSON_GetArraySize(detection_recording_schedule) == 168) {
+        for (int j = 0; j < 168; j++) {
+            cJSON *item = cJSON_GetArrayItem(detection_recording_schedule, j);
+            config.detection_recording_schedule[j] =
+                (item && cJSON_IsTrue(item)) ? 1 : 0;
+        }
     }
 
     // Parse tags setting (comma-separated list, e.g. "outdoor,critical,entrance")
@@ -836,6 +893,28 @@ void handle_post_stream(const http_request_t *req, http_response_t *res) {
                 sizeof(config.detection_url), 0);
     } else {
         config.detection_url[0] = '\0';
+    }
+
+    // RTMP/RTMPS publish (restream) destination, e.g. YouTube Live ingest URL.
+    cJSON *publish_url_post = cJSON_GetObjectItem(stream_json, "publish_url");
+    if (publish_url_post && cJSON_IsString(publish_url_post)) {
+        const char *pub = publish_url_post->valuestring;
+        if (pub[0] != '\0' && !is_allowed_publish_url(pub)) {
+            log_error("Rejected publish_url with disallowed scheme for stream %s", config.name);
+            cJSON_Delete(stream_json);
+            http_response_set_json_error(res, 400, "publish_url must use rtmp or rtmps");
+            return;
+        }
+        if (strlen(pub) >= sizeof(config.publish_url)) {
+            log_error("publish_url too long (%zu bytes, max %zu) for stream %s",
+                      strlen(pub), sizeof(config.publish_url) - 1, config.name);
+            cJSON_Delete(stream_json);
+            http_response_set_json_error(res, 413, "publish_url exceeds size limit");
+            return;
+        }
+        safe_strcpy(config.publish_url, pub, sizeof(config.publish_url), 0);
+    } else {
+        config.publish_url[0] = '\0';
     }
 
     // Check if isOnvif flag is set in the request
@@ -963,8 +1042,9 @@ void handle_post_stream(const http_request_t *req, http_response_t *res) {
             // Continue anyway, stream is created
         }
 
-        // Start detection thread if detection is enabled and we have a model
-        if (config.detection_based_recording && config.detection_model[0] != '\0') {
+        // Start detection when enabled and currently permitted by its schedule.
+        if (config.detection_based_recording &&
+            is_detection_recording_scheduled(&config)) {
             // If continuous recording is also enabled, run detection in annotation-only mode
             bool annotation_only = config.record;
             log_info("Detection enabled for new stream %s, starting unified detection thread with model %s (annotation_only=%s)",
@@ -1250,6 +1330,12 @@ void handle_put_stream(const http_request_t *req, http_response_t *res) {
     cJSON *retention_days = cJSON_GetObjectItem(stream_json, "retention_days");
     if (retention_days && cJSON_IsNumber(retention_days)) {
         int new_retention = retention_days->valueint;
+        if (new_retention < -1 || new_retention > 365) {
+            cJSON_Delete(stream_json);
+            http_response_set_json_error(res, 400,
+                "retention_days must be between -1 and 365");
+            return;
+        }
         if (config.retention_days != new_retention) {
             config.retention_days = new_retention;
             config_changed = true;
@@ -1261,6 +1347,12 @@ void handle_put_stream(const http_request_t *req, http_response_t *res) {
     cJSON *detection_retention_days = cJSON_GetObjectItem(stream_json, "detection_retention_days");
     if (detection_retention_days && cJSON_IsNumber(detection_retention_days)) {
         int new_detection_retention = detection_retention_days->valueint;
+        if (new_detection_retention < -1 || new_detection_retention > 365) {
+            cJSON_Delete(stream_json);
+            http_response_set_json_error(res, 400,
+                "detection_retention_days must be between -1 and 365");
+            return;
+        }
         if (config.detection_retention_days != new_detection_retention) {
             config.detection_retention_days = new_detection_retention;
             config_changed = true;
@@ -1403,6 +1495,38 @@ void handle_put_stream(const http_request_t *req, http_response_t *res) {
                 config_changed = true;
                 log_info("Recording schedule updated for stream %s", config.name);
             }
+        }
+    }
+
+    cJSON *detection_record_on_schedule =
+        cJSON_GetObjectItem(stream_json, "detection_record_on_schedule");
+    if (detection_record_on_schedule && cJSON_IsBool(detection_record_on_schedule)) {
+        bool new_value = cJSON_IsTrue(detection_record_on_schedule);
+        if (config.detection_record_on_schedule != new_value) {
+            config.detection_record_on_schedule = new_value;
+            config_changed = true;
+            log_info("Detection recording schedule mode changed to %s for stream %s",
+                     new_value ? "enabled" : "disabled", config.name);
+        }
+    }
+
+    cJSON *detection_recording_schedule =
+        cJSON_GetObjectItem(stream_json, "detection_recording_schedule");
+    if (detection_recording_schedule &&
+        cJSON_IsArray(detection_recording_schedule) &&
+        cJSON_GetArraySize(detection_recording_schedule) == 168) {
+        bool changed = false;
+        for (int j = 0; j < 168; j++) {
+            cJSON *item = cJSON_GetArrayItem(detection_recording_schedule, j);
+            uint8_t new_value = (item && cJSON_IsTrue(item)) ? 1 : 0;
+            if (config.detection_recording_schedule[j] != new_value) {
+                config.detection_recording_schedule[j] = new_value;
+                changed = true;
+            }
+        }
+        if (changed) {
+            config_changed = true;
+            log_info("Detection recording schedule updated for stream %s", config.name);
         }
     }
 
@@ -1567,6 +1691,42 @@ void handle_put_stream(const http_request_t *req, http_response_t *res) {
         }
     }
 
+    // RTMP/RTMPS publish (restream) destination. Changes require regenerating
+    // go2rtc.yaml (which carries the publish: block) and restarting go2rtc.
+    bool publish_changed = false;
+    cJSON *publish_url_put = cJSON_GetObjectItem(stream_json, "publish_url");
+    if (publish_url_put && cJSON_IsString(publish_url_put)) {
+        const char *pub = publish_url_put->valuestring;
+        if (pub[0] != '\0' && !is_allowed_publish_url(pub)) {
+            log_error("Rejected publish_url with disallowed scheme for stream %s", config.name);
+            cJSON_Delete(stream_json);
+            http_response_set_json_error(res, 400, "publish_url must use rtmp or rtmps");
+            return;
+        }
+        if (strlen(pub) >= sizeof(config.publish_url)) {
+            log_error("publish_url too long (%zu bytes, max %zu) for stream %s",
+                      strlen(pub), sizeof(config.publish_url) - 1, config.name);
+            cJSON_Delete(stream_json);
+            http_response_set_json_error(res, 413, "publish_url exceeds size limit");
+            return;
+        }
+        if (strncmp(config.publish_url, pub, sizeof(config.publish_url) - 1) != 0) {
+            safe_strcpy(config.publish_url, pub, sizeof(config.publish_url), 0);
+            publish_changed = true;
+            config_changed = true;
+            non_dynamic_config_changed = true;
+            log_info("Publish (restream) URL changed for stream %s", config.name);
+        }
+    } else if (publish_url_put && cJSON_IsNull(publish_url_put)) {
+        if (config.publish_url[0] != '\0') {
+            config.publish_url[0] = '\0';
+            publish_changed = true;
+            config_changed = true;
+            non_dynamic_config_changed = true;
+            log_info("Publish (restream) URL cleared for stream %s", config.name);
+        }
+    }
+
     // Update is_onvif flag based on request or URL
     bool original_is_onvif = config.is_onvif;
 
@@ -1708,7 +1868,8 @@ void handle_put_stream(const http_request_t *req, http_response_t *res) {
                             }
 
                             // If detection is enabled for this stream, start the unified detection thread
-                            if (stream_config.detection_based_recording && stream_config.detection_model[0] != '\0') {
+                            if (stream_config.detection_based_recording &&
+                                is_detection_recording_scheduled(&stream_config)) {
                                 // If continuous recording is also enabled, run detection in annotation-only mode
                                 bool annotation_only = stream_config.record;
                                 log_info("Starting unified detection thread for enabled stream %s (annotation_only=%s)",
@@ -1828,6 +1989,7 @@ void handle_put_stream(const http_request_t *req, http_response_t *res) {
     task->credentials_changed = credentials_changed;
     task->go2rtc_override_changed = go2rtc_override_changed;
     task->sub_stream_changed = sub_stream_changed;
+    task->publish_changed = publish_changed;
 
     log_info("Detection settings before update - Model: %s, Threshold: %.2f, Interval: %d, Pre-buffer: %d, Post-buffer: %d",
              config.detection_model, config.detection_threshold, config.detection_interval,
@@ -2068,16 +2230,119 @@ typedef struct {
     char stream_name[MAX_STREAM_NAME];  // Decoded stream name
 } refresh_stream_task_t;
 
+#define STREAM_REFRESH_COOLDOWN_SECONDS 30
+
+typedef struct {
+    bool used;
+    bool in_progress;
+    char stream_name[MAX_STREAM_NAME];
+    struct timespec last_started;
+} refresh_stream_guard_t;
+
+static refresh_stream_guard_t refresh_stream_guards[MAX_STREAMS];
+static pthread_mutex_t refresh_stream_guards_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+/* A player retry is cheap, but this endpoint restarts shared source state.
+ * Coalesce duplicate requests so several browser cells cannot continuously
+ * disrupt one another on a multi-view dashboard (#457). */
+static bool reserve_stream_refresh(const char *stream_name,
+                                   int *retry_after_seconds) {
+    struct timespec now;
+    if (clock_gettime(CLOCK_MONOTONIC, &now) != 0) {
+        now.tv_sec = time(NULL);
+        now.tv_nsec = 0;
+    }
+    if (retry_after_seconds) {
+        *retry_after_seconds = 0;
+    }
+
+    pthread_mutex_lock(&refresh_stream_guards_mutex);
+    int free_slot = -1;
+    int reusable_slot = -1;
+    time_t oldest_start = now.tv_sec;
+
+    for (int i = 0; i < MAX_STREAMS; i++) {
+        refresh_stream_guard_t *guard = &refresh_stream_guards[i];
+        if (!guard->used) {
+            if (free_slot < 0) free_slot = i;
+            continue;
+        }
+        if (strcmp(guard->stream_name, stream_name) == 0) {
+            time_t elapsed = now.tv_sec - guard->last_started.tv_sec;
+            if (elapsed < 0) {
+                guard->last_started = now;
+                elapsed = 0;
+            }
+            if (guard->in_progress || elapsed < STREAM_REFRESH_COOLDOWN_SECONDS) {
+                if (retry_after_seconds) {
+                    *retry_after_seconds = guard->in_progress
+                        ? 1
+                        : STREAM_REFRESH_COOLDOWN_SECONDS - (int)elapsed;
+                }
+                pthread_mutex_unlock(&refresh_stream_guards_mutex);
+                return false;
+            }
+            guard->in_progress = true;
+            guard->last_started = now;
+            pthread_mutex_unlock(&refresh_stream_guards_mutex);
+            return true;
+        }
+        if (!guard->in_progress && guard->last_started.tv_sec <= oldest_start) {
+            oldest_start = guard->last_started.tv_sec;
+            reusable_slot = i;
+        }
+    }
+
+    int slot = free_slot >= 0 ? free_slot : reusable_slot;
+    if (slot < 0) {
+        if (retry_after_seconds) *retry_after_seconds = 1;
+        pthread_mutex_unlock(&refresh_stream_guards_mutex);
+        return false;
+    }
+
+    refresh_stream_guard_t *guard = &refresh_stream_guards[slot];
+    memset(guard, 0, sizeof(*guard));
+    guard->used = true;
+    guard->in_progress = true;
+    guard->last_started = now;
+    safe_strcpy(guard->stream_name, stream_name, sizeof(guard->stream_name), 0);
+    pthread_mutex_unlock(&refresh_stream_guards_mutex);
+    return true;
+}
+
+static void finish_stream_refresh(const char *stream_name, bool discard) {
+    struct timespec now;
+    if (clock_gettime(CLOCK_MONOTONIC, &now) != 0) {
+        now.tv_sec = time(NULL);
+        now.tv_nsec = 0;
+    }
+    pthread_mutex_lock(&refresh_stream_guards_mutex);
+    for (int i = 0; i < MAX_STREAMS; i++) {
+        refresh_stream_guard_t *guard = &refresh_stream_guards[i];
+        if (guard->used && strcmp(guard->stream_name, stream_name) == 0) {
+            if (discard) {
+                memset(guard, 0, sizeof(*guard));
+            } else {
+                guard->in_progress = false;
+                guard->last_started = now;
+            }
+            break;
+        }
+    }
+    pthread_mutex_unlock(&refresh_stream_guards_mutex);
+}
+
 /**
  * @brief Worker function for stream refresh
  *
  * This function performs the actual go2rtc reload and detection thread
  * restart in a background thread so the event loop is not blocked.
  */
-static void refresh_stream_worker(refresh_stream_task_t *task) {
+static void *refresh_stream_worker(void *arg) {
+    refresh_stream_task_t *task = arg;
     if (!task) {
         log_error("Invalid refresh stream task");
-        return;
+        return NULL;
     }
 
     log_set_thread_context("StreamAPI", task->stream_name);
@@ -2088,8 +2353,9 @@ static void refresh_stream_worker(refresh_stream_task_t *task) {
         log_info("go2rtc integration not initialized, attempting full start");
         if (!go2rtc_integration_full_start()) {
             log_error("Failed to start go2rtc integration for stream refresh: %s", task->stream_name);
+            finish_stream_refresh(task->stream_name, false);
             free(task);
-            return;
+            return NULL;
         }
         log_info("go2rtc integration started successfully");
     }
@@ -2108,7 +2374,8 @@ static void refresh_stream_worker(refresh_stream_task_t *task) {
         stream_handle_t stream = get_stream_by_name(task->stream_name);
         stream_config_t config;
         if (stream && get_stream_config(stream, &config) == 0) {
-            if (config.detection_based_recording && config.detection_model[0] != '\0') {
+            if (config.detection_based_recording &&
+                is_detection_recording_scheduled(&config)) {
                 log_info("Restarting unified detection thread for stream: %s", task->stream_name);
 
                 // Stop existing detection thread if running
@@ -2137,7 +2404,9 @@ static void refresh_stream_worker(refresh_stream_task_t *task) {
         log_error("Failed to refresh go2rtc registration for stream: %s", task->stream_name);
     }
 
+    finish_stream_refresh(task->stream_name, false);
     free(task);
+    return NULL;
 }
 
 /**
@@ -2180,10 +2449,35 @@ void handle_post_stream_refresh(const http_request_t *req, http_response_t *res)
         return;
     }
 
+    int retry_after_seconds = 0;
+    if (!reserve_stream_refresh(stream_name, &retry_after_seconds)) {
+        cJSON *response = cJSON_CreateObject();
+        if (!response) {
+            http_response_set_json_error(res, 500, "Failed to create response JSON");
+            return;
+        }
+        cJSON_AddBoolToObject(response, "success", true);
+        cJSON_AddBoolToObject(response, "coalesced", true);
+        cJSON_AddStringToObject(response, "message",
+                                "A recent stream refresh is already active or cooling down");
+        cJSON_AddStringToObject(response, "stream", stream_name);
+        cJSON_AddNumberToObject(response, "retry_after_seconds", retry_after_seconds);
+        char *json_str = cJSON_PrintUnformatted(response);
+        cJSON_Delete(response);
+        if (!json_str) {
+            http_response_set_json_error(res, 500, "Failed to convert response JSON");
+            return;
+        }
+        http_response_set_json(res, 202, json_str);
+        free(json_str);
+        return;
+    }
+
     // Allocate task for worker thread
     refresh_stream_task_t *task = calloc(1, sizeof(refresh_stream_task_t));
     if (!task) {
         log_error("Failed to allocate refresh stream task");
+        finish_stream_refresh(stream_name, true);
         http_response_set_json_error(res, 500, "Internal server error");
         return;
     }
@@ -2194,6 +2488,7 @@ void handle_post_stream_refresh(const http_request_t *req, http_response_t *res)
     if (!response) {
         log_error("Failed to create response JSON object");
         free(task);
+        finish_stream_refresh(stream_name, true);
         http_response_set_json_error(res, 500, "Failed to create response JSON");
         return;
     }
@@ -2208,12 +2503,10 @@ void handle_post_stream_refresh(const http_request_t *req, http_response_t *res)
     if (!json_str) {
         log_error("Failed to convert response JSON to string");
         free(task);
+        finish_stream_refresh(stream_name, true);
         http_response_set_json_error(res, 500, "Failed to convert response JSON");
         return;
     }
-
-    http_response_set_json(res, 202, json_str);
-    free(json_str);
 
     // Spawn background thread to perform the actual refresh work
     // This prevents blocking the web server event loop
@@ -2222,13 +2515,19 @@ void handle_post_stream_refresh(const http_request_t *req, http_response_t *res)
     pthread_attr_init(&attr);
     pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
 
-    if (pthread_create(&thread_id, &attr, (void *(*)(void *))refresh_stream_worker, task) != 0) {
+    if (pthread_create(&thread_id, &attr, refresh_stream_worker, task) != 0) {
         log_error("Failed to create worker thread for stream refresh");
         free(task);
-        // Response already sent, just log the error
+        finish_stream_refresh(stream_name, true);
+        free(json_str);
+        pthread_attr_destroy(&attr);
+        http_response_set_json_error(res, 500, "Failed to start stream refresh");
+        return;
     } else {
         log_info("Stream refresh task started in worker thread for: %s", stream_name);
     }
 
     pthread_attr_destroy(&attr);
+    http_response_set_json(res, 202, json_str);
+    free(json_str);
 }

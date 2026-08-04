@@ -8,13 +8,23 @@ The tests are organized as follows:
 
 ```
 tests/
+├── *.spec.js             # Unit tests -- run by `npm test`
 ├── e2e/                  # End-to-end tests with Selenium
 │   ├── pages/            # Page objects
 │   ├── specs/            # Test specifications
 │   └── utils/            # Test utilities
-├── unit/                 # Unit tests (if needed)
-└── setup.js              # Test setup
+└── setup.cjs             # Test setup (both suites)
 ```
+
+The two suites run separately:
+
+| Command | Config | Scope |
+| --- | --- | --- |
+| `npm test` | `jest.config.cjs` | Unit tests only; no browser or server needed |
+| `npm run test:e2e` | `jest.e2e.config.cjs` | Selenium E2E; needs a browser and a running LightNVR server |
+
+E2E is excluded from `npm test` on purpose — those specs drive a real browser
+against a live server, so they cannot pass in a plain checkout.
 
 ## Page Objects
 
@@ -29,6 +39,7 @@ Current page objects:
 
 The `utils` directory contains helper functions for common test operations:
 - `createDriver()` - Creates a WebDriver instance for Chrome or Firefox
+- `url()` / `baseUrl()` - Builds URLs against the server under test
 - `takeScreenshot()` - Captures screenshots during test execution
 - `sleep()` - Waits for a specified amount of time
 
@@ -36,10 +47,12 @@ The `utils` directory contains helper functions for common test operations:
 
 Before running the tests, make sure you have the following installed:
 
-1. Node.js and npm
+1. Node.js 24.11+ (24.x) and npm
 2. Chrome and/or Firefox browsers
-3. ChromeDriver and/or GeckoDriver (for Selenium)
-4. Application running with authentication (username: `admin`, password: `admin`)
+3. Application running with authentication (username: `admin`, password: `admin`)
+
+No WebDriver download is needed: Selenium Manager (bundled with
+`selenium-webdriver`) fetches a driver matching your installed browser.
 
 ## Running Tests Locally
 
@@ -53,16 +66,19 @@ This guide includes:
 
 ## Headless Mode
 
-By default, tests run with the browser visible. To run in headless mode (without a visible browser window), modify the test file to enable headless mode:
+Tests run headless by default. To watch the browser, set `E2E_HEADLESS=false`:
 
-```javascript
-// In the test file
-driver = await createDriver('chrome', true); // Set second parameter to true for headless mode
+```bash
+E2E_HEADLESS=false npm run test:e2e
 ```
+
+See [RUNNING_TESTS_LOCALLY.md](./RUNNING_TESTS_LOCALLY.md) for the full list of
+environment variables (`E2E_BASE_URL`, `E2E_BROWSER`, `E2E_HEADLESS`).
 
 ## Screenshots
 
-Screenshots are saved to the `screenshots` directory during test execution. This is useful for debugging test failures.
+Screenshots are saved to `web/screenshots` during test execution (gitignored).
+This is useful for debugging test failures.
 
 ## Adding New Tests
 

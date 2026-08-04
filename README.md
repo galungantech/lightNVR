@@ -215,7 +215,26 @@ Powerful object detection using modern ONNX and TFLite models with zone-aware fi
 
 ### Installation
 
+> **🏠 Running Home Assistant?** Install LightNVR straight from the add-on store —
+> no Docker or command line needed. Add the repository
+> **[opensensor/lightnvr-hassio-addons](https://github.com/opensensor/lightnvr-hassio-addons)**
+> under **Settings → Add-ons → Add-on Store → ⋮ → Repositories**, then install
+> **LightNVR**. See that repo's README for one-click setup.
+
 1. **Build from source**:
+
+   Prerequisites (in addition to `build-essential`, `cmake`, `pkg-config`):
+   - **FFmpeg ≥ 7.1** (`libavcodec ≥ 61`, `libavformat ≥ 61`, `libavutil ≥ 59`,
+     `libswscale ≥ 8`, `libswresample ≥ 5`). Debian 12 (bookworm) and Ubuntu
+     22.04 ship FFmpeg 5.x/6.x, which is too old — build FFmpeg from source or
+     use a newer distro release (Debian 13 / Ubuntu 24.04+ ship a compatible
+     version).
+   - **Node.js ≥ 24.11 and < 25** for the web build. Use the pinned version in
+     `.nvmrc`; distribution packages may be older, so install Node 24 via
+     [NodeSource](https://github.com/nodesource/distributions) or
+     [nvm](https://github.com/nvm-sh/nvm) when needed.
+   - **`libsqlite3-dev`** (not pulled in automatically by any of the above).
+
    ```bash
    # Clone the repository
    git clone https://github.com/opensensor/lightnvr.git
@@ -224,11 +243,12 @@ Powerful object detection using modern ONNX and TFLite models with zone-aware fi
    # Initialize submodules (required for go2rtc)
    git submodule update --init --recursive
 
-   # Build web assets (requires Node.js/npm)
-   cd web
-   npm install
-   npm run build
-   cd ..
+   # Build web assets (requires Node.js >= 24.11 and < 25 -- see above).
+   # Use this script rather than running: cd web && npm install && npm run build
+   # It also runs scripts/extract_version.js first, which generates web/js/version.js
+   # from CMakeLists.txt. Skipping that step fails the Vite build with:
+   # "Could not resolve '../../version.js'" in Header.jsx.
+   ./scripts/build_web_vite.sh
 
    # Build the software
    ./scripts/build.sh --release
