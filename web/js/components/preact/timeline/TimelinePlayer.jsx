@@ -491,6 +491,13 @@ export function TimelinePlayer({ videoElementRef = null, autoFullscreen = false 
       return;
     }
 
+    // Bypass global state updates during fast-forward to optimize UI performance
+    if (video.playbackRate > 1) {
+      updateTimeDisplay(currentTime, segment);
+      lastTimeUpdateRef.current = currentTime;
+      return;
+    }
+    
     // Update timeline state with the current time
     timelineState.setState({
       currentTime: currentTime,
@@ -895,7 +902,6 @@ export function TimelinePlayer({ videoElementRef = null, autoFullscreen = false 
               ref={setVideoRefs}
               className="w-full h-full object-contain"
               controls
-              controlsList="nofullscreen"
               autoPlay={false}
               muted={false}
               playsInline
