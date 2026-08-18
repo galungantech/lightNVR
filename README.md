@@ -1,7 +1,7 @@
 # LightNVR - Lightweight Network Video Recorder
 
 [![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](https://www.gnu.org/licenses/gpl-3.0)
-[![Docker Pulls](https://img.shields.io/docker/pulls/matteius/lightnvr)](https://hub.docker.com/r/matteius/lightnvr)
+[![Container Image](https://img.shields.io/badge/container-ghcr.io-blue?logo=docker)](https://github.com/opensensor/lightNVR/pkgs/container/lightnvr)
 [![Integration Tests](https://github.com/opensensor/lightNVR/actions/workflows/integration-test.yml/badge.svg)](https://github.com/opensensor/lightNVR/actions/workflows/integration-test.yml)
 [![Static Analysis](https://github.com/opensensor/lightNVR/actions/workflows/static-analysis.yml/badge.svg)](https://github.com/opensensor/lightNVR/actions/workflows/static-analysis.yml)
 [![Sanitizer Build](https://github.com/opensensor/lightNVR/actions/workflows/sanitizer.yml/badge.svg)](https://github.com/opensensor/lightNVR/actions/workflows/sanitizer.yml)
@@ -86,8 +86,8 @@ Publish detection events to an MQTT broker for integration with Home Assistant a
 ### Demo Mode (v0.21.0)
 Built-in demo mode with virtual test streams for development and evaluation without real cameras.
 
-### Auto-Generated Credentials (v0.21.7)
-Admin password is now auto-generated on first run for improved out-of-box security.
+### Database-Backed User Management (v0.21.7)
+Users live in the database and are managed from the **Users** page, not the config file. The first run creates an `admin` account with the password `admin` — [change it immediately](#first-login).
 
 ## 💡 Use Cases
 
@@ -272,7 +272,7 @@ Powerful object detection using modern ONNX and TFLite models with zone-aware fi
 4. **Access the web interface**:
    Open a web browser and navigate to `http://your-device-ip:8080`
 
-   Default username: `admin` (password is auto-generated on first run — check the service logs with `journalctl -u lightnvr`)
+   See [First login](#first-login) — the default credentials are `admin` / `admin` and you should change them before anything else.
 
 5. **(Optional) Set up object detection**:
 
@@ -294,6 +294,30 @@ Powerful object detection using modern ONNX and TFLite models with zone-aware fi
    - Configure **Detection Zones** to define areas of interest
 
    See [Zone Configuration Guide](docs/ZONE_CONFIGURATION.md) for detailed zone setup instructions.
+
+### First login
+
+> ⚠️ **LightNVR ships with the credentials `admin` / `admin`, and the web server listens on
+> `0.0.0.0` by default.** Until you change the password, anyone who can reach port 8080 can
+> reach your cameras and recordings. Change it before you expose the port to anything.
+
+Log in at `http://your-device-ip:8080` with `admin` / `admin`, then go to **Settings →
+Users** and set a real password.
+
+You can also pre-set the password *before* the first start, which avoids the default ever
+being valid: set `password` in the `[web]` section of `lightnvr.ini` and start LightNVR.
+The first run creates the admin account with that password instead. The setting is only
+read when the account is created — after that, users live in the database and are managed
+from the **Users** page.
+
+Forgot the password? There is no reset flag. Stop LightNVR, delete the account row, and
+restart — it will be recreated from the same rules as a first run:
+
+```bash
+sudo systemctl stop lightnvr
+sqlite3 /var/lib/lightnvr/data/database/lightnvr.db "DELETE FROM users WHERE username = 'admin';"
+sudo systemctl start lightnvr
+```
 
 ## Troubleshooting
 
@@ -372,17 +396,13 @@ The container will automatically:
 - Set up web assets with working defaults
 - Configure go2rtc with WebRTC/STUN support
 
-Access the web UI at `http://localhost:8080` (default username: `admin`, password is auto-generated on first run — check logs)
+Access the web UI at `http://localhost:8080`. The default credentials are `admin` / `admin` — see [First login](#first-login).
 
 #### Using Docker Run
 
-Images are published to both Docker Hub and GHCR on every tagged release:
+Images are published to GHCR on every tagged release, for `linux/amd64`, `linux/arm64`, and `linux/arm/v7`:
 
 ```bash
-# Docker Hub (recommended)
-docker pull matteius/lightnvr:latest
-
-# GitHub Container Registry
 docker pull ghcr.io/opensensor/lightnvr:latest
 ```
 
@@ -398,7 +418,7 @@ docker run -d \
   -v ./config:/etc/lightnvr \
   -v ./data:/var/lib/lightnvr/data \
   -e TZ=America/New_York \
-  opensensor/lightnvr:latest
+  ghcr.io/opensensor/lightnvr:latest
 ```
 
 #### Volume Mounts Explained
@@ -427,15 +447,18 @@ The container uses two volume mounts for persistence:
 
 - `TZ` - Timezone (default: UTC)
 - `GO2RTC_CONFIG_PERSIST` - Persist go2rtc config across restarts (default: true)
-- `LIGHTNVR_AUTO_INIT` - Auto-initialize config files (default: true)
+- `LIGHTNVR_ONVIF_NETWORK` - Camera network to scan for ONVIF discovery, in CIDR form
+
+See [Docker Deployment](docs/DOCKER.md#environment-variables) for the full list.
 
 #### First Run
 
 On first run, the container will:
 1. Create default configuration files in `/etc/lightnvr`
-2. Copy web assets to `/var/lib/lightnvr/web`
+2. Verify the web assets baked into the image at `/var/lib/lightnvr/www`
 3. Initialize the database in `/var/lib/lightnvr/data/database`
-4. Set up go2rtc with WebRTC/STUN configuration
+4. Seed detection models into `/var/lib/lightnvr/data/models`
+5. Set up go2rtc with WebRTC/STUN configuration
 
 The go2rtc configuration includes STUN servers for WebRTC NAT traversal, so WebRTC streaming should work out-of-the-box in most network environments.
 
@@ -458,11 +481,16 @@ The configuration files will persist across container restarts and updates.
 
 ## Documentation
 
+**📖 [Full documentation index](docs/README.md)** — grouped by task, with a
+getting-started path from install to first recording.
+
 ### Getting Started
 - [Installation Guide](docs/INSTALLATION.md)
 - [Build Instructions](docs/BUILD.md)
 - [Configuration Guide](docs/CONFIGURATION.md)
 - [Docker Deployment](docs/DOCKER.md)
+- [Home Assistant Add-on](docs/HOME_ASSISTANT.md)
+- [Windows (Podman + WSL2)](docs/WINDOWS_PODMAN.md)
 - [Reverse Proxy & HTTPS](docs/REVERSE_PROXY.md)
 - [Troubleshooting Guide](docs/TROUBLESHOOTING.md)
 
@@ -472,6 +500,7 @@ The configuration files will persist across container restarts and updates.
 - [go2rtc Integration](docs/GO2RTC_INTEGRATION.md)
 - [go2rtc Config Override](docs/GO2RTC_CONFIG_OVERRIDE.md)
 - [MQTT Integration](docs/MQTT_INTEGRATION.md)
+- [Camera Compatibility](docs/CAMERAS.md)
 - [ONVIF Detection](docs/ONVIF_DETECTION.md)
 - [Motion Buffer System](docs/MOTION_BUFFER.md)
 - [SOD Integration](docs/SOD_INTEGRATION.md)
@@ -479,8 +508,9 @@ The configuration files will persist across container restarts and updates.
 ### Architecture & Development
 - [Architecture Overview](docs/ARCHITECTURE.md)
 - [Frontend Architecture](docs/FRONTEND.md)
-- [State Management](docs/STATE_MANAGEMENT.md)
 - [Release Process](docs/RELEASE_PROCESS.md)
+- [Product requirement documents](docs/prd/)
+- [Internal design notes](docs/internal/) — historical writeups, not current guidance
 
 ## Project Structure
 
