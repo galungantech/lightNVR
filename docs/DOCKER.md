@@ -1,6 +1,14 @@
 # Docker Deployment Guide
 
+*Verified against LightNVR 0.37.x.*
+
 This guide provides comprehensive information about deploying LightNVR using Docker.
+
+> **On Windows?** Everything here applies, but the host setup has its own pitfalls.
+> Start with [Running LightNVR on Windows with Podman + WSL2](WINDOWS_PODMAN.md).
+>
+> **On Home Assistant OS or Supervised?** Use the add-on instead — it handles networking,
+> storage, and backups for you. See [LightNVR on Home Assistant](HOME_ASSISTANT.md).
 
 ## Table of Contents
 
@@ -53,7 +61,7 @@ docker compose logs -f
 
 # Access the web UI
 # http://localhost:8080
-# Default username: admin (password is auto-generated on first run - check logs)
+# Default credentials: admin / admin - change immediately, see First Run Experience
 ```
 
 To build the image from source instead, clone the repository (with `git submodule update --init --recursive`) and switch the `image:` line in `docker-compose.yml` to the commented-out `build:` block — see [Building from Source](#building-from-source).
@@ -201,11 +209,14 @@ volumes:
 
 ### Web Assets
 
-Web assets are stored in `/var/lib/lightnvr/web` and are automatically copied from `/usr/share/lightnvr/web-template/` on first run. This ensures:
+Web assets are baked into the image at `/var/lib/lightnvr/www` during the build. The
+entrypoint verifies `index.html` is present and refuses to start if it is not; there is no
+copy-on-first-run step. This means:
 
-- Web UI works immediately after container start
-- Updates to the container image update the web UI
-- Web assets are not lost when mounting data volumes
+- The web UI works immediately after container start
+- Pulling a new image updates the web UI
+- **Never mount a volume over `/var/lib/lightnvr`** — it would hide the assets and the
+  container will fail to start. Mount `/var/lib/lightnvr/data` instead.
 
 ## Network Configuration
 
@@ -251,9 +262,15 @@ services:
 |----------|---------|-------------|
 | `TZ` | `UTC` | Container timezone |
 | `GO2RTC_CONFIG_PERSIST` | `true` | Persist go2rtc config across restarts |
-| `LIGHTNVR_AUTO_INIT` | `true` | Auto-initialize config files on first run |
-| `LIGHTNVR_WEB_ROOT` | `/var/lib/lightnvr/web` | Web assets directory |
 | `LIGHTNVR_ONVIF_NETWORK` | (none) | Override ONVIF discovery network (e.g., `192.168.1.0/24`) |
+| `LIGHTNVR_MIGRATIONS_DIR` | (none) | Override where database migrations are read from. Falls back to `./db/migrations`, then `/usr/share/lightnvr/migrations`, then a path relative to the binary. |
+
+> `LIGHTNVR_AUTO_INIT` and `LIGHTNVR_WEB_ROOT` are set by the image and by
+> `docker-compose.yml`, but nothing reads them — neither the entrypoint nor LightNVR
+> itself. Setting them has no effect. They are left in place because removing them from
+> existing compose files would be a breaking-looking change for no gain; treat them as
+> inert. Config initialization always runs when `/etc/lightnvr/lightnvr.ini` is absent,
+> and the web root is fixed at `/var/lib/lightnvr/www`.
 
 ### Example Usage
 
@@ -299,21 +316,27 @@ On first container start, the entrypoint script automatically:
 1. **Creates Directory Structure**
    ```
    /etc/lightnvr/
-   /var/lib/lightnvr/web/
    /var/lib/lightnvr/data/database/
    /var/lib/lightnvr/data/recordings/
    /var/lib/lightnvr/data/models/
    ```
 
-2. **Copies Web Assets**
-   - Copies from `/usr/share/lightnvr/web-template/` to `/var/lib/lightnvr/web/`
-   - Only if web directory is empty
+2. **Verifies Web Assets**
+   - Checks that `/var/lib/lightnvr/www/index.html` exists — the assets are baked into
+     the image at build time and are *not* copied at startup
+   - Startup fails with an error if they are missing, which normally means
+     `/var/lib/lightnvr` was mounted over. Mount `/var/lib/lightnvr/data`, never
+     `/var/lib/lightnvr` itself.
 
 3. **Creates Default Configuration**
    - `lightnvr.ini` with sensible defaults
    - `go2rtc.yaml` with WebRTC/STUN configuration
 
-4. **Initializes Database**
+4. **Seeds Detection Models**
+   - Copies `/usr/share/lightnvr/models/` into `/var/lib/lightnvr/data/models/`, only if
+     the destination is empty
+
+5. **Initializes Database**
    - Creates SQLite database on first access
    - Sets up default admin user
 
@@ -322,7 +345,14 @@ On first container start, the entrypoint script automatically:
 - **Username:** `admin`
 - **Password:** `admin`
 
-⚠️ **Change these immediately after first login!**
+⚠️ **Change these immediately after first login.** The web server binds `0.0.0.0` inside
+the container, so once you publish port 8080 these credentials are the only thing in front
+of your cameras and recordings. Change the password under **Settings → Users**.
+
+To avoid the default ever being valid, set `password` in the `[web]` section of
+`config/lightnvr.ini` *before* the first start — the admin account is then created with
+that password instead. The setting is only read when the account is created; afterwards
+users are managed from the **Users** page.
 
 ## WebRTC Configuration
 
@@ -532,7 +562,24 @@ services:
 
 ## Migration from Previous Versions
 
-If you're upgrading from an older version that mounted `/var/lib/lightnvr` directly, see [DOCKER_MIGRATION_GUIDE.md](../DOCKER_MIGRATION_GUIDE.md) for detailed migration instructions.
+If you're upgrading from an older version that mounted `/var/lib/lightnvr` directly, change
+the mount to `/var/lib/lightnvr/data` and move your existing content down one level:
+
+```bash
+docker compose down
+
+# Your old volume held database/, recordings/ and models/ at its root, alongside
+# the web assets. Only the first three should persist.
+mkdir -p ./data
+mv ./old-volume/database ./old-volume/recordings ./old-volume/models ./data/ 2>/dev/null
+
+# Then point the volume at the data subdirectory:
+#   - ./data:/var/lib/lightnvr/data
+docker compose up -d
+```
+
+Mounting `/var/lib/lightnvr` itself hides the web assets baked into the image, and the
+container will refuse to start with a "Web assets not found" error.
 
 ## Building from Source
 

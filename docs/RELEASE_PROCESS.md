@@ -52,6 +52,30 @@ This will:
 
 **Note:** This does NOT commit the changes. You'll need to commit them manually.
 
+### Documentation checkpoint
+
+Before cutting a release, confirm the documentation still describes what the code does.
+This is not a general "review the docs" ask — it is a specific check against the changes
+going into this release.
+
+**If a change in this release altered any of the following, the documentation change ships
+with it, not later:**
+
+| Changed | Check |
+|---|---|
+| A default value | `docs/CONFIGURATION.md`, and the sample in `config/lightnvr.ini` |
+| A port | `docs/DOCKER.md`, `README.md`, `docs/HOME_ASSISTANT.md`, `docker-compose.yml` |
+| A path (config, data, web root, models) | `docs/DOCKER.md`, `docs/INSTALLATION.md`, `docs/TROUBLESHOOTING*.md` |
+| Credentials or auth behavior | `README.md` first-login section, `docs/CONFIGURATION.md`, `docs/DOCKER.md` |
+| An environment variable | `docs/DOCKER.md` environment table — including *removing* one that no longer does anything |
+| A CLI flag, or a `scripts/*.sh` option | Every code block that uses it |
+| Where images are published | `README.md`, `docs/INSTALLATION.md`, `docs/DOCKER.md` |
+
+The failure mode this exists to prevent is documentation that quietly becomes false: it
+does not break a build, no test catches it, and the first person to notice is a user who
+followed it and got a different result. Every item in that table is there because it
+happened.
+
 ### 2. Creating a Release
 
 The recommended way to create a release is using the automated script:
@@ -111,7 +135,7 @@ When you push a tag, GitHub Actions automatically:
    - Installs Node.js 24.x LTS
    - Runs `npm ci --ignore-scripts` from the committed lockfile
    - Runs `npm run build` to build with Vite
-   - Copies built assets to `/usr/share/lightnvr/web-template/`
+   - Copies built assets to `/var/lib/lightnvr/www/` in the runtime image
 
 3. **Publishes images** to GitHub Container Registry:
    - `ghcr.io/opensensor/lightnvr:latest` (for main branch)
@@ -182,6 +206,13 @@ git add -A && git commit -m "Your changes"
 # or
 git stash
 ```
+
+> **Known inconsistency — tag prefix.** `scripts/release.sh` creates annotated tags as
+> `v$VERSION` (`scripts/release.sh:172`), but every release since `0.17` is tagged
+> *without* the prefix — `0.37.2`, not `v0.37.2`. The publish workflow triggers on
+> `'*.*.*'`, which matches either, so both work; but the script and current practice
+> disagree, and the commands below assume the script's form. Reconcile before relying on
+> either.
 
 ### "Tag vX.Y.Z already exists"
 
