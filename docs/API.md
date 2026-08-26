@@ -27,7 +27,7 @@ curl -c cookies.txt -X POST -H "Content-Type: application/json" \
 curl -b cookies.txt http://your-lightnvr-ip:8080/api/streams
 ```
 
-### 2. API key (automation, long-lived integrations)
+### 2. Legacy API key (compatibility automation)
 
 Every user has an `api_key` field. Pass it via either header:
 
@@ -41,7 +41,10 @@ curl -H "Authorization: Bearer <your-api-key>" http://your-lightnvr-ip:8080/api/
 
 For automation (Home Assistant, NodeRED, cron jobs, etc.), create a dedicated
 user with the `USER_ROLE_API` role and use that user's `api_key`. Keep admin
-keys out of automation configs.
+keys out of automation configs. New integrations should use the expiring,
+action- and camera-scoped tokens described below. The single non-expiring key
+remains a compatibility credential, but it is evaluated against the same
+selector-backed policy as interactive sessions.
 
 ### 3. HTTP Basic Auth
 
@@ -49,8 +52,10 @@ Also supported as a fallback for tools that only understand basic auth.
 
 ### Roles
 
-Role-based access is enforced per-endpoint. The table below is a high-level
-summary of the intended access model:
+The numeric role remains compatibility metadata and chooses the initial built-in
+policy for a new or migrated user. Effective endpoint access comes from action
+grants, not a numeric-role shortcut. The table below summarizes those built-in
+compatibility policies:
 
 | Role     | Can read | Can write | Can administer |
 |----------|:--------:|:---------:|:--------------:|
@@ -62,6 +67,269 @@ summary of the intended access model:
 Write authorization is endpoint-specific. Stream creation, updates (including
 privacy mode), and deletion reject `VIEWER` with `403`, as does
 [`POST /api/motion/trigger`](#trigger-motion-event).
+
+### Action-level authorization foundation
+
+New installations and upgrades include the Fleet 02 action catalog, reusable
+roles, and camera-selector or shared-collection grants. Startup performs a
+one-way, transactional migration of every legacy principal to exactly its
+compatibility role and prior scope. Legacy `allowed_tags` labels become
+normalized tag-UUID selectors; the tombstoned column is then cleared. Public
+APIs and the UI no longer accept `allowed_tags` or `mode: legacy`.
+
+Policy evaluation is default-deny: an action is allowed only when an enabled
+role grant contains it and its all-fleet, shared-collection, or camera-selector
+scope matches. Current coverage and the deliberately unenforced audio/job gaps
+are tracked in
+[`docs/internal/AUTHORIZATION_ENDPOINT_INVENTORY.md`](internal/AUTHORIZATION_ENDPOINT_INVENTORY.md).
+
+#### List authorization actions
+
+```
+GET /api/authorization/actions
+```
+
+Administrator-only. Returns the stable action key, category, description,
+whether a camera resource is required, and whether the action is destructive.
+
+Each entry also reports:
+
+- `enforced` — whether any request handler currently routes through the
+  centralized evaluator for this action. Actions are grantable ahead of their
+  enforcement work, so clients must label the unenforced ones rather than imply
+  a boundary that is not applied yet. See
+  `docs/internal/AUTHORIZATION_ENDPOINT_INVENTORY.md` for the coverage map.
+- `mask_bit` — the bit position this action occupies in a persisted API token
+  `action_mask`. The position is frozen once an action ships; the daemon refuses
+  to start if the stored layout in `authz_actions` disagrees with the binary.
+
+A policy manager may only author roles, grants, and tokens whose actions are a
+subset of the authority it holds itself. Requests that would widen the
+requester's own authority are rejected with `403` and name the offending
+actions, so `users.manage` cannot be used as a path to `system.admin`.
+
+#### Simulate authorization
+
+```
+POST /api/authorization/simulate
+```
+
+Administrator-only and side-effect free. Camera-scoped actions require a stable
+camera UUID:
+
+```json
+{
+  "user_id": 7,
+  "action": "recordings.export",
+  "camera_uuid": "0192a7f0-4f43-4a1d-9e1c-d6947677f145"
+}
+```
+
+The response reports `allowed`, the compatibility role or matching policy grant,
+the evaluated policy version, and a concise explanation. Global actions such as
+`users.manage` omit `camera_uuid`.
+
+#### Manage authorization roles
+
+```
+GET    /api/authorization/roles
+POST   /api/authorization/roles
+PUT    /api/authorization/roles/{role_uuid}
+DELETE /api/authorization/roles/{role_uuid}
+```
+
+Administrator-only. The list response includes the current `policy_version` and
+each role's action keys. Built-in roles are readable but immutable. Create,
+update, and delete requests must include the last observed version as
+`expected_policy_version`; stale writes return `409` so concurrent policy edits
+cannot silently overwrite one another.
+
+Create and update bodies use a complete role representation:
+
+```json
+{
+  "expected_policy_version": 12,
+  "name": "Evidence reviewer",
+  "description": "Can replay evidence without exporting it",
+  "actions": ["live.view", "recordings.replay"]
+}
+```
+
+A delete body contains only `expected_policy_version`. A custom role cannot be
+deleted while a grant references it.
+
+#### Manage a user's authorization policy
+
+```
+GET /api/authorization/users/{user_id}
+PUT /api/authorization/users/{user_id}
+```
+
+Administrator-only. `GET` returns the user's mode, complete grants, and a policy
+version. `PUT` atomically replaces the complete grant set and mode, and requires
+that version as `expected_policy_version`. An `all` scope omits a resource; a
+selector scope embeds a Fleet 01 selector:
+
+```json
+{
+  "expected_policy_version": 13,
+  "mode": "policy",
+  "grants": [
+    {
+      "role_uuid": "00000000-0000-4000-8000-000000000003",
+      "scope": {
+        "type": "selector",
+        "selector": {
+          "version": 1,
+          "expression": {
+            "op": "tag_any",
+            "uuids": ["c401035a-a208-4af9-9bf5-e49da3bd4200"]
+          }
+        }
+      }
+    }
+  ]
+}
+```
+
+A collection scope stores a durable reference instead of copying the
+collection's current selector or members:
+
+```json
+{
+  "role_uuid": "00000000-0000-4000-8000-000000000003",
+  "scope": {
+    "type": "collection",
+    "collection_uuid": "d813e24e-0c7a-48e7-960c-4f5b843466db"
+  }
+}
+```
+
+Only shared collections may be authorization scopes. Their current static or
+smart membership is evaluated at request time, so organizational changes take
+effect without rewriting every user policy. An in-use collection cannot be
+made private or deleted, and membership/rule changes advance the policy version.
+
+The server validates every selector, collection, and role before changing
+anything. It also
+rejects an authenticated administrator's attempt to remove their own effective
+`users.manage` grant. `PUT` accepts only `mode: "policy"`; there is no supported
+path back to legacy-role evaluation after the upgrade migration.
+
+#### Manage scoped API tokens
+
+```
+GET    /api/authorization/users/{user_id}/tokens
+POST   /api/authorization/users/{user_id}/tokens
+DELETE /api/authorization/users/{user_id}/tokens/{token_uuid}
+```
+
+A user may manage their own tokens; a principal with `users.manage` may manage
+another user's. Token management itself requires a session, Basic auth, or a
+legacy API key—a scoped token cannot mint another token. `POST` requires a
+description, an explicit expiry no more than 366 days away, one or more action
+keys, and an all-fleet, selector, or shared-collection scope:
+
+```json
+{
+  "description": "North garage PTZ bridge",
+  "expires_at": 1819075200,
+  "actions": ["live.view", "ptz.control"],
+  "scope": {
+    "type": "collection",
+    "collection_uuid": "d813e24e-0c7a-48e7-960c-4f5b843466db"
+  }
+}
+```
+
+The `201` response contains the secret once as `secret` plus non-secret token
+metadata. lightNVR stores only its SHA-256 hash and a short display prefix.
+`GET` returns metadata, expiry, revocation, last-use time, actions, and scope but
+never the secret or hash. `DELETE` revokes rather than erases the token.
+
+Token authorization is the intersection of the token and its owning user's
+current effective access, so changing the user policy can only reduce what an
+existing token can do. Protected camera, recording, configuration, taxonomy,
+storage, event, user, settings, and system handlers invoke the central action
+evaluator. The endpoint inventory documents the remaining direct-go2rtc audio
+boundary and future bulk-job surface.
+
+Administrators can manage these credentials from **Users → Manage API access**.
+The dialog exposes only actions with current scoped-token endpoint enforcement,
+supports shared collections and custom selectors, and requires acknowledgment
+before dismissing a newly displayed secret. The non-expiring legacy key remains
+in a separate compatibility-only section.
+
+### Audit history and correlation IDs
+
+Every initialized HTTP request receives a correlation ID. A caller may supply
+`X-Request-ID` using up to 64 letters, digits, dots, underscores, colons, or
+hyphens; otherwise lightNVR generates a UUID. Normal API responses echo the ID
+as `X-Request-ID`, and audit records retain it so an operator can correlate a UI
+failure, reverse-proxy log, and durable security decision.
+
+Audit records are append-only through supported APIs. Structured details are
+generated by the server, and sensitive field names such as passwords, secrets,
+credentials, authorization headers, cookies, API keys, and raw tokens are
+redacted before persistence. Coverage includes login outcomes, central
+authorization decisions, policy simulation and mutations, scoped-token
+creation/revocation, retention changes, and redacted success/failure/error
+outcomes for sensitive camera, evidence, storage, event, and system operations.
+
+#### List audit events
+
+```
+GET /api/audit/events
+```
+
+Requires `system.admin`. Results are ordered newest first and accept these
+optional query parameters:
+
+| Parameter | Meaning |
+| --- | --- |
+| `page`, `page_size` | 1-based page; page size defaults to 100 and is capped at 1000 |
+| `since`, `until` | Inclusive Unix timestamp bounds |
+| `principal_user_id` | Exact local user ID |
+| `action`, `outcome` | Exact action and outcome (`allowed`, `denied`, `success`, `failure`, or `error`) |
+| `target_uuid`, `request_id` | Exact target or correlation ID |
+
+The response contains `page`, `page_size`, page `count`, complete filtered
+`total`, and an `events` array. Principal name and authentication method are
+snapshotted so the history remains understandable after a user changes.
+
+#### Export audit events
+
+```
+GET /api/audit/events/export
+```
+
+Accepts the same filters and pagination contract and returns CSV. The filtered
+total is exposed as `X-Total-Count`. CSV cells are quoted and spreadsheet
+formula prefixes are neutralized.
+
+#### Manage audit retention
+
+```
+GET /api/audit/settings
+PUT /api/audit/settings
+```
+
+Requires `system.admin`. `PUT` accepts an integer retention period from 1 to
+3650 days and prunes already-expired records immediately:
+
+```json
+{
+  "retention_days": 365
+}
+```
+
+The default is 365 days. Routine audit writes perform an at-most-hourly expiry
+check, so retention does not depend on a separate scheduler.
+
+Administrators can browse this history from **Users → Audit History**. The
+responsive workspace keeps filters server-side, shows structured details on
+demand, exports the current filtered page, and manages retention without adding
+another top-level navigation destination.
 
 ## API Endpoints
 
@@ -528,7 +796,12 @@ recording enabled.
 GET /api/recordings
 ```
 
-Returns a list of recordings. Supports query parameters for filtering by stream name, date range, and pagination.
+Returns a list of recordings. Supports query parameters for filtering by stream
+name, date range, and pagination. Pass `collection_uuid` to filter recordings
+by an authorized static or smart camera collection. `collection_uuid` and
+`stream` are mutually exclusive; collection rules are evaluated on the server
+so shared smart rules remain private and large collections do not expand into
+query strings.
 
 `capture_method` is `continuous` for always-on recording, `scheduled` when
 continuous capture is gated by a weekly schedule, or `detection`, `motion`, or
@@ -671,6 +944,621 @@ GET /api/timeline/play
 
 Streams video for timeline playback at a specified point in time.
 
+### Investigation
+
+#### Multi-camera timeline
+
+```
+POST /api/investigations/timeline
+```
+
+Returns aligned recording tracks for up to 16 authorized camera UUIDs in a UTC
+window. Each track includes recording intervals, capture methods, media
+availability, and explicit gaps used by the synchronized investigation player.
+
+#### Event and metadata search
+
+```
+POST /api/investigations/search
+```
+
+Searches persisted detection metadata with stable cursor pagination. Camera
+scope is either `camera_uuids` or a Fleet selector, never both. Explicit camera
+lists fail if any requested camera is unauthorized; broad selectors omit
+unauthorized matches before totals, facets, and histograms are calculated.
+
+```json
+{
+  "camera_uuids": ["0192a7f0-4f43-4a1d-9e1c-d6947677f145"],
+  "start_time": 1787529600,
+  "end_time": 1787533200,
+  "filters": {
+    "event_types": ["detection"],
+    "labels": ["person"],
+    "zones": ["loading-area"],
+    "sources": ["local"],
+    "capture_methods": ["continuous"],
+    "recording_tags": ["reviewed"],
+    "locations": ["03852a50-1254-4a0f-894c-cbc660fa6726"],
+    "protected": true,
+    "min_confidence": 0.75,
+    "max_confidence": 1.0
+  },
+  "limit": 100,
+  "cursor": null
+}
+```
+
+The optional top-level `region` performs a metadata-only rectangular search on
+one camera. Coordinates are normalized to the source image. Matching modes are
+`center`, `intersects`, and `minimum_intersection`; the latter accepts a
+`min_intersection` fraction greater than zero and at most one.
+
+```json
+{
+  "region": {
+    "camera_uuid": "0192a7f0-4f43-4a1d-9e1c-d6947677f145",
+    "x": 0.1,
+    "y": 0.2,
+    "width": 0.4,
+    "height": 0.5,
+    "match": "minimum_intersection",
+    "min_intersection": 0.25
+  }
+}
+```
+
+Region search never decodes historical video. The response
+`coverage.spatial_metadata` reports rows with and without valid normalized
+bounding boxes. Rows without boxes are not searched spatially, and
+`spatial_metadata_missing` appears in `incomplete_reasons` so an empty result is
+not presented as proof that nothing crossed the selected area.
+
+#### Iterative thumbnail samples
+
+```
+POST /api/investigations/thumbnail-samples
+```
+
+Returns evenly spaced, authorized sample moments for one camera and a UTC
+window. `sample_count` is optional (default 7) and must be from 3 through 12.
+Windows use the same 31-day maximum as the investigation timeline. For windows
+shorter than the requested count, the response omits duplicate seconds.
+
+```json
+{
+  "camera_uuids": ["0192a7f0-4f43-4a1d-9e1c-d6947677f145"],
+  "start_time": 1787529600,
+  "end_time": 1787529720,
+  "sample_count": 7
+}
+```
+
+Each response sample has a `timestamp` and `media_status`. Samples covered by a
+recording also contain its ID and bounds, an `offset_ms`, and a lazy thumbnail
+URL. Gap samples remain useful for metadata-only time navigation and do not
+have a URL. `coverage.segments_truncated` warns when the interval should be
+narrowed before treating sample coverage as complete.
+
+```
+GET /api/investigations/thumbnail/{recording_id}/{offset_ms}
+```
+
+Generates an authorized JPEG at the requested recording offset and caches it
+under the recording. The existing thumbnail worker limit and browser request
+queue bound concurrent generation; a busy server returns `503` with
+`Retry-After: 2`. Deleting a recording also removes its arbitrary-offset cache
+entries.
+
+#### Recording action preview
+
+```
+POST /api/investigations/recordings/preview
+```
+
+Resolves the completed recordings that overlap a fixed list of authorized
+camera UUIDs and UTC interval before a protection or convenience-export action.
+The request uses the same `camera_uuids`, `start_time`, and `end_time` fields as
+the timeline endpoint. The response contains each recording ID, camera, bounds,
+size, current protection state, and the caller's `can_protect` and `can_export`
+decision for that camera. Aggregate permission counts allow the UI to explain a
+partial protection result before it occurs; ZIP export remains all-or-nothing.
+
+The preview and existing mutation endpoints independently re-authorize the
+request. A preview is therefore advisory and never grants later access. At most
+200 overlapping recordings are returned, matching the batch-download limit. A
+larger result returns `413` and requires a narrower interval rather than
+silently truncating the action set.
+
+#### Durable investigation bookmarks
+
+```
+GET    /api/investigation-bookmarks
+POST   /api/investigation-bookmarks
+GET    /api/investigation-bookmarks/{bookmark_uuid}
+PUT    /api/investigation-bookmarks/{bookmark_uuid}
+DELETE /api/investigation-bookmarks/{bookmark_uuid}
+```
+
+Bookmarks are private to the authenticated user and restore an investigation's
+camera order, UTC window, shared cursor, primary camera, filters, region, and an
+optional representative result. They are navigation aids only:
+`holds_recordings` is always `false`, so saving a bookmark does not protect
+media from retention or deletion. Use the recording protection endpoints when
+media must be retained.
+
+Create accepts one through 16 camera UUIDs and a window of at most 31 days:
+
+```json
+{
+  "title": "Loading bay handoff",
+  "note": "Review before the morning shift",
+  "camera_uuids": ["0192a7f0-4f43-4a1d-9e1c-d6947677f145"],
+  "start_time": 1787529600,
+  "end_time": 1787533200,
+  "cursor_time": 1787531400,
+  "primary_camera_uuid": "0192a7f0-4f43-4a1d-9e1c-d6947677f145",
+  "filters": {
+    "event_type": "detection",
+    "label": "person",
+    "min_confidence": 0.75
+  },
+  "representative_result": {
+    "result_id": "detection:482",
+    "camera_uuid": "0192a7f0-4f43-4a1d-9e1c-d6947677f145",
+    "start_time": 1787531400
+  }
+}
+```
+
+The service stores only a bounded whitelist of investigation fields; request
+credentials, media URLs, and arbitrary result data are not retained. Every
+list, read, update, delete, and reopen re-evaluates `recordings.replay` for all
+saved cameras using current policy. List responses omit bookmarks that are no
+longer fully visible. Direct access returns `403` for a current policy denial
+or `404` if a saved camera no longer exists.
+
+`PUT` changes only `title` and `note` and requires the last observed positive
+`revision`. `DELETE` accepts a JSON body containing the same `revision`.
+Stale changes return `409`. Create, update, and delete outcomes are written to
+the audit history. Demo mode returns an empty list and rejects mutations.
+
+### Fleet Query and Selectors
+
+#### Query Cameras
+
+```
+POST /api/fleet/cameras/query
+```
+
+Returns an authorized, server-paginated camera inventory with optional facets.
+The `address` field contains only the source scheme and network authority; paths,
+query strings, fragments, and embedded credentials are omitted. The caller's
+selector-backed `live.view` grants are applied before totals and facet counts
+are calculated.
+
+```json
+{
+  "selector": {
+    "version": 1,
+    "expression": {
+      "op": "and",
+      "children": [
+        {"op": "location_subtree", "uuid": "location-uuid"},
+        {"op": "tag_any", "uuids": ["tag-uuid"]},
+        {"op": "health", "values": ["down", "degraded"]}
+      ]
+    }
+  },
+  "search": "north door",
+  "collection_uuid": "optional-collection-uuid",
+  "page": 1,
+  "page_size": 50,
+  "sort_by": "name",
+  "sort_order": "asc",
+  "facets": true,
+  "explain": false
+}
+```
+
+`page_size` is limited to 200. Supported sort fields are `name`,
+`camera_uuid`, `location`, `health`, `enabled`, `recording_mode`, and
+`address`. Results use the selected field plus camera UUID as a stable
+tie-breaker.
+
+`collection_uuid` is optional and composes with `selector` and `search`. The
+collection must be shared, owned by the caller, or requested by a principal with
+effective global camera-configuration authority. Collection membership and the
+caller's selector-backed action scope are applied before totals, pages, and
+facets are calculated. A collection that is not visible to the caller returns
+`404`.
+
+Selector version 1 supports:
+
+- Boolean nodes: `and` with `children`, `or` with `children`, and `not` with
+  `child`.
+- `all`.
+- `camera_uuid` with `values`.
+- `location_subtree` with `uuid`.
+- `tag_any`, `tag_all`, and `tag_none` with tag `uuids`.
+- `enabled` with a boolean `value`.
+- `recording_mode` with `values` from `off`, `continuous`, and `detection`.
+- `vendor` and `model` with case-insensitive `values`. Inventory values are
+  populated as ONVIF inventory support becomes available.
+- `capability_any` and `capability_all` with `values` from `onvif`, `ptz`, and
+  `backchannel`.
+- `health` with `values` from `unknown`, `up`, `degraded`, `down`, and
+  `disabled`.
+
+Selectors are limited to 8 levels, 64 nodes, and 64 values per node.
+
+#### Preview Selector
+
+```
+POST /api/fleet/selectors/preview
+```
+
+Accepts the same request as the query endpoint, caps pages at 50 cameras, and
+adds `matched_clauses` to each returned camera. An optional `camera_uuid`
+restricts the preview to one camera.
+
+### Camera Collections
+
+Collections are durable named camera groups. A `static` collection stores UUID
+membership; a `smart` collection stores a selector v1 object and updates as
+cameras, locations, tags, configuration, or health change.
+
+#### List and Create Collections
+
+```
+GET /api/camera-collections
+POST /api/camera-collections
+```
+
+Listing requires viewer access and returns only shared collections, collections
+owned by the caller, or all collections for administrators. Counts are computed
+after current tag RBAC. Smart selector definitions are returned only to an
+administrator or the collection owner; other viewers receive `selector: null`
+and `selector_redacted: true`. Creation is administrator-only.
+
+```json
+{
+  "name": "Offline entrances",
+  "description": "Entrance cameras requiring attention",
+  "type": "smart",
+  "shared": true,
+  "selector": {
+    "version": 1,
+    "expression": {
+      "op": "and",
+      "children": [
+        {"op": "tag_any", "uuids": ["entrance-tag-uuid"]},
+        {"op": "health", "values": ["down"]}
+      ]
+    }
+  }
+}
+```
+
+#### Read, Update, and Delete a Collection
+
+```
+GET /api/camera-collections/{collection_uuid}
+PUT /api/camera-collections/{collection_uuid}
+DELETE /api/camera-collections/{collection_uuid}
+```
+
+Reads follow collection visibility and camera RBAC. Update and delete are
+administrator-only in this initial phase. Switching a collection to `smart`
+atomically removes obsolete static membership.
+
+#### Static Collection Members
+
+```
+GET /api/camera-collections/{collection_uuid}/members
+PUT /api/camera-collections/{collection_uuid}/members
+```
+
+`PUT` replaces membership atomically with a `camera_uuids` array and is limited
+to 4,096 entries. `GET` omits cameras outside the caller's current scope. Smart
+collections reject explicit member operations.
+
+#### Preview a Collection
+
+```
+POST /api/camera-collections/{collection_uuid}/preview
+```
+
+Returns the authorized `matched_count` and a sample of at most 50 camera UUIDs,
+names, and location paths.
+
+### Storage Targets
+
+Storage target endpoints require the global `storage.configure` action. They
+register local directories or administrator-mounted filesystems as stable,
+revisioned recording destinations and return cached capacity/health data.
+
+```
+GET    /api/storage-targets
+POST   /api/storage-targets
+GET    /api/storage-targets/{target_uuid}
+PUT    /api/storage-targets/{target_uuid}
+DELETE /api/storage-targets/{target_uuid}?revision={last_seen_revision}
+POST   /api/storage-targets/{target_uuid}/probe
+```
+
+An upgrade automatically creates one default target from the active recording
+root. Existing recording rows below that root gain a target UUID and relative
+object key without moving files. Absolute `file_path` remains a compatibility
+cache during the transition. The default target cannot be disabled, deleted, or
+repointed. Any other target that owns recording rows also keeps an immutable
+root and cannot be deleted until a future lifecycle operation relocates those
+rows.
+
+Create accepts the following shape. v1 target type is always `filesystem`;
+`root_path` must be an absolute path other than `/` and cannot contain traversal
+segments. Enabled targets must already exist and pass a write/fsync/unlink test.
+An unavailable future mount may be saved with `enabled: false` and enabled
+later.
+
+```json
+{
+  "name": "Campus NAS hot 01",
+  "root_path": "/mnt/lightnvr/hot-01",
+  "enabled": true,
+  "storage_class": "hot",
+  "reserve_bytes": 107374182400,
+  "low_watermark_pct": 80,
+  "high_watermark_pct": 90
+}
+```
+
+`storage_class` is `hot`, `warm`, or `cold`. Watermarks describe percent used
+and must satisfy `0 <= low < high < 100`. Updates are partial but require the
+last observed positive `revision`; deletes use that revision as a query
+parameter. The explicit probe performs a small temporary write, fsync, and
+unlink and then refreshes cached health.
+
+List and item responses include `health.status`, capacity, available and used
+bytes, `health.pressure`, `health.cleanup_target_bytes`, last probe/success
+times, and the last error. They also include indexed
+recording count/bytes maintained by SQLite triggers rather than scanning the
+recordings table. `health.duplicate_filesystem` warns when two roots have the
+same underlying device ID, preventing later capacity planning from counting one
+filesystem twice.
+
+An enabled target enters pressure cleanup at its high watermark or when reserved
+headroom is breached. Cleanup selects only complete, unprotected,
+pressure-eligible recordings assigned to that target and works back toward the
+low watermark (or reserve, whichever requires more free bytes). Cleanup is
+bounded per heartbeat and never borrows candidates from another target. The
+legacy global capacity and emergency paths are restricted to the default target.
+
+### Storage Placement Policies
+
+Storage placement policy endpoints also require `storage.configure`:
+
+```
+GET    /api/storage-policies
+POST   /api/storage-policies
+POST   /api/storage-policies/preview
+GET    /api/storage-policies/{policy_uuid}
+PUT    /api/storage-policies/{policy_uuid}
+DELETE /api/storage-policies/{policy_uuid}?revision={last_seen_revision}
+```
+
+Policies use a Fleet selector, integer priority, primary target, and an explicit
+`default`, named `target`, `pause`, or `fail` fallback. Higher priority wins;
+ties are stable by case-insensitive policy name and UUID. Placement is evaluated
+for each newly opened recording segment and does not move existing footage.
+
+The preview endpoint accepts the same draft as create. An edit draft also sends
+its `uuid` and `revision`. It does not mutate policy state. The response reports
+`matched_camera_count`, `effective_camera_count`, `shadowed_camera_count`, and
+conflicts grouped by existing policy, plus a bounded 50-camera sample showing the
+effective winning policy and target. This lets the editor expose overlap and
+effective precedence before save.
+
+### Event Routes
+
+Event route endpoints require the global `events.configure` action (legacy
+administrators have it). They expose the registered event catalog and a durable,
+revisioned route control plane. The normalized MQTT publisher evaluates enabled
+routes before durable enqueue; the preview endpoint never publishes.
+
+#### Event Catalog
+
+```
+GET /api/events/catalog
+```
+
+Returns every registered event type with its family, description, severity,
+sensitivity, media policy, expected rate, subject kind, and default expiry.
+
+#### MQTT Destination Profiles
+
+```
+GET    /api/event-destinations
+POST   /api/event-destinations
+GET    /api/event-destinations/{destination_uuid}
+PUT    /api/event-destinations/{destination_uuid}
+DELETE /api/event-destinations/{destination_uuid}?revision={last_seen_revision}
+```
+
+These endpoints manage up to 64 named MQTT broker profiles. All operations
+require `events.configure`. The list response also describes the unmanaged
+`mqtt:default` destination backed by the existing `[mqtt]` settings.
+
+Create requires `name` and `broker.host`. It defaults to port `8883`, system
+certificate trust, QoS 1, a 60-second keepalive, a unique `lightnvr-…` client
+ID, and topic template `lightnvr/v1/events/{type}/{subject_id}`.
+
+```json
+{
+  "name": "Operations bridge",
+  "description": "Input for the hosted notification service",
+  "enabled": true,
+  "type": "mqtt",
+  "broker": {
+    "host": "mqtt.example.net",
+    "port": 8883,
+    "client_id": "lightnvr-campus-a",
+    "topic_template": "campus-a/{type}/{subject_id}",
+    "keepalive_seconds": 60,
+    "qos": 1
+  },
+  "authentication": {
+    "username": "event-publisher",
+    "password": "write-only-secret"
+  },
+  "tls": {
+    "mode": "system"
+  }
+}
+```
+
+`tls.mode` is one of `disabled`, `system`, `custom_ca`, or `mutual`. Custom
+certificate paths must be absolute; `custom_ca` requires `ca_file`, and
+`mutual` requires `ca_file`, `cert_file`, and `key_file`.
+Topic templates must contain `{type}` and `{subject_id}` and cannot contain
+MQTT wildcards.
+
+Passwords are write-only. Responses contain only
+`authentication.password_configured`; they never return the credential. On
+update, omitting `authentication.password` preserves it, while JSON `null` or
+an empty string clears it. Updates are partial but require the last observed
+positive `revision`, and deletes use the same revision as a query parameter.
+Names are unique case-insensitively, as is the broker host, port, and client ID
+combination. A profile referenced by an event route or an active durable outbox
+row cannot be deleted. Delivered and dead history does not block deletion.
+Profile create, update, and delete outcomes are written to the audit history
+without credential material.
+
+Each enabled profile has an independent reconnecting MQTT client. Routes may
+use `mqtt:default` or the `mqtt:<destination_uuid>` key returned by these
+endpoints. Disabling a profile pauses delivery for its durable queue without
+discarding unexpired events; re-enabling or updating it rebuilds the client
+from the latest revision. The password remains write-only during that reload.
+
+#### List, Create, and Read Routes
+
+```
+GET  /api/event-routes
+POST /api/event-routes
+GET  /api/event-routes/{route_uuid}
+```
+
+Create accepts a complete route definition. Only `name` and `event_types` are
+required; omitted fields use the defaults shown below. Unknown fields and
+unknown event types are rejected. `destination` must be `mqtt:default` or the
+key of an existing managed MQTT destination profile.
+
+```json
+{
+  "name": "North entrance people",
+  "description": "External notification input",
+  "enabled": true,
+  "destination": "mqtt:default",
+  "event_types": ["io.lightnvr.detection.object.v1"],
+  "camera_scope": {
+    "type": "selector",
+    "selector": {
+      "version": 1,
+      "expression": {
+        "op": "location_prefix",
+        "values": ["Campus/North"]
+      }
+    }
+  },
+  "predicate": {
+    "version": 1,
+    "detection": {
+      "labels_any": ["person"],
+      "min_confidence": 0.8,
+      "zone_ids_any": ["entry"]
+    }
+  },
+  "schedule": {
+    "version": 1,
+    "timezone": "America/New_York",
+    "windows": [
+      {"days": [1, 2, 3, 4, 5], "start": "18:00", "end": "06:00"}
+    ]
+  },
+  "suppression": {
+    "debounce_seconds": 2,
+    "cooldown_seconds": 30,
+    "grouping_window_seconds": 10,
+    "max_events_per_minute": 20
+  }
+}
+```
+
+An all-camera scope is `{"type":"all"}`. Defaults are enabled, all cameras,
+`{"version":1}` predicate, an always-active UTC schedule, and zero for each
+suppression value. A successful create returns `201` with the server-assigned
+UUID, revision `1`, and timestamps. Names are unique case-insensitively and at
+most 512 routes may be stored.
+
+Timezone names must resolve under `/usr/share/zoneinfo` (with `UTC` and `GMT`
+always accepted). Schedules are evaluated against event occurrence time and
+support DST-aware overnight windows.
+
+Suppression is durable and isolated by route UUID, event type, and subject:
+
+- `debounce_seconds` suppresses a repeat inside the interval since the latest
+  observation; each suppressed repeat extends the interval.
+- `cooldown_seconds` starts when an event is accepted by the outbox; suppressed
+  repeats do not extend it.
+- `grouping_window_seconds` preserves the first event and coalesces repeats for
+  the window. Version 1 does not emit an aggregate summary event.
+- `max_events_per_minute` limits allowed events in a fixed 60-second window.
+
+Checks run in that order. An allowed event advances suppression state only after
+durable outbox acceptance (`ENQUEUED` or idempotent `DUPLICATE`), so queue-full
+and persistence errors do not consume cooldown or rate budget. Editing a route
+clears its prior suppression state, and inactive state is pruned after 30 days.
+
+One normalized envelope is persisted for each unique destination matched by at
+least one route. Multiple matching routes to the same destination do not create
+duplicate publishes. The destination's topic template is expanded and frozen
+when the outbox row is created, so later profile edits affect new events without
+changing already accepted work. Fan-out is independent: acceptance or failure
+for one destination does not consume another destination's suppression state.
+
+With zero stored routes, normalized MQTT retains its compatibility publish-all
+behavior through `mqtt:default` when the legacy MQTT setting is enabled. Once
+any route is stored, only events matching at least one enabled route are
+enqueued to that route's destination. Disabling all stored routes pauses
+normalized enqueue; deleting the last route restores the default. Managed
+destinations continue to run when the legacy/default MQTT setting is disabled.
+This does not filter legacy detection or Home Assistant compatibility topics.
+
+#### Update and Delete a Route
+
+```
+PUT    /api/event-routes/{route_uuid}
+DELETE /api/event-routes/{route_uuid}?revision={last_seen_revision}
+```
+
+Update is a partial write but must include the last observed positive
+`revision`. Delete carries the same value as a query parameter. A stale write
+returns `409`; a successful update increments the revision. Create, update, and
+delete outcomes are recorded in the audit history. Any successful update resets
+the route's durable suppression history so the revised policy starts cleanly.
+
+#### Preview a Route Draft
+
+```
+POST /api/event-routes/preview
+```
+
+Accepts the same complete body as create, validates every field, and resolves
+the camera selector against the current Fleet inventory. The response includes
+`matched_camera_count`, a `camera_sample` of at most 20 entries, registry
+metadata for the selected event types, and `would_publish: false`. It neither
+persists the draft nor enqueues or publishes an event.
+
 ### System
 
 #### Get System Information
@@ -738,10 +1626,22 @@ Creates a backup of the database.
 GET /api/settings
 ```
 
-Returns system configuration settings.
+Requires effective `system.admin` and returns the full system configuration.
+Viewer/player bootstrap code must not use this endpoint.
 
 The storage fields include `mp4_directory_format`, one of `flat`,
 `year_month`, or `year_month_day`.
+
+#### Get Safe Client Runtime Configuration
+
+```
+GET /api/client-config
+```
+
+Requires authentication but no global administrative action. Returns only the
+browser runtime contract: authentication/demo flags, go2rtc readiness and safe
+player flags/port/timeouts, plus thumbnail controls. It intentionally omits
+paths, credentials, integration settings, and go2rtc stream inventory.
 
 #### Update Settings
 
@@ -762,7 +1662,14 @@ GET endpoint; arbitrary `strftime` templates are rejected with HTTP 400.
 GET /api/health
 ```
 
-Returns basic health status.
+Returns system health plus per-stream telemetry. Each stream reports
+`observed_fps`, measured by LightNVR, and `expected_fps`, sourced from the
+stream's detected/configured metadata. The legacy `fps` and `configured_fps`
+fields remain available with the same values for compatibility.
+
+When recording, HLS, and detection consume the same camera concurrently,
+their observations are de-duplicated; the reported FPS and bitrate describe
+the logical camera stream rather than the sum of LightNVR consumers.
 
 #### HLS Health Check
 
@@ -800,6 +1707,20 @@ Authenticates a user and creates a session.
 }
 ```
 
+**Success Response:**
+```json
+{
+  "success": true,
+  "redirect": "/index.html",
+  "must_change_password": false
+}
+```
+
+On a fresh installation created with the fallback `admin` password,
+`must_change_password` is `true`. That password-authenticated session can only read
+`/api/auth/verify` and change its own password until the replacement succeeds. MFA is
+deferred until the next login. Demo mode and API-key authentication are unaffected.
+
 #### Login with TOTP
 
 ```
@@ -811,8 +1732,8 @@ Completes login with a TOTP code (for users with MFA enabled).
 **Request Body:**
 ```json
 {
-  "token": "pending_session_token",
-  "totp_code": "123456"
+  "totp_token": "pending_session_token",
+  "code": "123456"
 }
 ```
 
@@ -832,6 +1753,9 @@ GET /api/auth/verify
 ```
 
 Verifies that the current session is valid.
+
+The response includes `must_change_password`, allowing the blocking first-login flow to
+recover safely after a refresh.
 
 ### User Management
 

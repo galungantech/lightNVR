@@ -3,6 +3,8 @@ import utc from 'dayjs/plugin/utc';
 import timezone from 'dayjs/plugin/timezone';
 
 import {
+  advanceTimelineFling,
+  calculateTimelineFlingVelocity,
   countSegmentsForDate,
   findFirstVisibleSegmentIndex,
   formatTimestampAsLocalDate,
@@ -18,13 +20,17 @@ import {
   getClippedSegmentHourRange,
   getLocalDayBounds,
   getTimelineDayLengthHours,
+  getTimelinePreviewFrameIndex,
   localClockTimeToTimestamp,
   normalizeTimelineRange,
   panTimelineRange,
+  reconcileTimelineSegments,
   timelineOffsetToTimestamp,
   timestampToTimelineOffset,
   zoomTimelineRange,
-  segmentIntersectsDay
+  segmentIntersectsDay,
+  snapTimestampToRecordingEdge,
+  timelineSegmentIdentity
 } from '../js/components/preact/timeline/timelineUtils.js';
 
 dayjs.extend(utc);
@@ -513,17 +519,16 @@ describe('timelineUtils', () => {
       endHour: 24
     });
 
-    // normalizeTimelineRange enforces a minimum visible range (e.g. 0.5 hours)
-    // and clamps the resulting window to the 0–24 hour bounds.
-    expect(normalizeTimelineRange(23.9, 24.1)).toEqual({
-      startHour: 23.5,
-      endHour: 24
-    });
+    // Ranges larger than the one-minute floor retain their requested width and
+    // clamp as a unit at the end of the day.
+    const clampedRange = normalizeTimelineRange(23.9, 24.1);
+    expect(clampedRange.startHour).toBeCloseTo(23.8, 12);
+    expect(clampedRange.endHour).toBe(24);
 
     // When the requested range is even smaller than the minimum, it is expanded
     // to the minimum range while still clamping at the end of the day.
-    expect(normalizeTimelineRange(23.95, 24.0)).toEqual({
-      startHour: 23.5,
+    expect(normalizeTimelineRange(23.995, 24.0)).toEqual({
+      startHour: 24 - (1 / 60),
       endHour: 24
     });
   });
@@ -571,6 +576,153 @@ describe('timelineUtils', () => {
       startHour: 0,
       endHour: 24
     });
+
+    const minuteView = zoomTimelineRange(11.5, 12.5, 0.001, 12);
+    expect(minuteView.startHour).toBeCloseTo(12 - (1 / 120), 12);
+    expect(minuteView.endHour).toBeCloseTo(12 + (1 / 120), 12);
+  });
+
+  test('advances inertial pans consistently across animation frame rates', () => {
+    const oneFrame = advanceTimelineFling(4, 8, 0.002, 32);
+    const firstHalf = advanceTimelineFling(4, 8, 0.002, 16);
+    const secondHalf = advanceTimelineFling(
+      firstHalf.startHour,
+      firstHalf.endHour,
+      firstHalf.velocityHoursPerMillisecond,
+      16
+    );
+
+    expect(secondHalf.startHour).toBeCloseTo(oneFrame.startHour, 12);
+    expect(secondHalf.endHour).toBeCloseTo(oneFrame.endHour, 12);
+    expect(secondHalf.velocityHoursPerMillisecond)
+      .toBeCloseTo(oneFrame.velocityHoursPerMillisecond, 12);
+  });
+
+  test('stops an inertial pan when it reaches a day boundary', () => {
+    expect(advanceTimelineFling(20, 24, 0.002, 16)).toEqual({
+      startHour: 20,
+      endHour: 24,
+      velocityHoursPerMillisecond: 0
+    });
+  });
+
+  test('derives fling velocity independently of touch event frequency', () => {
+    const sparseSamples = [
+      { time: 0, position: 10 },
+      { time: 100, position: 110 }
+    ];
+    const denseSamples = Array.from({ length: 11 }, (_, index) => ({
+      time: index * 10,
+      position: 10 + (index * 10)
+    }));
+
+    expect(calculateTimelineFlingVelocity(sparseSamples, 100, 110)).toBeCloseTo(1, 12);
+    expect(calculateTimelineFlingVelocity(denseSamples, 100, 110)).toBeCloseTo(1, 12);
+    expect(calculateTimelineFlingVelocity([
+      { time: 40, position: 50 },
+      { time: 90, position: 100 }
+    ], 100, 110)).toBeCloseTo(1, 12);
+  });
+
+  test('does not launch a fling from a stale final movement sample', () => {
+    expect(calculateTimelineFlingVelocity([
+      { time: 0, position: 10 },
+      { time: 20, position: 40 }
+    ], 141, 40)).toBe(0);
+  });
+
+  test('snaps a cursor release within 500 ms to the nearest recording edge', () => {
+    const segments = [
+      { start_timestamp: 100, end_timestamp: 110 },
+      { start_timestamp: 120, end_timestamp: 130 }
+    ];
+
+    expect(snapTimestampToRecordingEdge(100.5, segments)).toEqual({
+      timestamp: 100,
+      snapped: true
+    });
+    expect(snapTimestampToRecordingEdge(109.6, segments)).toEqual({
+      timestamp: 110,
+      snapped: true
+    });
+    expect(snapTimestampToRecordingEdge(110.5001, segments)).toEqual({
+      timestamp: 110.5001,
+      snapped: false
+    });
+  });
+
+  test('reconciles timeline polls by id with a range fallback', () => {
+    const retained = { id: 2, stream_name: 'garage', start_timestamp: 20, end_timestamp: 30 };
+    const removed = { stream_name: 'door', start_timestamp: 10, end_timestamp: 15 };
+    const added = { stream_name: 'yard', start_timestamp: 40, end_timestamp: 50 };
+    const incomingRetained = { ...retained, has_detection: true };
+
+    expect(timelineSegmentIdentity(removed)).toBe('range:door:10:15');
+    expect(reconcileTimelineSegments([removed, retained], [incomingRetained, added])).toEqual({
+      added: [added],
+      removed: [removed],
+      authoritative: [incomingRetained, added],
+    });
+  });
+
+  test('selects the nearest available scrub preview frame', () => {
+    const segment = { start_timestamp: 100, end_timestamp: 130 };
+    expect(getTimelinePreviewFrameIndex(segment, 100)).toBe(0);
+    expect(getTimelinePreviewFrameIndex(segment, 116)).toBe(1);
+    expect(getTimelinePreviewFrameIndex(segment, 129)).toBe(2);
+    expect(getTimelinePreviewFrameIndex(segment, 500, 1)).toBe(0);
+  });
+
+  test('resolves equidistant recording edges deterministically to the earlier edge', () => {
+    const segments = [
+      { start_timestamp: 100, end_timestamp: 110 },
+      { start_timestamp: 111, end_timestamp: 120 }
+    ];
+
+    expect(snapTimestampToRecordingEdge(110.5, segments)).toEqual({
+      timestamp: 110,
+      snapped: true
+    });
+  });
+
+  test('snaps only to recording edges clipped inside the selected local day', () => {
+    const bounds = getLocalDayBounds(SPRING_FORWARD_DATE);
+    const overnightSegment = {
+      start_timestamp: bounds.startTimestamp - 60,
+      end_timestamp: bounds.endTimestamp + 60
+    };
+
+    expect(snapTimestampToRecordingEdge(
+      bounds.startTimestamp + 0.2,
+      [overnightSegment],
+      { selectedDate: SPRING_FORWARD_DATE }
+    )).toEqual({
+      timestamp: bounds.startTimestamp,
+      snapped: true
+    });
+
+    const rightEdge = snapTimestampToRecordingEdge(
+      bounds.endTimestamp,
+      [overnightSegment],
+      { selectedDate: SPRING_FORWARD_DATE }
+    );
+    expect(rightEdge.snapped).toBe(true);
+    expect(rightEdge.timestamp).toBeCloseTo(bounds.endTimestamp - 0.001, 6);
+    expect(rightEdge.timestamp).toBeLessThan(bounds.endTimestamp);
+  });
+
+  test('ignores recordings wholly outside the selected day when snapping', () => {
+    const bounds = getLocalDayBounds(SPRING_FORWARD_DATE);
+    expect(snapTimestampToRecordingEdge(
+      bounds.startTimestamp - 0.2,
+      [{
+        start_timestamp: bounds.startTimestamp - 10,
+        end_timestamp: bounds.startTimestamp - 0.1
+      }],
+      { selectedDate: SPRING_FORWARD_DATE }
+    )).toEqual({
+      timestamp: bounds.startTimestamp - 0.2,
+      snapped: false
+    });
   });
 });
-

@@ -20,6 +20,7 @@
 #include "video/go2rtc/go2rtc_consumer.h"
 #include "video/go2rtc/go2rtc_stream.h"
 #include "video/go2rtc/go2rtc_process.h"
+#include "video/go2rtc/go2rtc_lifecycle.h"
 #include "video/go2rtc/go2rtc_api.h"
 #include "core/logger.h"
 #include "core/config.h"
@@ -114,11 +115,8 @@ static time_t g_last_restart_time = 0;
 static int g_consecutive_api_failures = 0;
 static time_t g_restart_history[PROCESS_MAX_RESTARTS_PER_WINDOW];
 static int g_restart_history_index = 0;
-/* Stream updates are processed asynchronously and more than one update can
- * require a process restart at the same time.  Serializing the full stop/start
- * sequence prevents one update from killing the child that another update has
- * just started, leaving a zombie PID and no listening go2rtc service. */
-static pthread_mutex_t g_restart_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+static bool go2rtc_integration_full_start_locked(void);
 
 // ============================================================================
 // Stuck Stream Detection Functions
@@ -624,6 +622,40 @@ static bool stream_needs_reregistration(const char *stream_name) {
 }
 
 /**
+ * @brief Recover one unhealthy stream without disrupting healthy streams
+ *
+ * Normal streams are registered through go2rtc's runtime API, so deleting and
+ * re-adding just that stream is safe. Source overrides are generated into
+ * go2rtc.yaml and cannot be reloaded through the runtime API. Restarting the
+ * shared go2rtc process for an unchanged, unhealthy override would disconnect
+ * every healthy stream, so leave the YAML registration in place and let the
+ * caller reconnect this stream's consumers instead.
+ *
+ * Actual source-override configuration changes still use the explicit process
+ * restart path in the stream update handler.
+ */
+static bool recover_stream_scoped(const stream_config_t *config) {
+    if (!config || config->name[0] == '\0') {
+        return false;
+    }
+
+    if (config->go2rtc_source_override[0] == '\0') {
+        return go2rtc_integration_reload_stream(config->name);
+    }
+
+    if (!go2rtc_stream_is_ready()) {
+        log_warn("Cannot recover YAML-backed stream %s while go2rtc is unavailable",
+                 config->name);
+        return false;
+    }
+
+    log_warn("Stream %s uses a go2rtc source override; preserving the shared "
+             "go2rtc process and reconnecting only this stream's consumers",
+             config->name);
+    return true;
+}
+
+/**
  * @brief Check stream consensus - if all/most streams are down, it's likely go2rtc
  *
  * Two signal sources are used per stream so that go2rtc-managed streams
@@ -798,25 +830,33 @@ static bool restart_go2rtc_process_locked(void) {
     return true;
 }
 
-static bool restart_go2rtc_process(void) {
-    pthread_mutex_lock(&g_restart_mutex);
-    bool restarted = restart_go2rtc_process_locked();
-    pthread_mutex_unlock(&g_restart_mutex);
+static bool restart_go2rtc_process(bool intentional) {
+    go2rtc_lifecycle_guard_t guard;
+    if (!go2rtc_lifecycle_begin(GO2RTC_LIFECYCLE_RESTART, true,
+                                intentional, &guard)) {
+        log_error("Failed to enter go2rtc lifecycle for restart");
+        return false;
+    }
+    if (guard.coalesced) {
+        log_info("Coalesced go2rtc restart with lifecycle generation %llu",
+                 (unsigned long long)guard.generation);
+        return guard.result;
+    }
+
+    bool restarted;
+    if (!go2rtc_stream_is_initialized() || !g_initialized) {
+        log_info("go2rtc modules are not fully initialized, performing full start");
+        restarted = go2rtc_integration_full_start_locked();
+    } else {
+        restarted = restart_go2rtc_process_locked();
+    }
+
+    go2rtc_lifecycle_end(&guard, restarted);
     return restarted;
 }
 
 bool go2rtc_integration_restart_process(void) {
-    if (!go2rtc_stream_is_initialized()) {
-        log_info("go2rtc stream module is not initialized, performing full start");
-        return go2rtc_integration_full_start();
-    }
-
-    if (!g_initialized) {
-        log_info("go2rtc integration module is not initialized, performing full start");
-        return go2rtc_integration_full_start();
-    }
-
-    return restart_go2rtc_process();
+    return restart_go2rtc_process(true);
 }
 
 /**
@@ -838,6 +878,15 @@ static void *unified_health_monitor_thread(void *arg) {
 
         if (!g_monitor_running || is_shutdown_initiated()) {
             break;
+        }
+
+        /* An intentional stop/start makes the API unavailable by design. Do
+         * not count that window as a health failure or queue another restart;
+         * lifecycle callers arriving during it coalesce with the owner. */
+        if (go2rtc_lifecycle_intentional_restart_active()) {
+            g_consecutive_api_failures = 0;
+            log_debug("Skipping go2rtc health check during intentional lifecycle restart");
+            continue;
         }
 
         // =====================================================================
@@ -880,7 +929,7 @@ static void *unified_health_monitor_thread(void *arg) {
                                  total_stream_count);
                     }
                     if (can_restart_go2rtc()) {
-                        if (restart_go2rtc_process()) {
+                        if (restart_go2rtc_process(false)) {
                             log_info("go2rtc process successfully restarted");
                             process_restarted = true;
                         } else {
@@ -930,9 +979,9 @@ static void *unified_health_monitor_thread(void *arg) {
             if (stream_needs_reregistration(config.name)) {
                 log_info("Stream %s needs re-registration (state-based), attempting to fix", config.name);
 
-                if (go2rtc_integration_reload_stream(config.name)) {
-                    log_info("Successfully re-registered stream %s", config.name);
-                    reset_stuck_tracker(config.name);  // Reset stuck tracking after reload
+                if (recover_stream_scoped(&config)) {
+                    log_info("Completed stream-scoped recovery for %s", config.name);
+                    reset_stuck_tracker(config.name);  // Reset tracking after recovery
 
                     // Update reconnect state
                     stream_state_manager_t *state = get_stream_state_by_name(config.name);
@@ -945,7 +994,7 @@ static void *unified_health_monitor_thread(void *arg) {
                     // discovering the stale RTSP connection through av_read_frame errors.
                     signal_mp4_recording_reconnect(config.name);
                 } else {
-                    log_error("Failed to re-register stream %s", config.name);
+                    log_error("Failed stream-scoped recovery for %s", config.name);
                 }
                 continue;  // Skip stuck check for this stream, we just reloaded it
             }
@@ -954,16 +1003,17 @@ static void *unified_health_monitor_thread(void *arg) {
             // This catches cases where go2rtc thinks the stream is fine but no data is flowing
             // (e.g., video doorbells that stop sending frames without disconnecting)
             if (check_stream_data_flow(config.name)) {
-                log_warn("Stream %s detected as STUCK (no data flow), attempting reload", config.name);
+                log_warn("Stream %s detected as STUCK (no data flow), attempting scoped recovery",
+                         config.name);
 
-                if (go2rtc_integration_reload_stream(config.name)) {
-                    log_info("Successfully reloaded stuck stream %s", config.name);
-                    reset_stuck_tracker(config.name);  // Reset tracking after reload
+                if (recover_stream_scoped(&config)) {
+                    log_info("Completed stream-scoped recovery for stuck stream %s", config.name);
+                    reset_stuck_tracker(config.name);  // Reset tracking after recovery
 
                     // Signal the recording thread to reconnect cleanly after the reload.
                     signal_mp4_recording_reconnect(config.name);
                 } else {
-                    log_error("Failed to reload stuck stream %s", config.name);
+                    log_error("Failed stream-scoped recovery for stuck stream %s", config.name);
                 }
             }
         }
@@ -1041,8 +1091,10 @@ bool go2rtc_integration_init(void) {
         return false;
     }
 
-    // Initialize tracking array
-    memset(g_tracked_streams, 0, sizeof(g_tracked_streams));
+    // Initialize tracking array, bounded to the configured slot count so the
+    // clear does not fault in the whole compile-time ceiling.
+    memset(g_tracked_streams, 0,
+           (size_t)configured_stream_slots() * sizeof(g_tracked_streams[0]));
 
     // Start the unified health monitor (replaces separate stream and process monitors)
     if (!start_unified_health_monitor()) {
@@ -1056,7 +1108,7 @@ bool go2rtc_integration_init(void) {
     return true;
 }
 
-bool go2rtc_integration_full_start(void) {
+static bool go2rtc_integration_full_start_locked(void) {
     // Resolve config values with defaults
     const char *binary_path = g_config.go2rtc_binary_path[0] != '\0'
                               ? g_config.go2rtc_binary_path : NULL;
@@ -1110,6 +1162,24 @@ bool go2rtc_integration_full_start(void) {
 
     log_info("go2rtc full start complete");
     return true;
+}
+
+bool go2rtc_integration_full_start(void) {
+    go2rtc_lifecycle_guard_t guard;
+    if (!go2rtc_lifecycle_begin(GO2RTC_LIFECYCLE_FULL_START, true, true,
+                                &guard)) {
+        log_error("Failed to enter go2rtc lifecycle for full start");
+        return false;
+    }
+    if (guard.coalesced) {
+        log_info("Coalesced go2rtc full start with lifecycle generation %llu",
+                 (unsigned long long)guard.generation);
+        return guard.result;
+    }
+
+    bool result = go2rtc_integration_full_start_locked();
+    go2rtc_lifecycle_end(&guard, result);
+    return result;
 }
 
 /**
@@ -1416,7 +1486,7 @@ bool go2rtc_integration_register_all_streams(void) {
     }
 
     // Get all stream configurations (heap-allocated)
-    int ms = g_config.max_streams > 0 ? g_config.max_streams : 32;
+    int ms = configured_stream_slots();
     stream_config_t *streams = calloc(ms, sizeof(stream_config_t));
     if (!streams) return false;
     int count = get_all_stream_configs(streams, ms);
@@ -1498,7 +1568,7 @@ bool go2rtc_sync_streams_from_database(void) {
     }
 
     // Get all stream configurations from database (heap-allocated)
-    int ms2 = g_config.max_streams > 0 ? g_config.max_streams : 32;
+    int ms2 = configured_stream_slots();
     stream_config_t *db_streams = calloc(ms2, sizeof(stream_config_t));
     if (!db_streams) return false;
     int count = get_all_stream_configs(db_streams, ms2);
@@ -1748,13 +1818,14 @@ bool go2rtc_integration_get_hls_url(const char *stream_name, char *buffer, size_
     return true;
 }
 
-bool go2rtc_integration_reload_stream_config(const char *stream_name,
-                                             const char *new_url,
-                                             const char *new_username,
-                                             const char *new_password,
-                                             int new_backchannel_enabled,
-                                             int new_protocol,
-                                             int new_record_audio) {
+static bool go2rtc_integration_reload_stream_config_locked(
+    const char *stream_name,
+    const char *new_url,
+    const char *new_username,
+    const char *new_password,
+    int new_backchannel_enabled,
+    int new_protocol,
+    int new_record_audio) {
     if (!stream_name) {
         log_error("go2rtc_integration_reload_stream_config: stream_name is NULL");
         return false;
@@ -1836,6 +1907,28 @@ bool go2rtc_integration_reload_stream_config(const char *stream_name,
     log_info("Successfully reloaded stream %s in go2rtc with URL: %s (protocol=%s)",
              stream_name, url, protocol == STREAM_PROTOCOL_UDP ? "UDP" : "TCP");
     return true;
+}
+
+bool go2rtc_integration_reload_stream_config(const char *stream_name,
+                                             const char *new_url,
+                                             const char *new_username,
+                                             const char *new_password,
+                                             int new_backchannel_enabled,
+                                             int new_protocol,
+                                             int new_record_audio) {
+    go2rtc_lifecycle_guard_t guard;
+    if (!go2rtc_lifecycle_begin(GO2RTC_LIFECYCLE_RECONFIGURE, false, true,
+                                &guard)) {
+        log_error("Failed to enter go2rtc lifecycle to reload %s",
+                  stream_name ? stream_name : "<null>");
+        return false;
+    }
+
+    bool result = go2rtc_integration_reload_stream_config_locked(
+        stream_name, new_url, new_username, new_password,
+        new_backchannel_enabled, new_protocol, new_record_audio);
+    go2rtc_lifecycle_end(&guard, result);
+    return result;
 }
 
 bool go2rtc_integration_reload_stream(const char *stream_name) {

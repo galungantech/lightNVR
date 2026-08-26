@@ -24,6 +24,10 @@ import { useAutoRetry } from './useAutoRetry.js';
 import { useVideoZoom } from './useVideoZoom.js';
 import { streamConnectionGate, priorityForStreamStatus, isGateTimeout, isGateAbort } from '../../utils/stream-connection-gate.js';
 import { shouldFallbackFullscreenToSubStream } from './liveStreamPolicy.js';
+import { LiveTileStatus } from './LiveTileStatus.jsx';
+import { PictureInPictureButton } from './PictureInPictureButton.jsx';
+import { shouldEnterFullscreenFromTap } from './useAlwaysFullscreenOnTap.js';
+import { MobileTileContextMenu, useMobileTileGestures } from './MobileTileGestures.jsx';
 import 'webrtc-adapter';
 
 // Retry configuration for sending WebRTC offers to go2rtc.
@@ -76,7 +80,11 @@ export function WebRTCVideoCell({
   onToggleFullscreen,
   showLabels = true,
   showControls = true,
-  globalShowDetections = true
+  globalShowDetections = true,
+  alwaysFullscreenOnTap = false,
+  onRequestReorder,
+  mobileGesturesDisabled = false,
+  onTransportFailure
 }) {
   const { t } = useI18n();
   const queryClient = useQueryClient();
@@ -105,7 +113,6 @@ export function WebRTCVideoCell({
   const [connectionQuality, setConnectionQuality] = useState('unknown'); // 'unknown', 'good', 'fair', 'poor', 'bad'
   const [retryCount, setRetryCount] = useState(0); // Used to trigger WebRTC re-initialization
   const [showRefreshConfirm, setShowRefreshConfirm] = useState(false);
-
   // Sub-stream fallback (#468). Entering fullscreen flips the `useSubStream`
   // prop to false so the cell upgrades to the full-resolution main stream. On a
   // LAN that is exactly what you want, but over a remote/proxied link the main
@@ -207,6 +214,12 @@ export function WebRTCVideoCell({
     setAudioEnabled(nextEnabled);
     applyAudioPlaybackState(nextEnabled);
 
+    if (nextEnabled) {
+      window.dispatchEvent(new CustomEvent('lightnvr:tile-audio-enabled', {
+        detail: { streamName: stream.name },
+      }));
+    }
+
     if (!nextEnabled) return;
 
     const videoElement = videoRef.current;
@@ -231,6 +244,16 @@ export function WebRTCVideoCell({
       });
     }
   }, [applyAudioPlaybackState, stream?.name, t]);
+
+  const mobileGestures = useMobileTileGestures({
+    streamName: stream.name,
+    cellRef,
+    videoRef,
+    audioEnabled,
+    onToggleAudio: handleAudioToggle,
+    onRequestReorder,
+    disabled: zoom.isZoomed || mobileGesturesDisabled,
+  });
 
   // Clear the sub-stream fallback whenever the cell is no longer being forced
   // onto the main stream (i.e. it left fullscreen and the grid asked for the
@@ -265,7 +288,7 @@ export function WebRTCVideoCell({
     let go2rtcBaseUrl = null;
 
     // Server-configurable WebRTC timeouts (ms). Populated in initWebRTC from
-    // /api/settings; seeded with the previous hardcoded defaults so behaviour is
+    // /api/client-config; seeded with the previous hardcoded defaults so behaviour is
     // unchanged when the server does not supply values. Lets Docker users tune
     // these via lightnvr.ini / env / settings API without rebuilding the bundle.
     let webrtcConnectionTimeoutMs = 30000;
@@ -578,8 +601,6 @@ export function WebRTCVideoCell({
             playRetryTimeout = null;
           }
         };
-
-        videoElement.ondblclick = (e) => onToggleFullscreen(stream.name, e, cellRef.current);
 
         // Start initial playback attempt
         attemptPlay();
@@ -1108,6 +1129,10 @@ export function WebRTCVideoCell({
   // clears `error` which unmounts the effect).
   const autoRetryCountdown = useAutoRetry(error, handleRetry);
 
+  useEffect(() => {
+    if (error && onTransportFailure) onTransportFailure(error);
+  }, [error, onTransportFailure]);
+
   /**
    * Pause stream for privacy — sets privacy_mode=true without touching the enabled flag.
    */
@@ -1325,6 +1350,24 @@ export function WebRTCVideoCell({
       data-stream-id={streamId}
       data-sub-stream={effectiveUseSubStream ? 'true' : 'false'}
       data-zoom-scale={zoom.isZoomed ? zoom.scale.toFixed(2) : undefined}
+      data-mobile-chrome={mobileGestures.chromeVisible ? 'visible' : 'hidden'}
+      onPointerDown={mobileGestures.onPointerDown}
+      onPointerMove={mobileGestures.onPointerMove}
+      onPointerUp={mobileGestures.onPointerUp}
+      onPointerCancel={mobileGestures.onPointerCancel}
+      onContextMenu={mobileGestures.onContextMenu}
+      onClick={(event) => {
+        if (mobileGestures.onClick(event)) return;
+        if (shouldEnterFullscreenFromTap(event, alwaysFullscreenOnTap, zoom.isZoomed)) {
+          onToggleFullscreen(stream.name, event, cellRef.current);
+        }
+      }}
+      onDblClick={(event) => {
+        if (!alwaysFullscreenOnTap
+            && shouldEnterFullscreenFromTap(event, true, zoom.isZoomed)) {
+          onToggleFullscreen(stream.name, event, cellRef.current);
+        }
+      }}
       ref={(el) => {
         // The cell is already `position: relative; overflow: hidden`, which is
         // exactly what the zoom viewport needs, so it doubles as the zoom
@@ -1348,7 +1391,6 @@ export function WebRTCVideoCell({
         ref={videoRef}
         autoPlay
         muted={!audioEnabled}
-        disablePictureInPicture
         playsInline
         style={{
           width: '100%',
@@ -1358,6 +1400,16 @@ export function WebRTCVideoCell({
           transformOrigin: 'center center'
         }}
       />
+
+      <LiveTileStatus
+        stream={stream}
+        isPlaying={isPlaying}
+        isLoading={isLoading}
+        error={error}
+        showLabels={showLabels}
+      />
+
+      <MobileTileContextMenu gestures={mobileGestures} audioEnabled={audioEnabled} />
 
       {/* Detection overlay component.
           Hidden while zoomed: the canvas is sized to the cell, not to the
@@ -1792,6 +1844,7 @@ export function WebRTCVideoCell({
             <path d="M320 128C426 128 512 214 512 320C512 426 426 512 320 512C254.8 512 197.1 479.5 162.4 429.7C152.3 415.2 132.3 411.7 117.8 421.8C103.3 431.9 99.8 451.9 109.9 466.4C156.1 532.6 233 576 320 576C461.4 576 576 461.4 576 320C576 178.6 461.4 64 320 64C234.3 64 158.5 106.1 112 170.7L112 144C112 126.3 97.7 112 80 112C62.3 112 48 126.3 48 144L48 256C48 273.7 62.3 288 80 288L104.6 288C105.1 288 105.6 288 106.1 288L192.1 288C209.8 288 224.1 273.7 224.1 256C224.1 238.3 209.8 224 192.1 224L153.8 224C186.9 166.6 249 128 320 128zM344 216C344 202.7 333.3 192 320 192C306.7 192 296 202.7 296 216L296 320C296 326.4 298.5 332.5 303 337L375 409C384.4 418.4 399.6 418.4 408.9 409C418.2 399.6 418.3 384.4 408.9 375.1L343.9 310.1L343.9 216z"/>
           </svg>
         </button>
+        <PictureInPictureButton videoRef={videoRef} disabled={!isPlaying} />
         <button
           className="fullscreen-btn"
           title={t('live.toggleFullscreen')}

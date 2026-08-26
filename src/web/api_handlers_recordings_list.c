@@ -19,6 +19,7 @@
 #define LOG_COMPONENT "RecordingsAPI"
 #include "core/logger.h"
 #include "core/config.h"
+#include "core/camera_collection_filter.h"
 #include "core/shutdown_coordinator.h"
 #include "utils/strings.h"
 #include "database/db_recordings.h"
@@ -26,9 +27,12 @@
 #include "database/db_auth.h"
 #include "database/db_streams.h"
 #include "database/db_recording_tags.h"
+#include "database/db_fleet_query.h"
 
 #define MAX_SELECTED_STREAM_FILTERS 32
 #define MAX_SELECTED_STREAM_NAME_LEN 64
+#define MAX_BATCHED_DETECTION_RECORDINGS 1000
+#define MAX_BATCHED_TAG_RECORDINGS 100
 
 static int parse_selected_streams(const char *csv,
                                   char values[][MAX_SELECTED_STREAM_NAME_LEN],
@@ -53,6 +57,42 @@ static int parse_selected_streams(const char *csv,
     return count;
 }
 
+static bool valid_uuid(const char *value) {
+    if (!value || strlen(value) != CAMERA_UUID_STRING_SIZE - 1) return false;
+    for (int i = 0; i < CAMERA_UUID_STRING_SIZE - 1; i++) {
+        char c = value[i];
+        if (i == 8 || i == 13 || i == 18 || i == 23) {
+            if (c != '-') return false;
+        } else if (!isxdigit((unsigned char)c)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static void respond_empty_recordings(http_response_t *res, int page, int limit) {
+    cJSON *root = cJSON_CreateObject();
+    cJSON *recordings = cJSON_CreateArray();
+    cJSON *pagination = cJSON_CreateObject();
+    if (!root || !recordings || !pagination) {
+        cJSON_Delete(root);
+        cJSON_Delete(recordings);
+        cJSON_Delete(pagination);
+        http_response_set_json_error(res, 500, "Failed to create response JSON");
+        return;
+    }
+    cJSON_AddItemToObject(root, "recordings", recordings);
+    cJSON_AddNumberToObject(pagination, "page", page);
+    cJSON_AddNumberToObject(pagination, "pages", 0);
+    cJSON_AddNumberToObject(pagination, "total", 0);
+    cJSON_AddNumberToObject(pagination, "limit", limit);
+    cJSON_AddItemToObject(root, "pagination", pagination);
+    char *json = cJSON_PrintUnformatted(root);
+    http_response_set_json(res, 200, json ? json : "{}");
+    free(json);
+    cJSON_Delete(root);
+}
+
 /**
  * @brief Backend-agnostic handler for GET /api/recordings
  * 
@@ -60,6 +100,8 @@ static int parse_selected_streams(const char *csv,
  * 
  * Query parameters:
  * - stream: Filter by stream name or comma-separated stream names
+ * - collection_uuid: Filter by one authorized camera collection; when paired
+ *   with stream, both predicates are applied
  * - start: Start time (ISO 8601 format)
  * - end: End time (ISO 8601 format)
  * - page: Page number (default: 1)
@@ -82,27 +124,11 @@ void handle_get_recordings(const http_request_t *req, http_response_t *res) {
 
     log_debug("Processing GET /api/recordings request");
 
-    // Check authentication if enabled
-    // In demo mode, allow unauthenticated viewer access to read recordings
     user_t auth_user;
     memset(&auth_user, 0, sizeof(auth_user));
-    bool have_auth_user = false;
-    if (g_config.web_auth_enabled) {
-        if (g_config.demo_mode) {
-            if (!httpd_check_viewer_access(req, &auth_user)) {
-                log_error("Authentication failed for GET /api/recordings request");
-                http_response_set_json_error(res, 401, "Unauthorized");
-                return;
-            }
-            have_auth_user = true;
-        } else {
-            if (!httpd_get_authenticated_user(req, &auth_user)) {
-                log_error("Authentication failed for GET /api/recordings request");
-                http_response_set_json_error(res, 401, "Unauthorized");
-                return;
-            }
-            have_auth_user = true;
-        }
+    if (!httpd_check_action_access(req, &auth_user)) {
+        http_response_set_json_error(res, 401, "Unauthorized");
+        return;
     }
 
     // Extract query parameters
@@ -118,6 +144,7 @@ void handle_get_recordings(const http_request_t *req, http_response_t *res) {
     char protected_str[8] = {0};
     char tag_filter_str[512] = {0};
     char capture_method_str[128] = {0};
+    char collection_uuid[CAMERA_UUID_STRING_SIZE] = {0};
 
     http_request_get_query_param(req, "stream", stream_name, sizeof(stream_name));
     http_request_get_query_param(req, "start", start_time_str, sizeof(start_time_str));
@@ -131,7 +158,12 @@ void handle_get_recordings(const http_request_t *req, http_response_t *res) {
     http_request_get_query_param(req, "protected", protected_str, sizeof(protected_str));
     http_request_get_query_param(req, "tag", tag_filter_str, sizeof(tag_filter_str));
     http_request_get_query_param(req, "capture_method", capture_method_str, sizeof(capture_method_str));
+    http_request_get_query_param(req, "collection_uuid", collection_uuid, sizeof(collection_uuid));
 
+    if (collection_uuid[0] && !valid_uuid(collection_uuid)) {
+        http_response_set_json_error(res, 400, "Invalid collection_uuid");
+        return;
+    }
     // Parse numeric parameters
     int page = page_str[0] ? (int)strtol(page_str, NULL, 10) : 1;
     int all_limit_requested = (limit_str[0] != '\0' && strcasecmp(limit_str, "all") == 0);
@@ -203,101 +235,118 @@ void handle_get_recordings(const http_request_t *req, http_response_t *res) {
         has_detection = 1;  // Searching by label implies detection filter
     }
 
-    // --- Tag-based RBAC: build list of allowed streams for this user ---
-    stream_config_t *all_stream_cfgs = NULL;
+    // Build the recordings.replay-authorized camera set before querying. Both
+    // rows and pagination totals therefore use the same server-side scope.
+    fleet_camera_t *all_stream_cfgs = NULL;
     const char *allowed_streams[MAX_STREAMS];
     int allowed_streams_count = 0;
-    bool tag_restricted = have_auth_user && auth_user.has_tag_restriction;
+    int authorized_camera_count = 0;
+    if (db_fleet_camera_load(&all_stream_cfgs, &authorized_camera_count) != 0 ||
+        authorization_filter_cameras(&auth_user, AUTHZ_RECORDINGS_REPLAY,
+                                     all_stream_cfgs,
+                                     &authorized_camera_count) != 0) {
+        free(all_stream_cfgs);
+        http_response_set_json_error(
+            res, 500, "Authorization policy evaluation failed");
+        return;
+    }
+    for (int i = 0; i < authorized_camera_count && i < MAX_STREAMS; i++) {
+        allowed_streams[allowed_streams_count++] = all_stream_cfgs[i].name;
+    }
 
-    if (tag_restricted) {
-        all_stream_cfgs = calloc(g_config.max_streams, sizeof(stream_config_t));
-        if (all_stream_cfgs) {
-            int sc = get_all_stream_configs(all_stream_cfgs, g_config.max_streams);
-            for (int i = 0; i < sc; i++) {
-                if (db_auth_stream_allowed_for_user(&auth_user, all_stream_cfgs[i].tags)) {
-                    allowed_streams[allowed_streams_count++] = all_stream_cfgs[i].name;
+    // If the caller requested specific streams, validate each one is in the
+    // allowed list without revealing which camera failed.
+    if (stream_name[0] != '\0') {
+        char requested_streams[MAX_SELECTED_STREAM_FILTERS][MAX_SELECTED_STREAM_NAME_LEN] = {{0}};
+        int requested_stream_count = parse_selected_streams(stream_name, requested_streams, MAX_SELECTED_STREAM_FILTERS);
+        bool permitted = requested_stream_count > 0;
+
+        for (int requested = 0; requested < requested_stream_count && permitted; requested++) {
+            bool found = false;
+            for (int i = 0; i < allowed_streams_count; i++) {
+                if (strcmp(requested_streams[requested], allowed_streams[i]) == 0) {
+                    found = true;
+                    break;
                 }
             }
+            if (!found) permitted = false;
         }
 
-        // If the caller requested specific streams, validate each one is in the allowed list
-        if (stream_name[0] != '\0') {
-            char requested_streams[MAX_SELECTED_STREAM_FILTERS][MAX_SELECTED_STREAM_NAME_LEN] = {{0}};
-            int requested_stream_count = parse_selected_streams(stream_name, requested_streams, MAX_SELECTED_STREAM_FILTERS);
-            bool permitted = requested_stream_count > 0;
-
-            for (int requested = 0; requested < requested_stream_count && permitted; requested++) {
-                bool found = false;
-                for (int i = 0; i < allowed_streams_count; i++) {
-                    if (strcmp(requested_streams[requested], allowed_streams[i]) == 0) {
-                        found = true;
-                        break;
-                    }
-                }
-                if (!found) {
-                    permitted = false;
-                }
-            }
-
-            if (!permitted) {
-                log_warn("User '%s' attempted to access restricted stream '%s' via recordings API",
-                         auth_user.username, stream_name);
-                // Return an empty result set rather than an error to avoid leaking stream existence
-                free(recordings);
-                if (all_stream_cfgs) free(all_stream_cfgs);
-                cJSON *empty_resp = cJSON_CreateObject();
-                cJSON *empty_arr  = cJSON_CreateArray();
-                cJSON *empty_pg   = cJSON_CreateObject();
-                if (empty_resp && empty_arr && empty_pg) {
-                    cJSON_AddItemToObject(empty_resp, "recordings", empty_arr);
-                    cJSON_AddNumberToObject(empty_pg, "page", page);
-                    cJSON_AddNumberToObject(empty_pg, "pages", 0);
-                    cJSON_AddNumberToObject(empty_pg, "total", 0);
-                    cJSON_AddNumberToObject(empty_pg, "limit", limit);
-                    cJSON_AddItemToObject(empty_resp, "pagination", empty_pg);
-                    char *json_str = cJSON_PrintUnformatted(empty_resp);
-                    http_response_set_json(res, 200, json_str ? json_str : "{}");
-                    free(json_str);
-                    cJSON_Delete(empty_resp);
-                } else {
-                    cJSON_Delete(empty_resp); cJSON_Delete(empty_arr); cJSON_Delete(empty_pg);
-                    http_response_set_json_error(res, 500, "Failed to create response JSON");
-                }
-                return;
-            }
-            // The specific stream is permitted — no need for the IN clause; use stream_name filter
-            allowed_streams_count = 0;
-        } else if (allowed_streams_count == 0) {
-            // User has tag restriction but no accessible streams at all
-            free(recordings);
+        if (!permitted) {
             if (all_stream_cfgs) free(all_stream_cfgs);
-            cJSON *empty_resp = cJSON_CreateObject();
-            cJSON *empty_arr  = cJSON_CreateArray();
-            cJSON *empty_pg   = cJSON_CreateObject();
-            if (empty_resp && empty_arr && empty_pg) {
-                cJSON_AddItemToObject(empty_resp, "recordings", empty_arr);
-                cJSON_AddNumberToObject(empty_pg, "page", page);
-                cJSON_AddNumberToObject(empty_pg, "pages", 0);
-                cJSON_AddNumberToObject(empty_pg, "total", 0);
-                cJSON_AddNumberToObject(empty_pg, "limit", limit);
-                cJSON_AddItemToObject(empty_resp, "pagination", empty_pg);
-                char *json_str = cJSON_PrintUnformatted(empty_resp);
-                http_response_set_json(res, 200, json_str ? json_str : "{}");
-                free(json_str);
-                cJSON_Delete(empty_resp);
+            http_response_set_json_error(res, 403, "Forbidden");
+            return;
+        }
+    } else if (allowed_streams_count == 0) {
+        if (all_stream_cfgs) free(all_stream_cfgs);
+        respond_empty_recordings(res, page, limit);
+        return;
+    }
+
+    // Resolve a collection on the server so smart rules stay private and large
+    // fleets do not expand into hundreds of stream names in a query string.
+    char **collection_streams = NULL;
+    int collection_stream_count = 0;
+    if (collection_uuid[0]) {
+        camera_collection_filter_result_t collection_result =
+            camera_collection_filter_resolve_stream_names_for_action(
+                collection_uuid, &auth_user, AUTHZ_RECORDINGS_REPLAY,
+                &collection_streams, &collection_stream_count);
+        if (collection_result != CAMERA_COLLECTION_FILTER_OK) {
+            if (all_stream_cfgs) free(all_stream_cfgs);
+            if (collection_result == CAMERA_COLLECTION_FILTER_NOT_FOUND) {
+                http_response_set_json_error(res, 404, "Collection not found");
+            } else if (collection_result == CAMERA_COLLECTION_FILTER_OUT_OF_MEMORY) {
+                http_response_set_json_error(res, 500, "Out of memory");
+            } else if (collection_result == CAMERA_COLLECTION_FILTER_INVALID_SELECTOR) {
+                http_response_set_json_error(res, 500, "Collection selector is invalid");
             } else {
-                cJSON_Delete(empty_resp); cJSON_Delete(empty_arr); cJSON_Delete(empty_pg);
-                http_response_set_json_error(res, 500, "Failed to create response JSON");
+                http_response_set_json_error(res, 500,
+                                             "Failed to load collection members");
             }
+            return;
+        }
+
+        if (collection_stream_count == 0) {
+            camera_collection_filter_free_stream_names(
+                collection_streams, collection_stream_count);
+            if (all_stream_cfgs) free(all_stream_cfgs);
+            respond_empty_recordings(res, page, limit);
+            return;
+        }
+        int authorized_collection_count = 0;
+        for (int i = 0; i < collection_stream_count; i++) {
+            bool permitted = false;
+            for (int j = 0; j < allowed_streams_count; j++) {
+                if (strcmp(collection_streams[i], allowed_streams[j]) == 0) {
+                    permitted = true;
+                    break;
+                }
+            }
+            if (!permitted) {
+                free(collection_streams[i]);
+                continue;
+            }
+            collection_streams[authorized_collection_count++] =
+                collection_streams[i];
+        }
+        collection_stream_count = authorized_collection_count;
+        if (collection_stream_count == 0) {
+            camera_collection_filter_free_stream_names(
+                collection_streams, collection_stream_count);
+            free(all_stream_cfgs);
+            respond_empty_recordings(res, page, limit);
             return;
         }
     }
 
     // Get total count first (for pagination)
-    const char * const *streams_filter = (tag_restricted && allowed_streams_count > 0)
-                                         ? allowed_streams : NULL;
-    int streams_filter_count = (tag_restricted && allowed_streams_count > 0)
-                               ? allowed_streams_count : 0;
+    const char * const *streams_filter = collection_uuid[0]
+        ? (const char * const *)collection_streams
+        : (allowed_streams_count > 0 ? allowed_streams : NULL);
+    int streams_filter_count = collection_uuid[0]
+        ? collection_stream_count
+        : allowed_streams_count;
 
     const char *tag_filt = tag_filter_str[0] != '\0' ? tag_filter_str : NULL;
 
@@ -310,6 +359,8 @@ void handle_get_recordings(const http_request_t *req, http_response_t *res) {
 
     if (total_count < 0) {
         log_error("Failed to get total recording count from database");
+        camera_collection_filter_free_stream_names(
+            collection_streams, collection_stream_count);
         if (all_stream_cfgs) free(all_stream_cfgs);
         http_response_set_json_error(res, 500, "Failed to get recording count from database");
         return;
@@ -325,6 +376,8 @@ void handle_get_recordings(const http_request_t *req, http_response_t *res) {
     recordings = (recording_metadata_t *)malloc(limit * sizeof(recording_metadata_t));
     if (!recordings) {
         log_error("Failed to allocate memory for recordings");
+        camera_collection_filter_free_stream_names(
+            collection_streams, collection_stream_count);
         if (all_stream_cfgs) free(all_stream_cfgs);
         http_response_set_json_error(res, 500, "Failed to allocate memory for recordings");
         return;
@@ -343,16 +396,21 @@ void handle_get_recordings(const http_request_t *req, http_response_t *res) {
     if (count < 0) {
         log_error("Failed to get recordings from database");
         free(recordings);
+        camera_collection_filter_free_stream_names(
+            collection_streams, collection_stream_count);
         if (all_stream_cfgs) free(all_stream_cfgs);
         http_response_set_json_error(res, 500, "Failed to get recordings from database");
         return;
     }
+    camera_collection_filter_free_stream_names(
+        collection_streams, collection_stream_count);
 
     // Create response object with recordings array and pagination
     cJSON *response = cJSON_CreateObject();
     if (!response) {
         log_error("Failed to create response JSON object");
         free(recordings);
+        if (all_stream_cfgs) free(all_stream_cfgs);
         http_response_set_json_error(res, 500, "Failed to create response JSON");
         return;
     }
@@ -362,6 +420,7 @@ void handle_get_recordings(const http_request_t *req, http_response_t *res) {
     if (!recordings_array) {
         log_error("Failed to create recordings JSON array");
         free(recordings);
+        if (all_stream_cfgs) free(all_stream_cfgs);
         cJSON_Delete(response);
         http_response_set_json_error(res, 500, "Failed to create recordings JSON");
         return;
@@ -375,6 +434,7 @@ void handle_get_recordings(const http_request_t *req, http_response_t *res) {
     if (!pagination) {
         log_error("Failed to create pagination JSON object");
         free(recordings);
+        if (all_stream_cfgs) free(all_stream_cfgs);
         cJSON_Delete(response);
         http_response_set_json_error(res, 500, "Failed to create pagination JSON");
         return;
@@ -389,6 +449,41 @@ void handle_get_recordings(const http_request_t *req, http_response_t *res) {
 
     // Add pagination object to response
     cJSON_AddItemToObject(response, "pagination", pagination);
+
+    // Enrich the whole page in bounded database batches. Historically this
+    // loop issued one detection aggregation and one tag query per recording,
+    // making the endpoint increasingly sensitive to SQLite mutex contention.
+    recording_detection_summary_t *detection_summaries = NULL;
+    recording_tag_list_t *recording_tag_lists = NULL;
+
+    if (count > 0 && count <= MAX_BATCHED_DETECTION_RECORDINGS) {
+        detection_summaries = calloc((size_t)count, sizeof(*detection_summaries));
+        if (!detection_summaries ||
+            get_recording_detection_summaries(recordings, count,
+                                              detection_summaries) != 0) {
+            log_warn("Falling back to per-recording detection summary queries");
+            free(detection_summaries);
+            detection_summaries = NULL;
+        }
+    }
+
+    if (count > 0 && count <= MAX_BATCHED_TAG_RECORDINGS) {
+        recording_tag_lists = calloc((size_t)count, sizeof(*recording_tag_lists));
+        uint64_t *recording_ids = malloc((size_t)count * sizeof(*recording_ids));
+        if (recording_tag_lists && recording_ids) {
+            for (int i = 0; i < count; i++) recording_ids[i] = recordings[i].id;
+            if (db_recording_tag_get_batch(recording_ids, count,
+                                           recording_tag_lists) < 0) {
+                log_warn("Falling back to per-recording tag queries");
+                free(recording_tag_lists);
+                recording_tag_lists = NULL;
+            }
+        } else {
+            free(recording_tag_lists);
+            recording_tag_lists = NULL;
+        }
+        free(recording_ids);
+    }
 
     // Add each recording to the array
     for (int i = 0; i < count; i++) {
@@ -431,6 +526,12 @@ void handle_get_recordings(const http_request_t *req, http_response_t *res) {
 
         cJSON_AddNumberToObject(recording, "id", (double)recordings[i].id);
         cJSON_AddStringToObject(recording, "stream", recordings[i].stream_name);
+        if (recordings[i].camera_uuid[0] != '\0') {
+            cJSON_AddStringToObject(recording, "camera_uuid",
+                                    recordings[i].camera_uuid);
+        } else {
+            cJSON_AddNullToObject(recording, "camera_uuid");
+        }
         cJSON_AddStringToObject(recording, "file_path", recordings[i].file_path);
         cJSON_AddStringToObject(recording, "start_time", start_time_formatted);
         cJSON_AddStringToObject(recording, "end_time", end_time_formatted);
@@ -449,10 +550,17 @@ void handle_get_recordings(const http_request_t *req, http_response_t *res) {
 
         // Check if recording has detections and get detection labels summary
         bool has_detection_flag = (strcmp(recordings[i].trigger_type, "detection") == 0);
-        detection_label_summary_t labels[MAX_DETECTION_LABELS];
+        detection_label_summary_t fallback_labels[MAX_DETECTION_LABELS];
+        detection_label_summary_t *labels = fallback_labels;
         int label_count = 0;
 
-        if (recordings[i].start_time > 0 && recordings[i].end_time > 0) {
+        if (detection_summaries) {
+            labels = detection_summaries[i].labels;
+            label_count = detection_summaries[i].label_count;
+            if (detection_summaries[i].has_detection) {
+                has_detection_flag = true;
+            }
+        } else if (recordings[i].start_time > 0 && recordings[i].end_time > 0) {
             // Get detection labels summary for this recording's time range
             label_count = get_detection_labels_summary(recordings[i].stream_name,
                                                        recordings[i].start_time,
@@ -490,13 +598,20 @@ void handle_get_recordings(const http_request_t *req, http_response_t *res) {
         }
 
         // Add recording tags
-        char rec_tags[MAX_RECORDING_TAGS][MAX_TAG_LENGTH];
-        int tag_count_val = db_recording_tag_get(recordings[i].id, rec_tags, MAX_RECORDING_TAGS);
+        recording_tag_list_t fallback_tag_list = {0};
+        recording_tag_list_t *tag_list = recording_tag_lists
+            ? &recording_tag_lists[i] : &fallback_tag_list;
+        if (!recording_tag_lists) {
+            tag_list->count = db_recording_tag_get(
+                recordings[i].id, tag_list->tags, MAX_RECORDING_TAGS);
+        }
+        int tag_count_val = tag_list->count;
         if (tag_count_val > 0) {
             cJSON *tags_array = cJSON_CreateArray();
             if (tags_array) {
                 for (int j = 0; j < tag_count_val; j++) {
-                    cJSON_AddItemToArray(tags_array, cJSON_CreateString(rec_tags[j]));
+                    cJSON_AddItemToArray(tags_array,
+                                         cJSON_CreateString(tag_list->tags[j]));
                 }
                 cJSON_AddItemToObject(recording, "tags", tags_array);
             }
@@ -506,6 +621,9 @@ void handle_get_recordings(const http_request_t *req, http_response_t *res) {
 
         cJSON_AddItemToArray(recordings_array, recording);
     }
+
+    free(detection_summaries);
+    free(recording_tag_lists);
 
     // Free recordings and stream config buffer (if allocated for tag-based RBAC)
     free(recordings);

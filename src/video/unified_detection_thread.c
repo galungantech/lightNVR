@@ -38,7 +38,7 @@
 #include "core/config.h"
 #include "core/path_utils.h"
 #include "core/shutdown_coordinator.h"
-#include "core/mqtt_client.h"
+#include "core/event_producers.h"
 #include "utils/strings.h"
 #include "video/unified_detection_thread.h"
 #include "video/packet_buffer.h"
@@ -185,8 +185,39 @@ static uint64_t detection_link_recording_id(unified_detection_ctx_t *ctx) {
 }
 
 static bool should_annotate_continuous(unified_detection_ctx_t *ctx) {
-    return ctx && atomic_load(&ctx->current_recording_id) == 0 &&
-           get_current_recording_id_for_stream(ctx->stream_name) != 0;
+    if (!ctx) {
+        return false;
+    }
+
+    /* Detection already owns an MP4 of its own, so there is nothing to
+     * annotate — keep writing into that clip. */
+    if (atomic_load(&ctx->current_recording_id) != 0) {
+        return false;
+    }
+
+    /* Annotation mode is a per-stream configuration: record=1 together with
+     * detection_based_recording=1. A stream without continuous recording has
+     * nothing to annotate, so detection keeps writing its own clips. This is
+     * the flag's only read in production code; without it the decision rested
+     * entirely on the runtime probe below (issue #547). */
+    if (!ctx->annotation_only) {
+        return false;
+    }
+
+    /* Continuous recording is configured for this stream, so annotate for as
+     * long as its writer is registered — including while it is between
+     * segments or reconnecting.
+     *
+     * Sampling current_recording_id here instead is what produced the
+     * duplicate clips: that ID drops to 0 on every segment rotation and stays
+     * 0 for the whole of an RTSP reconnect, which is precisely when a flaky
+     * camera fires detections. A single sample landing in one of those gaps
+     * committed a full-length detection MP4 running alongside the continuous
+     * recording for the rest of the motion event. The writer registration is
+     * the durable "continuous recording is running" signal: it is dropped only
+     * when the recording thread itself stops (e.g. a recording schedule turns
+     * it off), which is when detection legitimately owns its own clips. */
+    return stream_has_continuous_writer(ctx->stream_name);
 }
 
 /**
@@ -1002,6 +1033,8 @@ int start_unified_detection_thread(const char *stream_name, const char *model_pa
 
     // Initialize context
     safe_strcpy(ctx->stream_name, stream_name, sizeof(ctx->stream_name), 0);
+    safe_strcpy(ctx->camera_uuid, config.camera_uuid,
+                sizeof(ctx->camera_uuid), 0);
     safe_strcpy(ctx->model_path, model_path, sizeof(ctx->model_path), 0);
     ctx->detection_threshold = threshold;
     ctx->pre_buffer_seconds = pre_buffer_seconds > 0 ? pre_buffer_seconds : 10;
@@ -1023,8 +1056,9 @@ int start_unified_detection_thread(const char *stream_name, const char *model_pa
     atomic_store(&ctx->last_detection_check_time, (long long)time(NULL));
 
     if (annotation_only) {
-        log_info("[%s] Detection will annotate continuous recordings and create "
-                 "detection clips while continuous recording is inactive",
+        log_info("[%s] Detection will annotate continuous recordings instead of "
+                 "writing separate detection clips; clips are only created while "
+                 "continuous recording is stopped",
                  stream_name);
     }
 
@@ -1039,18 +1073,7 @@ int start_unified_detection_thread(const char *stream_name, const char *model_pa
         }
     }
 
-    // Set output directory
-    if (global_cfg) {
-        if (build_mp4_recording_directory(global_cfg, stream_name, time(NULL),
-                                          ctx->output_dir,
-                                          sizeof(ctx->output_dir)) != 0 ||
-            mkdir_recursive(ctx->output_dir) != 0) {
-            log_error("Failed to create output directory %s: %s", ctx->output_dir, strerror(errno));
-            free(ctx);
-            pthread_mutex_unlock(&contexts_mutex);
-            return -1;
-        }
-    }
+    /* The recording directory is selected lazily when a detection clip starts. */
 
     // If using built-in motion detection, enable the motion stream now so that
     // detect_motion() does not silently return 0 on every call.  New motion
@@ -2126,7 +2149,8 @@ stats_done:
         packet_buffer_add_packet(ctx->packet_buffer, pkt, now);
 
     // Record stream metrics
-    metrics_record_frame(ctx->stream_name, pkt->size, is_video);
+    metrics_record_frame_from_source(ctx->stream_name, pkt->size, is_video,
+                                     METRICS_SOURCE_DETECTION);
 
     // Detection stream path: runs on EVERY packet, no keyframe requirement.
     //
@@ -2323,10 +2347,15 @@ static int udt_start_recording(unified_detection_ctx_t *ctx) {
     if (!ctx) return -1;
 
     time_t now = time(NULL);
-    if (build_mp4_recording_directory(get_streaming_config(), ctx->stream_name,
-                                      now, ctx->output_dir,
-                                      sizeof(ctx->output_dir)) != 0) {
-        log_error("[%s] Failed to build output directory", ctx->stream_name);
+    memset(&ctx->placement, 0, sizeof(ctx->placement));
+    if (storage_placement_select(ctx->stream_name, &ctx->placement) != 0 ||
+        ctx->placement.status != STORAGE_PLACEMENT_READY ||
+        build_mp4_recording_directory_for_placement(
+            get_streaming_config(), &ctx->placement,
+            ctx->stream_name, now, ctx->output_dir,
+            sizeof(ctx->output_dir)) != 0) {
+        log_warn("[%s] Storage placement blocked detection recording (reason: %s)",
+                 ctx->stream_name, ctx->placement.reason);
         return -1;
     }
 
@@ -2347,6 +2376,16 @@ static int udt_start_recording(unified_detection_ctx_t *ctx) {
 
     snprintf(ctx->current_recording_path, sizeof(ctx->current_recording_path),
              "%s/detection_%s.mp4", ctx->output_dir, timestamp);
+    size_t root_length = strlen(ctx->placement.target_root);
+    if (strncmp(ctx->current_recording_path, ctx->placement.target_root,
+                root_length) != 0 ||
+        ctx->current_recording_path[root_length] != '/') {
+        log_error("[%s] Placed path escaped storage target", ctx->stream_name);
+        return -1;
+    }
+    safe_strcpy(ctx->placement.object_key,
+                ctx->current_recording_path + root_length + 1,
+                sizeof(ctx->placement.object_key), 0);
 
     log_info("[%s] Starting detection recording: %s", ctx->stream_name, ctx->current_recording_path);
 
@@ -2356,6 +2395,9 @@ static int udt_start_recording(unified_detection_ctx_t *ctx) {
         log_error("[%s] Failed to create MP4 writer", ctx->stream_name);
         return -1;
     }
+    ctx->mp4_writer->placement = ctx->placement;
+    safe_strcpy(ctx->mp4_writer->camera_uuid, ctx->camera_uuid,
+                sizeof(ctx->mp4_writer->camera_uuid), 0);
     ctx->mp4_writer->pre_buffer_seconds = ctx->pre_buffer_seconds;
 
     // Configure audio recording based on stream settings
@@ -2439,6 +2481,15 @@ static int udt_start_recording(unified_detection_ctx_t *ctx) {
     recording_metadata_t metadata = {0};
     safe_strcpy(metadata.file_path, ctx->current_recording_path, sizeof(metadata.file_path), 0);
     safe_strcpy(metadata.stream_name, ctx->stream_name, sizeof(metadata.stream_name), 0);
+    safe_strcpy(metadata.camera_uuid, ctx->camera_uuid,
+                sizeof(metadata.camera_uuid), 0);
+    safe_strcpy(metadata.storage_target_uuid, ctx->placement.target_uuid,
+                sizeof(metadata.storage_target_uuid), 0);
+    safe_strcpy(metadata.object_key, ctx->placement.object_key,
+                sizeof(metadata.object_key), 0);
+    safe_strcpy(metadata.placement_reason, ctx->placement.reason,
+                sizeof(metadata.placement_reason), 0);
+    metadata.storage_policy_version = ctx->placement.policy_version;
     metadata.start_time = now;
     metadata.end_time = 0;  // Will be set when recording stops
     metadata.size_bytes = 0;  // Will be set when recording stops
@@ -2521,6 +2572,15 @@ static int udt_stop_recording(unified_detection_ctx_t *ctx) {
         recording_metadata_t metadata = {0};
         safe_strcpy(metadata.file_path, ctx->current_recording_path, sizeof(metadata.file_path), 0);
         safe_strcpy(metadata.stream_name, ctx->stream_name, sizeof(metadata.stream_name), 0);
+        safe_strcpy(metadata.camera_uuid, ctx->camera_uuid,
+                    sizeof(metadata.camera_uuid), 0);
+        safe_strcpy(metadata.storage_target_uuid, ctx->placement.target_uuid,
+                    sizeof(metadata.storage_target_uuid), 0);
+        safe_strcpy(metadata.object_key, ctx->placement.object_key,
+                    sizeof(metadata.object_key), 0);
+        safe_strcpy(metadata.placement_reason, ctx->placement.reason,
+                    sizeof(metadata.placement_reason), 0);
+        metadata.storage_policy_version = ctx->placement.policy_version;
         metadata.start_time = start_time;
         metadata.end_time = end_time;
         metadata.size_bytes = file_size;
@@ -2866,14 +2926,19 @@ static void report_detections(unified_detection_ctx_t *ctx,
     if (!is_api_detection(ctx->model_path)) {
         uint64_t rec_id = detection_link_recording_id(ctx);
 
-        if (store_detections_in_db(ctx->stream_name, result, now, rec_id) != 0)
+        if (store_detections_in_db_for_camera(
+                ctx->camera_uuid, ctx->stream_name, result, now, rec_id) != 0)
             log_warn("[%s] Failed to store detections in database", ctx->stream_name);
 
-        // Keep MQTT/Home Assistant topics in sync for the local detection
-        // backends (motion, SOD, TFLite). API backends publish from inside
-        // detect_objects_api / *_snapshot, so they are excluded here.
-        mqtt_publish_detection(ctx->stream_name, result, now);
-        mqtt_set_motion_state(ctx->stream_name, result);
+        // API backends enqueue from detect_objects_api / *_snapshot. Local
+        // backends enqueue here after their single database write.
+        char event_error[256] = {0};
+        if (event_producer_publish_detection(
+                ctx->camera_uuid, ctx->stream_name, result, now,
+                event_error, sizeof(event_error)) != 0) {
+            log_debug("[%s] Detection event enqueue failed: %s",
+                      ctx->stream_name, event_error);
+        }
     }
 
     pthread_mutex_lock(&ctx->mutex);

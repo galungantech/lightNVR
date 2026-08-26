@@ -24,7 +24,11 @@
 #include "core/daemon.h"
 #include "core/shutdown_coordinator.h"
 #include "core/curl_init.h"
+#include "core/event_bus.h"
+#include "core/event_identity.h"
+#include "core/mqtt_event_adapter.h"
 #include "core/mqtt_client.h"
+#include "core/mqtt_delivery_worker.h"
 #include "core/path_utils.h"
 #include "utils/strings.h"
 #include "video/stream_manager.h"
@@ -32,6 +36,7 @@
 #include "video/stream_state_adapter.h"
 #include "storage/storage_manager.h"
 #include "storage/storage_manager_streams_cache.h"
+#include "storage/storage_target_health.h"
 #include "video/streams.h"
 #include "video/hls_streaming.h"
 #include "video/mp4_recording.h"
@@ -60,6 +65,8 @@ void init_recordings_system(void);
 #include "database/database_manager.h"
 #include "database/db_schema_cache.h"
 #include "database/db_core.h"
+#include "database/db_authorization.h"
+#include "database/db_storage_targets.h"
 #include "database/db_recordings_sync.h"
 #include <sqlite3.h>
 #include "web/http_server.h"
@@ -585,9 +592,9 @@ int main(int argc, char *argv[]) {
     fprintf(stderr, "Setting log level from config: %d\n", config.log_level);
     set_log_level(config.log_level);
 
-    // Use log_error instead of log_info to ensure this message is always logged
-    // regardless of the configured log level
-    log_error("Log level set to %d (%s)", config.log_level, get_log_level_string(config.log_level));
+    // Log configured log level as informational startup context
+    // (severity should match message semantics)
+    log_info("Log level set to %d (%s)", config.log_level, get_log_level_string(config.log_level));
 
     // Enable syslog if configured
     if (config.syslog_enabled) {
@@ -609,9 +616,15 @@ int main(int argc, char *argv[]) {
             return EXIT_FAILURE;
         }
 
+        // This is a one-shot invocation that reads stream rows and exits, so it
+        // opens the database in the cheapest mode available. A full open here
+        // would run the startup consistency check, the migration pass, and a
+        // whole-database backup on exit -- and the server process that follows
+        // repeats all of it, doubling an already long window in which nothing
+        // is listening on the HTTP port.
         bool db_initialized_for_generation = false;
         if (config.db_path[0] != '\0') {
-            if (init_database(config.db_path) == 0) {
+            if (init_database_ex(config.db_path, DB_INIT_READ_ONLY) == 0) {
                 db_initialized_for_generation = true;
                 if (load_stream_configs(&config) < 0) {
                     log_warn("Failed to load stream configurations while generating go2rtc config");
@@ -704,6 +717,13 @@ int main(int argc, char *argv[]) {
         goto cleanup;
     }
 
+    // authz_actions records the bit layout every issued API token was minted
+    // against. Refuse to serve a policy this binary would read differently
+    // than it was authored, rather than silently re-mapping permissions.
+    if (db_authorization_verify_action_catalog() != 0) {
+        log_error("Authorization action catalog does not match this build");
+        goto cleanup;
+    }
     // Initialize schema cache
     log_info("Initializing schema cache...");
     init_schema_cache();
@@ -718,12 +738,41 @@ int main(int argc, char *argv[]) {
     // Copy configuration to global config
     memcpy(&g_config, &config, sizeof(config_t));
 
+    // Register the legacy recording root as a stable storage target and attach
+    // existing rows by relative key. This is metadata-only; no footage moves.
+    const char *default_recording_root =
+        config.record_mp4_directly && config.mp4_storage_path[0] != '\0'
+            ? config.mp4_storage_path : config.storage_path;
+    char default_storage_target_uuid[LIGHTNVR_UUID_STRING_SIZE];
+    if (db_storage_target_bootstrap_default(
+            default_recording_root, default_storage_target_uuid) != 0) {
+        // Storage targets are still metadata-only, so a failure here must not
+        // keep the NVR from recording. Rows simply carry a NULL target until
+        // the next start repairs it, which is exactly the pre-migration
+        // behaviour that add_recording_metadata() already handles.
+        log_error("Failed to initialize the default storage target; "
+                  "continuing without storage target attribution");
+    }
+
+    // Establish the stable installation identity and asynchronous event path
+    // before any camera producer threads can start.
+    if (event_identity_init() != 0) {
+        log_error("Failed to initialize persistent event identity");
+    } else if (mqtt_event_adapter_register(&g_config) != 0) {
+        log_error("Failed to register MQTT event compatibility adapter");
+    } else if (event_bus_init(0, 0) != 0) {
+        log_error("Failed to initialize asynchronous event bus");
+    } else {
+        log_info("Asynchronous event pipeline initialized successfully");
+    }
+
     // Initialize storage manager
     if (init_storage_manager(config.storage_path, config.max_storage_size) != 0) {
         log_error("Failed to initialize storage manager");
         goto cleanup;
     }
     set_retention_days(config.retention_days);
+    (void)storage_target_refresh_health_and_publish();
     log_info("Storage manager initialized");
 
     // Start recording sync thread to ensure database file sizes are accurate
@@ -871,7 +920,10 @@ int main(int argc, char *argv[]) {
     // Initialize authentication system
     if (init_auth_system() != 0) {
         log_error("Failed to initialize authentication system");
-        // Continue anyway, will fall back to config-based authentication
+        /* Authorization initialization includes the one-way legacy policy
+         * migration. Serving after it fails would evaluate a legacy account
+         * without its retired allowed_tags restriction, so fail closed. */
+        goto cleanup;
     } else {
         log_info("Authentication system initialized successfully");
     }
@@ -884,15 +936,19 @@ int main(int argc, char *argv[]) {
         log_info("Batch delete progress tracking initialized successfully");
     }
 
-    // Initialize MQTT client if enabled
-    if (config.mqtt_enabled) {
-        // cppcheck-suppress knownConditionTrueFalse
-        if (mqtt_init(&config) != 0) {
-            log_error("Failed to initialize MQTT client");
-            // Continue anyway, MQTT is optional
-        } else {
-            log_info("MQTT client initialized successfully");
-            // Connect to MQTT broker
+    // Initialize the shared MQTT runtime even when the legacy/default broker
+    // is disabled; managed event destinations use the same library runtime.
+#ifdef ENABLE_MQTT
+    // cppcheck-suppress knownConditionTrueFalse
+    if (mqtt_init(&config) != 0) {
+        log_error("Failed to initialize MQTT runtime");
+        // Continue anyway, MQTT is optional
+    } else {
+        log_info("MQTT runtime initialized successfully");
+        if (mqtt_delivery_worker_start() != 0) {
+            log_error("Failed to start durable MQTT delivery worker");
+        }
+        if (config.mqtt_enabled) {
             // cppcheck-suppress knownConditionTrueFalse
             if (mqtt_connect() != 0) {
                 log_warn("Failed to connect to MQTT broker, will retry automatically");
@@ -902,6 +958,11 @@ int main(int argc, char *argv[]) {
             }
         }
     }
+#else
+    if (config.mqtt_enabled) {
+        log_warn("MQTT is configured but this build has MQTT support disabled");
+    }
+#endif
 
     // Initialize web server with direct handlers
     http_server_config_t server_config = {
@@ -1472,6 +1533,17 @@ cleanup:
         // hangs, the safety alarm will still fire.
         cleanup_detection_resources();
 
+        // Drain accepted events while MQTT is still alive, then detach the
+        // compatibility subscriber before tearing down broker state.
+        log_info("Draining asynchronous event pipeline...");
+        event_bus_shutdown(true);
+        mqtt_event_adapter_unregister();
+        event_identity_shutdown();
+
+        // All accepted events are now persisted. Stop delivery before broker
+        // teardown; pending rows remain eligible after restart.
+        mqtt_delivery_worker_shutdown();
+
         // Cleanup MQTT client
         log_info("Cleaning up MQTT client...");
         mqtt_cleanup();
@@ -1582,6 +1654,12 @@ cleanup:
         cleanup_mp4_recording_backend();
         cleanup_hls_streaming_backend();
         cleanup_transcoding_backend();
+
+        event_bus_shutdown(true);
+        mqtt_event_adapter_unregister();
+        event_identity_shutdown();
+
+        mqtt_delivery_worker_shutdown();
 
         // Cleanup MQTT client
         mqtt_cleanup();

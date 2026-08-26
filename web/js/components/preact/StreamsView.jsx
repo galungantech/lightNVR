@@ -11,6 +11,8 @@ import { StreamBulkActionModal } from './StreamBulkActionModal.jsx';
 import { StreamConfigModal } from './StreamConfigModal.jsx';
 import { StreamCard } from './StreamCard.jsx';
 import { HealthView } from './HealthView.jsx';
+import { FleetView } from './FleetView.jsx';
+import { EventRoutingView } from './EventRoutingView.jsx';
 import { validateSession } from '../../utils/auth-utils.js';
 import {
   useQuery,
@@ -25,6 +27,12 @@ import { useI18n } from '../../i18n.js';
  * StreamsView component
  * @returns {JSX.Element} StreamsView component
  */
+function getInitialWorkspaceTab() {
+  if (typeof window === 'undefined') return 'streams';
+  const view = new URLSearchParams(window.location.search).get('view');
+  return view === 'inventory' || view === 'health' || view === 'events' ? view : 'streams';
+}
+
 export function StreamsView() {
   const { t } = useI18n();
   const queryClient = useQueryClient();
@@ -63,7 +71,7 @@ export function StreamsView() {
   const shouldHideCredentials = isDemoMode || userRole === 'viewer';
 
   // State for streams data
-  const [activeTab, setActiveTab] = useState('streams');
+  const [activeTab, setActiveTab] = useState(getInitialWorkspaceTab);
   const [modalVisible, setModalVisible] = useState(false);
   const [onvifModalVisible, setOnvifModalVisible] = useState(false);
   const [showCustomNameInput, setShowCustomNameInput] = useState(false);
@@ -77,6 +85,14 @@ export function StreamsView() {
   const [isDiscovering, setIsDiscovering] = useState(false);
   const [isLoadingProfiles, setIsLoadingProfiles] = useState(false);
   const [onvifNetworkOverride, setOnvifNetworkOverride] = useState('auto');
+
+  useEffect(() => {
+    if (typeof window === 'undefined') return;
+    const url = new URL(window.location.href);
+    if (activeTab === 'streams') url.searchParams.delete('view');
+    else url.searchParams.set('view', activeTab);
+    window.history.replaceState({}, '', url);
+  }, [activeTab]);
 
   // Credential-reveal toggle is now owned by StreamCard (per-card state).
   // StreamsView used to track a Set of revealed streams when the page was a
@@ -150,6 +166,12 @@ export function StreamsView() {
     retries: 1,
     retryDelay: 1000
   });
+
+  const { data: clientConfig = {} } = useQuery(
+    ['client-config'],
+    '/api/client-config',
+    { timeout: 5000, retries: 1, retryDelay: 1000 }
+  );
 
   // Process the response to handle both array and object formats
   const streams = Array.isArray(streamsResponse) ? streamsResponse : (streamsResponse.streams || []);
@@ -267,6 +289,7 @@ const handleDrop = (e, targetIndex) => {
     adminUrl: '',
     enabled: true,
     streamingEnabled: true,
+    playbackTransport: 'auto',
     width: 1280,
     height: 720,
     fps: 15,
@@ -621,6 +644,7 @@ const handleDrop = (e, targetIndex) => {
       admin_url: currentStream.adminUrl || '',
       enabled: currentStream.enabled,
       streaming_enabled: currentStream.streamingEnabled,
+      playback_transport: currentStream.playbackTransport || 'auto',
       // width/height/fps are read-only (auto-detected). codec is user-settable
       // as a hint (select Auto / H.264 / H.265) — the detection thread still
       // overwrites it with the real value from the source if they differ,
@@ -739,6 +763,7 @@ const handleDrop = (e, targetIndex) => {
       adminUrl: '',
       enabled: true,
       streamingEnabled: true,
+      playbackTransport: clientConfig.default_playback_transport || 'auto',
       width: 0,
       height: 0,
       fps: 0,
@@ -824,6 +849,7 @@ const handleDrop = (e, targetIndex) => {
         // Map API fields to form fields
         adminUrl: stream.admin_url || '',
         streamingEnabled: stream.streaming_enabled !== undefined ? stream.streaming_enabled : true,
+        playbackTransport: stream.playback_transport || 'auto',
         isOnvif: stream.isOnvif !== undefined ? stream.isOnvif : false,
         // ONVIF credentials
         onvifUsername: stream.onvif_username || '',
@@ -914,6 +940,7 @@ const handleDrop = (e, targetIndex) => {
         postBuffer: stream.post_detection_buffer || 30,
         adminUrl: stream.admin_url || '',
         streamingEnabled: stream.streaming_enabled !== undefined ? stream.streaming_enabled : true,
+        playbackTransport: stream.playback_transport || 'auto',
         isOnvif: stream.isOnvif !== undefined ? stream.isOnvif : false,
         onvifUsername: stream.onvif_username || '',
         onvifPassword: stream.onvif_password || '',
@@ -972,6 +999,13 @@ const handleDrop = (e, targetIndex) => {
     setSelectedDevice(null);
     setSelectedProfile(null);
     setCustomStreamName('');
+    // Reopen the durable staging inbox before the operator starts another scan.
+    try {
+      const inventory = await fetchJSON('/api/onvif/devices', { timeout: 5000 });
+      setDiscoveredDevices(inventory?.devices || []);
+    } catch (e) {
+      console.warn('Could not load persisted ONVIF discovery inventory', e);
+    }
     // Fetch the configured default network from settings
     try {
       const settings = await fetchJSON('/api/settings', { timeout: 5000 });
@@ -1258,7 +1292,31 @@ const handleDrop = (e, targetIndex) => {
 
     // Use mutation to save stream
     saveStreamMutation.mutate(streamData, {
-      onSuccess: () => {
+      onSuccess: async () => {
+        if (selectedDevice.inventory_uuid) {
+          try {
+            await fetchJSON('/api/onvif/device/claim', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                inventory_uuid: selectedDevice.inventory_uuid,
+                stream_name: streamData.name
+              }),
+              timeout: 5000
+            });
+            setDiscoveredDevices(previous => previous.map(device =>
+              device.inventory_uuid === selectedDevice.inventory_uuid
+                ? { ...device, claim_state: 'claimed' }
+                : device
+            ));
+          } catch (error) {
+            showStatusMessage(
+              t('streams.onvifClaimWarning', { message: error.message }),
+              'warning',
+              5000
+            );
+          }
+        }
         setIsAddingStream(false);
         setShowCustomNameInput(false);
         // Keep the discovery modal open with its device list intact so
@@ -1364,7 +1422,7 @@ const handleDrop = (e, targetIndex) => {
 
   return (
     <section id="streams-page" className="page">
-      <div className="page-header flex justify-between items-center mb-4 p-4 bg-card text-card-foreground rounded-lg shadow">
+      {activeTab === 'streams' && <div className="page-header flex justify-between items-center mb-4 p-4 bg-card text-card-foreground rounded-lg shadow">
         <h2 className="text-xl font-bold">{t('nav.streams')}</h2>
         <div className="controls flex items-center space-x-2">
           {!canModifyStreams && userRole && (
@@ -1404,7 +1462,7 @@ const handleDrop = (e, targetIndex) => {
             </>
           )}
         </div>
-      </div>
+      </div>}
 
       <div className="mb-4 border-b border-border" role="tablist" aria-label={t('nav.streams')}>
         <div className="flex gap-2">
@@ -1421,7 +1479,22 @@ const handleDrop = (e, targetIndex) => {
             }`}
             onClick={() => setActiveTab('streams')}
           >
-            {t('nav.streams')}
+            {t('streams.configuration')}
+          </button>
+          <button
+            type="button"
+            id="inventory-tab"
+            role="tab"
+            aria-selected={activeTab === 'inventory'}
+            aria-controls="inventory-panel"
+            className={`rounded-t-lg px-4 py-2 text-sm font-medium transition-colors ${
+              activeTab === 'inventory'
+                ? 'bg-card text-card-foreground border border-border border-b-0 -mb-px'
+                : 'text-muted-foreground hover:text-foreground'
+            }`}
+            onClick={() => setActiveTab('inventory')}
+          >
+            {t('streams.inventory')}
           </button>
           <button
             type="button"
@@ -1438,12 +1511,35 @@ const handleDrop = (e, targetIndex) => {
           >
             {t('nav.health')}
           </button>
+          <button
+            type="button"
+            id="events-tab"
+            role="tab"
+            aria-selected={activeTab === 'events'}
+            aria-controls="events-panel"
+            className={`rounded-t-lg px-4 py-2 text-sm font-medium transition-colors ${
+              activeTab === 'events'
+                ? 'bg-card text-card-foreground border border-border border-b-0 -mb-px'
+                : 'text-muted-foreground hover:text-foreground'
+            }`}
+            onClick={() => setActiveTab('events')}
+          >
+            {t('events.tab')}
+          </button>
         </div>
       </div>
 
-      {activeTab === 'health' ? (
+      {activeTab === 'inventory' ? (
+        <div role="tabpanel" id="inventory-panel" aria-labelledby="inventory-tab">
+          <FleetView />
+        </div>
+      ) : activeTab === 'health' ? (
         <div role="tabpanel" id="health-panel" aria-labelledby="health-tab">
           <HealthView />
+        </div>
+      ) : activeTab === 'events' ? (
+        <div role="tabpanel" id="events-panel" aria-labelledby="events-tab">
+          <EventRoutingView />
         </div>
       ) : (
         <div role="tabpanel" id="streams-panel" aria-labelledby="streams-tab">
@@ -1459,7 +1555,7 @@ const handleDrop = (e, targetIndex) => {
               still work the same way over the new card grid. */}
           {canModifyStreams && selectionMode && (
             <div className="flex flex-wrap items-center gap-3 px-3 py-2 mb-3 rounded-md bg-card border border-border">
-              <label className="inline-flex items-center gap-2 text-sm text-muted-foreground">
+              <label className="touch-target inline-flex cursor-pointer items-center gap-2 text-sm text-muted-foreground">
                 <input
                   type="checkbox"
                   className="w-4 h-4 rounded cursor-pointer"
@@ -1626,6 +1722,11 @@ const handleDrop = (e, targetIndex) => {
           onClose={closeModal}
           onRefreshModels={loadDetectionModels}
           hideCredentials={shouldHideCredentials}
+          transportOfferings={{
+            webrtc: !clientConfig.webrtc_disabled,
+            mse: !clientConfig.mse_disabled,
+            hls: !clientConfig.hls_disabled,
+          }}
         />
       )}
 
@@ -1685,13 +1786,14 @@ const handleDrop = (e, targetIndex) => {
                     <th className="px-6 py-3 text-left text-xs font-medium text-muted-foreground uppercase tracking-wider">{t('streams.ipAddress')}</th>
                     <th className="px-6 py-3 text-left text-xs font-medium text-muted-foreground uppercase tracking-wider">{t('streams.manufacturer')}</th>
                     <th className="px-6 py-3 text-left text-xs font-medium text-muted-foreground uppercase tracking-wider">{t('streams.model')}</th>
+                    <th className="px-6 py-3 text-left text-xs font-medium text-muted-foreground uppercase tracking-wider">{t('common.status')}</th>
                     <th className="px-6 py-3 text-left text-xs font-medium text-muted-foreground uppercase tracking-wider">{t('common.actions')}</th>
                   </tr>
                   </thead>
                   <tbody className="bg-card divide-y divide-border">
                   {discoveredDevices.length === 0 ? (
                     <tr>
-                      <td colSpan="4" className="px-6 py-4 text-center text-muted-foreground">
+                      <td colSpan="5" className="px-6 py-4 text-center text-muted-foreground">
                         {isDiscovering ? (
                           <div className="flex items-center justify-center">
                             <span>{t('streams.discoveringDevices')}</span>
@@ -1708,11 +1810,16 @@ const handleDrop = (e, targetIndex) => {
                     const alreadyAdded = isDeviceAlreadyAdded(device);
                     const isConnecting = isLoadingProfiles && selectedDevice && selectedDevice.ip_address === device.ip_address;
                     const baseRowClass = 'hover:bg-muted/50 transition-opacity';
-                    const rowClassName = alreadyAdded ? `${baseRowClass} opacity-60` : baseRowClass;
+                    const rowClassName = alreadyAdded || !device.online ? `${baseRowClass} opacity-60` : baseRowClass;
                     return (
-                      <tr key={device.ip_address} className={rowClassName}>
+                      <tr key={device.inventory_uuid || device.endpoint || device.ip_address} className={rowClassName}>
                         <td className="px-6 py-4 whitespace-nowrap">
-                          <span>{device.ip_address}</span>
+                          <div>{device.ip_address}</div>
+                          {device.last_seen_at > 0 && (
+                            <div className="text-xs text-muted-foreground mt-1">
+                              {t('streams.lastSeen', { time: new Date(device.last_seen_at * 1000).toLocaleString() })}
+                            </div>
+                          )}
                           {alreadyAdded && (
                             <span className="ml-2 inline-flex items-center px-2 py-0.5 text-xs font-medium rounded-full bg-muted text-muted-foreground border border-border">
                               {t('streams.alreadyAdded')}
@@ -1721,6 +1828,23 @@ const handleDrop = (e, targetIndex) => {
                         </td>
                         <td className="px-6 py-4 whitespace-nowrap">{device.manufacturer || t('common.unknown')}</td>
                         <td className="px-6 py-4 whitespace-nowrap">{device.model || t('common.unknown')}</td>
+                        <td className="px-6 py-4 whitespace-nowrap">
+                          <div className="flex flex-wrap gap-1">
+                            <span className={`inline-flex items-center px-2 py-0.5 text-xs font-medium rounded-full border ${device.online ? 'border-green-500/40 text-green-600' : 'border-border text-muted-foreground'}`}>
+                              {device.online ? t('common.online') : t('common.offline')}
+                            </span>
+                            {device.claim_state === 'claimed' && (
+                              <span className="inline-flex items-center px-2 py-0.5 text-xs font-medium rounded-full border border-primary/40 text-primary">
+                                {t('streams.claimed')}
+                              </span>
+                            )}
+                            {device.duplicate_suspected && (
+                              <span className="inline-flex items-center px-2 py-0.5 text-xs font-medium rounded-full border border-yellow-500/40 text-yellow-600" title={t('streams.duplicateSuspectedHelp')}>
+                                {t('streams.duplicateSuspected')}
+                              </span>
+                            )}
+                          </div>
+                        </td>
                         <td className="px-6 py-4 whitespace-nowrap">
                           <button
                               className={alreadyAdded ? 'btn-secondary focus:outline-none' : 'btn-primary focus:outline-none'}

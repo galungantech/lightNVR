@@ -30,8 +30,10 @@
 #include "video/go2rtc/go2rtc_process.h"
 #include "video/go2rtc/go2rtc_stream.h"
 #include "video/go2rtc/go2rtc_integration.h"
+#include "video/go2rtc/go2rtc_lifecycle.h"
 #include "video/hls/hls_api.h"
 #include "core/mqtt_client.h"
+#include "core/mqtt_delivery_worker.h"
 #include "storage/storage_manager.h"
 #include "utils/yaml_validate.h"
 
@@ -71,22 +73,31 @@ typedef struct {
     bool mqtt_now_enabled;  // Whether MQTT is enabled after the settings change
 } mqtt_settings_task_t;
 
-static void mqtt_settings_worker(mqtt_settings_task_t *task) {
-    if (!task) return;
+static void *mqtt_settings_worker(void *argument) {
+    mqtt_settings_task_t *task = argument;
+    if (!task) return NULL;
 
     log_set_thread_context("Settings", NULL);
     log_info("MQTT settings worker: reinitializing MQTT client...");
 
+    // Prevent a durable publish from racing broker teardown. Any pending or
+    // leased row remains recoverable in SQLite.
+    mqtt_delivery_worker_shutdown();
     int rc = mqtt_reinit(&g_config);
     // cppcheck-suppress knownConditionTrueFalse
     if (rc != 0) {
         log_error("MQTT settings worker: reinit failed (rc=%d)", rc);
+#ifdef ENABLE_MQTT
+    } else if (mqtt_delivery_worker_start() != 0) {
+        log_error("MQTT settings worker: delivery worker restart failed");
+#endif
     } else {
         log_info("MQTT settings worker: reinit complete (mqtt_enabled=%s)",
-                 task->mqtt_now_enabled ? "true" : "false");
+                 g_config.mqtt_enabled ? "true" : "false");
     }
 
     free(task);
+    return NULL;
 }
 
 /**
@@ -114,6 +125,16 @@ static void go2rtc_settings_worker(go2rtc_settings_task_t *task) {
     if (!task->becoming_enabled) {
         // go2rtc is being DISABLED — stop health monitor, stop go2rtc, start native HLS
         log_info("go2rtc settings worker: disabling go2rtc...");
+
+        go2rtc_lifecycle_guard_t lifecycle_guard;
+        bool lifecycle_entered = go2rtc_lifecycle_begin(
+            GO2RTC_LIFECYCLE_CLEANUP, false, true, &lifecycle_guard);
+        if (!lifecycle_entered) {
+            log_error("go2rtc settings worker: failed to enter lifecycle for disable");
+            free(all_streams);
+            free(task);
+            return;
+        }
 
         // Stop the health monitor first so it doesn't restart go2rtc
         go2rtc_integration_cleanup();
@@ -148,6 +169,10 @@ static void go2rtc_settings_worker(go2rtc_settings_task_t *task) {
         // Without this, the stream module remains "initialized" with potentially
         // stale state, and go2rtc_integration_full_start() skips the init step.
         go2rtc_stream_cleanup();
+
+        if (lifecycle_entered) {
+            go2rtc_lifecycle_end(&lifecycle_guard, true);
+        }
 
         // Restart MP4 recordings with direct camera URLs (go2rtc is now disabled)
         for (int i = 0; i < stream_count; i++) {
@@ -192,16 +217,10 @@ static void go2rtc_settings_worker(go2rtc_settings_task_t *task) {
             }
         }
 
-        // Stop go2rtc if already running
-        if (go2rtc_process_is_running()) {
-            if (!go2rtc_process_stop()) {
-                log_warn("Failed to stop go2rtc process cleanly, continuing anyway");
-            }
-            sleep(2);
-        }
-
-        // Full go2rtc startup: init, start, register streams
-        if (!go2rtc_integration_full_start()) {
+        // One serialized reconfigure operation handles both the already-running
+        // and freshly-enabled cases. This keeps stop/start atomic with respect
+        // to refresh workers and the health monitor.
+        if (!go2rtc_integration_restart_process()) {
             log_error("Failed to start go2rtc integration");
 
             // go2rtc failed to start — restart recordings with direct URLs as fallback
@@ -314,7 +333,7 @@ void handle_post_settings_go2rtc_validate(const http_request_t *req,
                                           http_response_t *res) {
     log_info("Handling POST /api/settings/go2rtc/validate request");
 
-    if (!httpd_check_admin_privileges(req, res)) {
+    if (!httpd_authorize_global_action(req, res, AUTHZ_SYSTEM_ADMIN)) {
         return;
     }
 
@@ -369,29 +388,78 @@ void handle_post_settings_go2rtc_validate(const http_request_t *req,
 }
 
 /**
+ * @brief GET /api/client-config
+ *
+ * Browser playback needs a small runtime contract, but the full settings
+ * document contains paths, network topology and integration configuration.
+ * Keep this endpoint authenticated and intentionally limited to values that
+ * are already observable through the viewer UI.
+ */
+void handle_get_client_config(const http_request_t *req, http_response_t *res) {
+    user_t user;
+    if (!httpd_check_action_access(req, &user)) {
+        http_response_set_json_error(res, 401, "Unauthorized");
+        return;
+    }
+    cJSON *config = cJSON_CreateObject();
+    if (!config) {
+        http_response_set_json_error(res, 500, "Failed to create client config");
+        return;
+    }
+    cJSON_AddBoolToObject(config, "go2rtc_enabled", g_config.go2rtc_enabled);
+    cJSON_AddBoolToObject(config, "web_auth_enabled",
+                          g_config.web_auth_enabled);
+    cJSON_AddBoolToObject(config, "demo_mode", g_config.demo_mode);
+    bool go2rtc_available = false;
+    if (g_config.go2rtc_enabled) {
+        int go2rtc_pid = -1;
+        if (go2rtc_process_try_get_pid(&go2rtc_pid)) {
+            go2rtc_available = go2rtc_pid > 0;
+        } else {
+            /*
+             * A reload/start/stop currently owns the lifecycle guard.  API
+             * workers must never wait behind it: the browser can keep using
+             * its existing playback path while the transition completes.
+             */
+            go2rtc_available = true;
+        }
+    }
+    cJSON_AddBoolToObject(config, "go2rtc_available", go2rtc_available);
+    cJSON_AddNumberToObject(config, "go2rtc_api_port",
+                            g_config.go2rtc_api_port);
+    cJSON_AddBoolToObject(config, "webrtc_disabled", g_config.webrtc_disabled);
+    cJSON_AddBoolToObject(config, "hls_disabled", g_config.hls_disabled);
+    cJSON_AddBoolToObject(config, "mse_disabled", g_config.mse_disabled);
+    cJSON_AddStringToObject(config, "default_playback_transport",
+                            playback_transport_is_valid(g_config.default_playback_transport)
+                                ? g_config.default_playback_transport : "auto");
+    cJSON_AddBoolToObject(config, "go2rtc_force_native_hls",
+                          g_config.go2rtc_force_native_hls);
+    cJSON_AddNumberToObject(config, "webrtc_connection_timeout_ms",
+                            g_config.webrtc_connection_timeout_ms);
+    cJSON_AddNumberToObject(config, "webrtc_ice_recovery_timeout_ms",
+                            g_config.webrtc_ice_recovery_timeout_ms);
+    cJSON_AddBoolToObject(config, "generate_thumbnails",
+                          g_config.generate_thumbnails);
+    cJSON_AddNumberToObject(config, "thumbnails_per_recording",
+                            g_config.thumbnails_per_recording);
+    char *json = cJSON_PrintUnformatted(config);
+    cJSON_Delete(config);
+    if (!json) {
+        http_response_set_json_error(res, 500, "Failed to serialize client config");
+        return;
+    }
+    http_response_set_json(res, 200, json);
+    free(json);
+}
+
+/**
  * @brief Direct handler for GET /api/settings
  */
 void handle_get_settings(const http_request_t *req, http_response_t *res) {
     log_info("Handling GET /api/settings request");
 
-    // Check authentication if enabled
-    // In demo mode, allow unauthenticated viewer access to read settings
-    if (g_config.web_auth_enabled) {
-        user_t user;
-        if (g_config.demo_mode) {
-            if (!httpd_check_viewer_access(req, &user)) {
-                log_error("Authentication failed for GET /api/settings request");
-                http_response_set_json_error(res, 401, "Unauthorized");
-                return;
-            }
-        } else {
-            if (!httpd_get_authenticated_user(req, &user)) {
-                log_error("Authentication failed for GET /api/settings request");
-                http_response_set_json_error(res, 401, "Unauthorized");
-                return;
-            }
-        }
-    }
+    if (!httpd_authorize_global_action(req, res, AUTHZ_SYSTEM_ADMIN)) return;
 
     // Get global configuration
     // Create JSON object
@@ -471,6 +539,9 @@ void handle_get_settings(const http_request_t *req, http_response_t *res) {
     cJSON_AddNumberToObject(settings, "pre_detection_buffer", g_config.default_pre_detection_buffer);
     cJSON_AddNumberToObject(settings, "post_detection_buffer", g_config.default_post_detection_buffer);
     cJSON_AddStringToObject(settings, "buffer_strategy", g_config.default_buffer_strategy);
+    cJSON_AddStringToObject(settings, "default_playback_transport",
+                            playback_transport_is_valid(g_config.default_playback_transport)
+                                ? g_config.default_playback_transport : "auto");
     cJSON_AddNumberToObject(settings, "detection_grace_period", g_config.detection_grace_period);
 
     // In-process LiteRT detection engine settings
@@ -615,7 +686,7 @@ void handle_post_settings(const http_request_t *req, http_response_t *res) {
     log_info("Handling POST /api/settings request");
 
     // Check if user has admin privileges to modify settings
-    if (!httpd_check_admin_privileges(req, res)) {
+    if (!httpd_authorize_global_action(req, res, AUTHZ_SYSTEM_ADMIN)) {
         return;  // Error response already sent
     }
 
@@ -1133,6 +1204,25 @@ void handle_post_settings(const http_request_t *req, http_response_t *res) {
         log_info("Updated default_buffer_strategy: %s", g_config.default_buffer_strategy);
     }
 
+    // Playback transport profile applied to newly-created streams.
+    cJSON *default_playback_transport =
+        cJSON_GetObjectItem(settings, "default_playback_transport");
+    if (default_playback_transport) {
+        if (!cJSON_IsString(default_playback_transport) ||
+            !playback_transport_is_valid(default_playback_transport->valuestring)) {
+            cJSON_Delete(settings);
+            http_response_set_json_error(res, 400,
+                "default_playback_transport is invalid");
+            return;
+        }
+        safe_strcpy(g_config.default_playback_transport,
+                    default_playback_transport->valuestring,
+                    sizeof(g_config.default_playback_transport), 0);
+        settings_changed = true;
+        log_info("Updated default_playback_transport: %s",
+                 g_config.default_playback_transport);
+    }
+
     // Detection grace period
     cJSON *detection_grace_period = cJSON_GetObjectItem(settings, "detection_grace_period");
     if (detection_grace_period && cJSON_IsNumber(detection_grace_period)) {
@@ -1624,7 +1714,8 @@ void handle_post_settings(const http_request_t *req, http_response_t *res) {
         // First, stop all HLS streams explicitly to ensure they're properly shut down
         log_info("Stopping all HLS streams before changing database path...");
         
-        // Get a list of all active streams (heap-allocated; 256 * 256 B on stack is too large)
+        // Get a list of all active streams on the heap; MAX_STREAMS entries
+        // would make this unsafe on the stack.
         char (*active_streams)[MAX_STREAM_NAME] = calloc(g_config.max_streams, MAX_STREAM_NAME);
         if (!active_streams) {
             log_error("handle_post_settings: out of memory for active_streams");
@@ -2070,7 +2161,7 @@ void handle_post_settings(const http_request_t *req, http_response_t *res) {
                 pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
 
                 if (pthread_create(&thread_id, &attr,
-                                   (void *(*)(void *))mqtt_settings_worker, task) != 0) {
+                                   mqtt_settings_worker, task) != 0) {
                     log_error("Failed to create MQTT settings worker thread");
                     free(task);
                 } else {

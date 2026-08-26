@@ -22,6 +22,11 @@ import { createPlayerTelemetry } from '../../utils/player-telemetry.js';
 import { useAutoRetry } from './useAutoRetry.js';
 import { useVideoZoom } from './useVideoZoom.js';
 import { streamConnectionGate, priorityForStreamStatus, isGateTimeout, isGateAbort } from '../../utils/stream-connection-gate.js';
+import { LiveTileStatus } from './LiveTileStatus.jsx';
+import { PictureInPictureButton } from './PictureInPictureButton.jsx';
+import { shouldEnterFullscreenFromTap } from './useAlwaysFullscreenOnTap.js';
+import { MobileTileContextMenu, useMobileTileGestures } from './MobileTileGestures.jsx';
+import { TileAudioButton } from './TileAudioButton.jsx';
 
 /**
  * MSEVideoCell component
@@ -38,7 +43,11 @@ export function MSEVideoCell({
   onToggleFullscreen,
   showLabels = true,
   showControls = true,
-  globalShowDetections = true
+  globalShowDetections = true,
+  alwaysFullscreenOnTap = false,
+  onRequestReorder,
+  mobileGesturesDisabled = false,
+  onTransportFailure
 }) {
   const { t } = useI18n();
   const queryClient = useQueryClient();
@@ -47,6 +56,7 @@ export function MSEVideoCell({
   const [isLoading, setIsLoading] = useState(true);
   const [error, setError] = useState(null);
   const [isPlaying, setIsPlaying] = useState(false);
+  const [audioEnabled, setAudioEnabled] = useState(false);
   const [retryCount, setRetryCount] = useState(0);
 
   // Auto-retry tracking (separate from manual retryCount to avoid infinite loops)
@@ -89,6 +99,31 @@ export function MSEVideoCell({
   const gateSettleRef = useRef(null);
   // Cell-scoped abort: cancels a queued/in-flight gated attempt on unmount
   const cellAbortRef = useRef(null);
+  const handleMobileAudioToggle = () => {
+    const nextEnabled = !audioEnabled;
+    setAudioEnabled(nextEnabled);
+    if (videoRef.current) {
+      videoRef.current.muted = !nextEnabled;
+      if (nextEnabled) videoRef.current.play().catch(() => {
+        if (videoRef.current) videoRef.current.muted = true;
+        setAudioEnabled(false);
+      });
+    }
+    if (nextEnabled) {
+      window.dispatchEvent(new CustomEvent('lightnvr:tile-audio-enabled', {
+        detail: { streamName: stream.name },
+      }));
+    }
+  };
+  const mobileGestures = useMobileTileGestures({
+    streamName: stream.name,
+    cellRef,
+    videoRef,
+    audioEnabled,
+    onToggleAudio: handleMobileAudioToggle,
+    onRequestReorder,
+    disabled: zoom.isZoomed || mobileGesturesDisabled,
+  });
 
   // Constants from go2rtc's video-rtc.js
   const RECONNECT_TIMEOUT = 15000;
@@ -204,8 +239,6 @@ export function MSEVideoCell({
           videoRef.current.src = URL.createObjectURL(ms);
           videoRef.current.srcObject = null;
         }
-
-        videoRef.current.ondblclick = (e) => onToggleFullscreen(stream.name, e, cellRef.current);
 
         // Start playback
         videoRef.current.play().catch(() => {
@@ -475,6 +508,10 @@ export function MSEVideoCell({
   // Auto-retry while the error overlay is visible — see WebRTCVideoCell for rationale.
   const autoRetryCountdown = useAutoRetry(error, handleRetry);
 
+  useEffect(() => {
+    if (error && onTransportFailure) onTransportFailure(error);
+  }, [error, onTransportFailure]);
+
   /**
    * Pause stream for privacy — sets privacy_mode=true without touching the enabled flag.
    */
@@ -663,6 +700,24 @@ export function MSEVideoCell({
       data-stream-id={streamId}
       data-sub-stream={useSubStream ? 'true' : 'false'}
       data-zoom-scale={zoom.isZoomed ? zoom.scale.toFixed(2) : undefined}
+      data-mobile-chrome={mobileGestures.chromeVisible ? 'visible' : 'hidden'}
+      onPointerDown={mobileGestures.onPointerDown}
+      onPointerMove={mobileGestures.onPointerMove}
+      onPointerUp={mobileGestures.onPointerUp}
+      onPointerCancel={mobileGestures.onPointerCancel}
+      onContextMenu={mobileGestures.onContextMenu}
+      onClick={(event) => {
+        if (mobileGestures.onClick(event)) return;
+        if (shouldEnterFullscreenFromTap(event, alwaysFullscreenOnTap, zoom.isZoomed)) {
+          onToggleFullscreen(stream.name, event, cellRef.current);
+        }
+      }}
+      onDblClick={(event) => {
+        if (!alwaysFullscreenOnTap
+            && shouldEnterFullscreenFromTap(event, true, zoom.isZoomed)) {
+          onToggleFullscreen(stream.name, event, cellRef.current);
+        }
+      }}
       ref={(el) => {
         cellRef.current = el;
         zoom.containerRef.current = el;
@@ -681,7 +736,7 @@ export function MSEVideoCell({
         className="video-element"
         ref={videoRef}
         autoPlay
-        muted
+        muted={!audioEnabled}
         playsInline
         style={{
           width: '100%',
@@ -691,6 +746,16 @@ export function MSEVideoCell({
           transformOrigin: 'center center'
         }}
       />
+
+      <LiveTileStatus
+        stream={stream}
+        isPlaying={isPlaying}
+        isLoading={isLoading}
+        error={error}
+        showLabels={showLabels}
+      />
+
+      <MobileTileContextMenu gestures={mobileGestures} audioEnabled={audioEnabled} />
 
       {/* Detection overlay component */}
       {stream.detection_based_recording && stream.detection_model && showDetections && !zoom.isZoomed && (
@@ -981,6 +1046,14 @@ export function MSEVideoCell({
               <path d="M320 128C426 128 512 214 512 320C512 426 426 512 320 512C254.8 512 197.1 479.5 162.4 429.7C152.3 415.2 132.3 411.7 117.8 421.8C103.3 431.9 99.8 451.9 109.9 466.4C156.1 532.6 233 576 320 576C461.4 576 576 461.4 576 320C576 178.6 461.4 64 320 64C234.3 64 158.5 106.1 112 170.7L112 144C112 126.3 97.7 112 80 112C62.3 112 48 126.3 48 144L48 256C48 273.7 62.3 288 80 288L104.6 288C105.1 288 105.6 288 106.1 288L192.1 288C209.8 288 224.1 273.7 224.1 256C224.1 238.3 209.8 224 192.1 224L153.8 224C186.9 166.6 249 128 320 128zM344 216C344 202.7 333.3 192 320 192C306.7 192 296 202.7 296 216L296 320C296 326.4 298.5 332.5 303 337L375 409C384.4 418.4 399.6 418.4 408.9 409C418.2 399.6 418.3 384.4 408.9 375.1L343.9 310.1L343.9 216z"/>
             </svg>
           </button>
+
+          <PictureInPictureButton videoRef={videoRef} disabled={!isPlaying} />
+
+          <TileAudioButton
+            enabled={audioEnabled}
+            onToggle={handleMobileAudioToggle}
+            disabled={!isPlaying}
+          />
 
           {/* Fullscreen button */}
           <button

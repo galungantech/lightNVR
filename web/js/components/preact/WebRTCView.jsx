@@ -6,14 +6,20 @@
 import { useState, useEffect, useCallback, useMemo } from 'preact/hooks';
 // Note: useCallback is still used by getStreamsToShow
 import { showStatusMessage } from './ToastContainer.jsx';
-import { useFullscreenManager, FullscreenManager, useFullscreenGridNav, useFullscreenCellStream } from './FullscreenManager.jsx';
+import { useFullscreenManager, FullscreenManager, useFullscreenGridNav, useFullscreenCellStream, getNativeFullscreenElement, requestNativeFullscreen, exitNativeFullscreen } from './FullscreenManager.jsx';
 import { useQuery, useQueryClient } from '../../query-client.js';
-import { WebRTCVideoCell } from './WebRTCVideoCell.jsx';
+import { PlaybackTransportCell } from './PlaybackTransportCell.jsx';
 import { SnapshotManager, useSnapshotManager } from './SnapshotManager.jsx';
 import { isGo2rtcEnabled } from '../../utils/settings-utils.js';
 import { useCameraOrder } from './useCameraOrder.js';
 import { GridPicker, computeOptimalGrid, MAX_GRID_CELLS } from './GridPicker.jsx';
 import { useI18n } from '../../i18n.js';
+import { buildLiveViewHref, resolveForcedLiveTransport } from '../../utils/live-view-url.js';
+import { useCollectionMembership } from './fleet/collectionMembership.js';
+import { AlwaysFullscreenToggle } from './AlwaysFullscreenToggle.jsx';
+import { useAlwaysFullscreenOnTap } from './useAlwaysFullscreenOnTap.js';
+import { usePullToRefresh } from './usePullToRefresh.js';
+import { shouldShowGestureTip } from './mobileLiveGestures.js';
 
 /**
  * Convert the old single-string layout value to cols/rows for backward compat.
@@ -36,6 +42,11 @@ function legacyLayoutToColsRowsWebRTC(layout) {
  */
 export function WebRTCView({ isWebRTCDisabled, isHlsDisabled, isMseDisabled }) {
   const { t } = useI18n();
+  const forcedTransport = resolveForcedLiveTransport(
+    window.location.pathname,
+    window.location.search
+  );
+  const [alwaysFullscreenOnTap, setAlwaysFullscreenOnTap] = useAlwaysFullscreenOnTap();
 
   // Use the snapshot manager hook
   useSnapshotManager();
@@ -50,12 +61,23 @@ export function WebRTCView({ isWebRTCDisabled, isHlsDisabled, isMseDisabled }) {
 
   // State for streams and layout
   const [streams, setStreams] = useState([]);
+  const [refreshGeneration, setRefreshGeneration] = useState(0);
 
   // Tag filter: '' means "All tags", or a single tag value to filter by
   const [tagFilter, setTagFilter] = useState(() => {
     const p = new URLSearchParams(window.location.search);
     return p.get('tag') || localStorage.getItem('lightnvr-webrtc-tag-filter') || '';
   });
+  const [collectionFilter, setCollectionFilter] = useState(() => {
+    const p = new URLSearchParams(window.location.search);
+    return p.get('collection') || '';
+  });
+  const {
+    collections,
+    cameraUuids: collectionCameraUuids,
+    isLoading: isCollectionLoading,
+    error: collectionError,
+  } = useCollectionMembership(collectionFilter);
 
   // State for toggling stream labels and controls visibility
   const [showLabels, setShowLabels] = useState(() => {
@@ -194,7 +216,8 @@ export function WebRTCView({ isWebRTCDisabled, isHlsDisabled, isMseDisabled }) {
   const {
     data: streamsData,
     isLoading: isLoadingStreams,
-    error: streamsError
+    error: streamsError,
+    refetch: refetchStreams,
   } = useQuery(
     'streams',
     '/api/streams',
@@ -208,6 +231,18 @@ export function WebRTCView({ isWebRTCDisabled, isHlsDisabled, isMseDisabled }) {
     }
   );
 
+  const refreshLiveGrid = useCallback(async () => {
+    try {
+      const result = await refetchStreams();
+      if (result?.error) throw result.error;
+      setRefreshGeneration((generation) => generation + 1);
+      showStatusMessage(t('live.streamsRefreshed'), 'success', 2000);
+    } catch (error) {
+      showStatusMessage(t('live.refreshStreamsFailed', { message: error.message }), 'error', 5000);
+    }
+  }, [refetchStreams, t]);
+  const pullToRefresh = usePullToRefresh(refreshLiveGrid, { disabled: isFullscreen });
+
   // Update loading state based on streams query status
   useEffect(() => {
     setIsLoading(isLoadingStreams);
@@ -215,12 +250,18 @@ export function WebRTCView({ isWebRTCDisabled, isHlsDisabled, isMseDisabled }) {
 
   // Process streams data when it's loaded.
   useEffect(() => {
+    let cancelled = false;
     if (streamsData && Array.isArray(streamsData)) {
+      if (collectionFilter && isCollectionLoading) return;
       // Process the streams data
       const processStreams = async () => {
         try {
           // Filter and process the streams
-          const filteredStreams = await filterStreamsForWebRTC(streamsData);
+          const candidateStreams = collectionFilter
+            ? streamsData.filter((stream) => collectionCameraUuids.has(stream.camera_uuid))
+            : streamsData;
+          const filteredStreams = await filterStreamsForWebRTC(candidateStreams);
+          if (cancelled) return;
 
           if (filteredStreams.length > 0) {
             setStreams(filteredStreams);
@@ -246,8 +287,11 @@ export function WebRTCView({ isWebRTCDisabled, isHlsDisabled, isMseDisabled }) {
             }
           } else {
             console.warn('No streams available for WebRTC view after filtering');
+            setStreams([]);
+            setSelectedStream('');
           }
         } catch (error) {
+          if (cancelled) return;
           console.error('Error processing streams:', error);
           showStatusMessage(t('live.errorProcessingStreams', { message: error.message }));
         }
@@ -255,10 +299,11 @@ export function WebRTCView({ isWebRTCDisabled, isHlsDisabled, isMseDisabled }) {
 
       processStreams();
     }
+    return () => { cancelled = true; };
     // Note: selectedStream is read to preserve the current selection when valid,
     // but we still need to populate streams even when a selection already exists.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [streamsData, autoGrid]);
+  }, [streamsData, autoGrid, collectionFilter, collectionCameraUuids, isCollectionLoading]);
 
   // Sync layout/page/stream to URL — only meaningful once streams are loaded.
   useEffect(() => {
@@ -307,6 +352,9 @@ export function WebRTCView({ isWebRTCDisabled, isHlsDisabled, isMseDisabled }) {
     if (tagFilter) url.searchParams.set('tag', tagFilter);
     else url.searchParams.delete('tag');
 
+    if (collectionFilter) url.searchParams.set('collection', collectionFilter);
+    else url.searchParams.delete('collection');
+
     // Omit params when at their defaults (true) to keep URL clean
     if (!showLabels) url.searchParams.set('labels', '0');
     else url.searchParams.delete('labels');
@@ -322,7 +370,13 @@ export function WebRTCView({ isWebRTCDisabled, isHlsDisabled, isMseDisabled }) {
     localStorage.setItem('lightnvr-show-labels', String(showLabels));
     localStorage.setItem('lightnvr-show-controls', String(showControls));
     localStorage.setItem('lightnvr-show-detections', String(showDetections));
-  }, [tagFilter, showLabels, showControls, showDetections]);
+  }, [tagFilter, collectionFilter, showLabels, showControls, showDetections]);
+
+  useEffect(() => {
+    if (collectionError) {
+      showStatusMessage(t('collections.loadMembersError', { message: collectionError.message }));
+    }
+  }, [collectionError, t]);
 
   /**
    * Filter streams for WebRTC view
@@ -409,22 +463,29 @@ export function WebRTCView({ isWebRTCDisabled, isHlsDisabled, isMseDisabled }) {
     return Array.from(tags).sort();
   }, [streams]);
 
-  // Apply tag filter before passing to the order hook
+  // Apply reusable collection and ad-hoc tag filters before camera ordering.
   const tagFilteredStreams = useMemo(() => {
-    if (!tagFilter) return streams;
-    return streams.filter(s => s.tags && s.tags.split(',').some(t => t.trim() === tagFilter));
-  }, [streams, tagFilter]);
+    return streams.filter((stream) => {
+      if (collectionFilter && !collectionCameraUuids.has(stream.camera_uuid)) return false;
+      return !tagFilter || (stream.tags && stream.tags.split(',').some(tag => tag.trim() === tagFilter));
+    });
+  }, [streams, tagFilter, collectionFilter, collectionCameraUuids]);
 
   // Camera ordering hook (operates on group-filtered streams)
   const {
     orderedStreams,
     reorderMode,
     toggleReorderMode,
+    enterReorderMode,
     resetOrder,
     handleDragStart,
     handleDragOver,
     handleDrop,
     handleDragEnd,
+    handleReorderPointerDown,
+    handleReorderPointerMove,
+    handleReorderPointerUp,
+    handleReorderPointerCancel,
   } = useCameraOrder(tagFilteredStreams, 'webrtc');
 
   // Ensure current page is valid when orderedStreams or maxStreams changes
@@ -456,6 +517,10 @@ export function WebRTCView({ isWebRTCDisabled, isHlsDisabled, isMseDisabled }) {
    * @param {HTMLElement} cellElement - The video cell element
    */
   const toggleStreamFullscreen = (streamName, event, cellElement) => {
+    if (event?.currentTarget?.classList?.contains('fullscreen-btn')
+        && shouldShowGestureTip('double-tap-fullscreen', 3)) {
+      showStatusMessage(t('live.tipDoubleTapFullscreen'), 'info', 5000);
+    }
     // Prevent default button behavior
     if (event) {
       event.preventDefault();
@@ -474,15 +539,17 @@ export function WebRTCView({ isWebRTCDisabled, isHlsDisabled, isMseDisabled }) {
       return;
     }
 
-    if (!document.fullscreenElement) {
+    if (!getNativeFullscreenElement()) {
       console.log('Entering fullscreen mode for video cell');
-      cellElement.requestFullscreen().catch(err => {
+      requestNativeFullscreen(cellElement).catch(err => {
         console.error(`Error attempting to enable fullscreen: ${err.message}`);
         showStatusMessage(`Could not enable fullscreen mode: ${err.message}`);
       });
     } else {
       console.log('Exiting fullscreen mode');
-      document.exitFullscreen();
+      exitNativeFullscreen().catch(err => {
+        console.error(`Error attempting to exit fullscreen: ${err.message}`);
+      });
     }
 
     // Prevent event propagation
@@ -516,37 +583,88 @@ export function WebRTCView({ isWebRTCDisabled, isHlsDisabled, isMseDisabled }) {
       />
 
       <div className="page-header flex justify-between items-center mb-4 p-4 bg-card text-card-foreground rounded-lg shadow" style={{ position: 'relative', zIndex: 10, pointerEvents: 'auto' }}>
-        <div className="flex items-center gap-3">
+        <div className="flex flex-wrap items-center gap-3">
           <h2 className="text-xl font-bold whitespace-nowrap">{t('live.liveView')}</h2>
-          {/* View-mode tab strip: WebRTC | HLS | MSE */}
+          {/* Auto honors per-stream precedence; explicit modes force every tile. */}
           <div className="inline-flex items-center bg-muted rounded-lg p-1 gap-1" style={{ position: 'relative', zIndex: 50 }}>
-            <span className="px-3 py-1.5 rounded text-sm font-medium bg-primary text-primary-foreground select-none">
-              WebRTC
-            </span>
+            {forcedTransport === null ? (
+              <span className="px-3 py-1.5 rounded text-sm font-medium bg-primary text-primary-foreground select-none">
+                Auto
+              </span>
+            ) : (
+              <a
+                href={buildLiveViewHref('/index.html', window.location.search)}
+                className="px-3 py-1.5 rounded text-sm font-medium transition-colors no-underline text-muted-foreground hover:bg-background hover:text-foreground focus:outline-none"
+              >
+                Auto
+              </a>
+            )}
+
+            {forcedTransport === 'webrtc' ? (
+              <span className="px-3 py-1.5 rounded text-sm font-medium bg-primary text-primary-foreground select-none">
+                WebRTC
+              </span>
+            ) : (
+              <a
+                href={buildLiveViewHref('/index.html', window.location.search, 'webrtc')}
+                className="px-3 py-1.5 rounded text-sm font-medium transition-colors no-underline text-muted-foreground hover:bg-background hover:text-foreground focus:outline-none"
+              >
+                WebRTC
+              </a>
+            )}
 
             {/* Tab HLS */}
             {!isHlsDisabled && (
-              <a
-                href="/hls.html"
-                className="px-3 py-1.5 rounded text-sm font-medium transition-colors no-underline text-muted-foreground hover:bg-background hover:text-foreground focus:outline-none"
-              >
-                {t('live.hlsShort')}
-              </a>
+              forcedTransport === 'hls' ? (
+                <span className="px-3 py-1.5 rounded text-sm font-medium bg-primary text-primary-foreground select-none">
+                  {t('live.hlsShort')}
+                </span>
+              ) : (
+                <a
+                  href={buildLiveViewHref('/hls.html', window.location.search)}
+                  className="px-3 py-1.5 rounded text-sm font-medium transition-colors no-underline text-muted-foreground hover:bg-background hover:text-foreground focus:outline-none"
+                >
+                  {t('live.hlsShort')}
+                </a>
+              )
             )}
-    
+
             {/* Tab MSE */}
             {go2rtcAvailable && !isMseDisabled && (
-              <a
-                href="/hls.html?mode=mse"
-                className="px-3 py-1.5 rounded text-sm font-medium transition-colors no-underline text-muted-foreground hover:bg-background hover:text-foreground focus:outline-none"
-              >
-                {t('live.mseShort')}
-              </a>
+              forcedTransport === 'mse' ? (
+                <span className="px-3 py-1.5 rounded text-sm font-medium bg-primary text-primary-foreground select-none">
+                  {t('live.mseShort')}
+                </span>
+              ) : (
+                <a
+                  href={buildLiveViewHref('/hls.html', window.location.search, 'mse')}
+                  className="px-3 py-1.5 rounded text-sm font-medium transition-colors no-underline text-muted-foreground hover:bg-background hover:text-foreground focus:outline-none"
+                >
+                  {t('live.mseShort')}
+                </a>
+              )
             )}
           </div>
         </div>
         
         <div className="controls flex items-center space-x-2">
+          {collections.length > 0 && (
+            <div className="flex items-center gap-1.5">
+              <label htmlFor="webrtc-collection-filter" className="text-sm whitespace-nowrap">{t('collections.filter')}:</label>
+              <select
+                id="webrtc-collection-filter"
+                className="px-3 py-2 border border-border rounded-md shadow-sm focus:outline-none focus:ring-2 focus:ring-primary bg-background text-foreground"
+                value={collectionFilter}
+                disabled={isCollectionLoading}
+                onChange={(event) => { setCollectionFilter(event.currentTarget.value); setCurrentPage(0); }}
+              >
+                <option value="">{t('collections.all')}</option>
+                {collections.map((collection) => (
+                  <option key={collection.uuid} value={collection.uuid}>{collection.name} ({collection.effective_count})</option>
+                ))}
+              </select>
+            </div>
+          )}
           {availableTags.length > 0 && (
             <div className="flex items-center gap-1.5 flex-wrap">
               <span className="text-sm whitespace-nowrap">{t('live.tags')}:</span>
@@ -643,6 +761,11 @@ export function WebRTCView({ isWebRTCDisabled, isHlsDisabled, isMseDisabled }) {
             </svg>
           </button>
 
+          <AlwaysFullscreenToggle
+            enabled={alwaysFullscreenOnTap}
+            onChange={setAlwaysFullscreenOnTap}
+          />
+
           {orderedStreams.length > 1 && (
             <button
               className={`p-2 rounded-full focus:outline-none focus:ring-2 focus:ring-primary ${reorderMode ? 'bg-primary text-primary-foreground hover:bg-primary/90' : 'bg-secondary hover:bg-secondary/80 text-secondary-foreground'}`}
@@ -689,7 +812,23 @@ export function WebRTCView({ isWebRTCDisabled, isHlsDisabled, isMseDisabled }) {
         </div>
       </div>
 
-      <div className="live-grid-frame flex flex-col space-y-4 h-full">
+      <div
+        className="live-grid-frame flex flex-col space-y-4 h-full"
+        {...pullToRefresh.bind}
+      >
+        {(pullToRefresh.distance > 0 || pullToRefresh.refreshing) && (
+          <div
+            className={`mobile-pull-refresh ${pullToRefresh.ready ? 'ready' : ''}`}
+            style={{ '--pull-distance': `${pullToRefresh.distance}px` }}
+            role="status"
+          >
+            {pullToRefresh.refreshing
+              ? t('live.refreshingStreams')
+              : pullToRefresh.ready
+                ? t('live.releaseToRefresh')
+                : t('live.pullToRefresh')}
+          </div>
+        )}
         <div
           id="video-grid"
           className="video-container"
@@ -743,13 +882,18 @@ export function WebRTCView({ isWebRTCDisabled, isHlsDisabled, isMseDisabled }) {
               const globalIndex = currentPage * maxStreams + index;
               return (
                 <div
-                  key={stream.name}
-                  style={{ position: 'relative' }}
+                  key={`${stream.name}:${refreshGeneration}`}
+                  data-camera-order-index={globalIndex}
+                  style={{ position: 'relative', touchAction: reorderMode ? 'none' : undefined }}
                   draggable={reorderMode}
                   onDragStart={reorderMode ? () => handleDragStart(globalIndex) : undefined}
                   onDragOver={reorderMode ? (e) => handleDragOver(e, globalIndex) : undefined}
                   onDrop={reorderMode ? handleDrop : undefined}
                   onDragEnd={reorderMode ? handleDragEnd : undefined}
+                  onPointerDown={reorderMode ? (event) => handleReorderPointerDown(event, globalIndex) : undefined}
+                  onPointerMove={reorderMode ? handleReorderPointerMove : undefined}
+                  onPointerUp={reorderMode ? handleReorderPointerUp : undefined}
+                  onPointerCancel={reorderMode ? handleReorderPointerCancel : undefined}
                 >
                   {reorderMode && (
                     <div
@@ -768,8 +912,15 @@ export function WebRTCView({ isWebRTCDisabled, isHlsDisabled, isMseDisabled }) {
                       {t('live.dragToReorder')}
                     </div>
                   )}
-                  <WebRTCVideoCell
+                  <PlaybackTransportCell
                     stream={stream}
+                    offerings={{
+                      webrtc: !isWebRTCDisabled,
+                      mse: !isMseDisabled,
+                      hls: !isHlsDisabled,
+                    }}
+                    defaultTransport="webrtc"
+                    forcedTransport={forcedTransport}
                     useSubStream={!isSingleStream && fullscreenCellStream !== stream.name && (stream.has_sub_stream || !!stream.sub_stream_url)}
                     fullscreenUpgraded={!isSingleStream && fullscreenCellStream === stream.name && (stream.has_sub_stream || !!stream.sub_stream_url)}
                     onToggleFullscreen={toggleStreamFullscreen}
@@ -777,6 +928,9 @@ export function WebRTCView({ isWebRTCDisabled, isHlsDisabled, isMseDisabled }) {
                     showLabels={showLabels}
                     showControls={showControls}
                     globalShowDetections={showDetections}
+                    alwaysFullscreenOnTap={alwaysFullscreenOnTap && !reorderMode}
+                    onRequestReorder={orderedStreams.length > 1 ? enterReorderMode : undefined}
+                    mobileGesturesDisabled={reorderMode}
                   />
                 </div>
               );

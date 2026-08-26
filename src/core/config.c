@@ -23,6 +23,18 @@
 // Global configuration variable
 config_t g_config;
 
+bool playback_transport_is_valid(const char *value) {
+    if (!value) return false;
+    static const char *const valid_values[] = {
+        "auto", "webrtc_only", "mse_only", "hls_only",
+        "webrtc_then_mse", "mse_then_hls"
+    };
+    for (size_t i = 0; i < sizeof(valid_values) / sizeof(valid_values[0]); i++) {
+        if (strcmp(value, valid_values[i]) == 0) return true;
+    }
+    return false;
+}
+
 /**
  * Safe integer conversion from string using strtol.
  * Returns the converted value, or fallback on failure (empty string, non-numeric, overflow).
@@ -128,8 +140,9 @@ static const env_config_mapping_t env_config_mappings[] = {
     // Database settings
     {"DB_PATH",            CONFIG_TYPE_STRING, CONFIG_OFFSET(db_path),            MAX_PATH_LENGTH, "/var/lib/lightnvr/lightnvr.db", 0, false},
     {"DB_BACKUP_INTERVAL_MINUTES", CONFIG_TYPE_INT, CONFIG_OFFSET(db_backup_interval_minutes), 0, NULL, 60, false},
-    {"DB_BACKUP_RETENTION_COUNT",  CONFIG_TYPE_INT, CONFIG_OFFSET(db_backup_retention_count),  0, NULL, 24, false},
+    {"DB_BACKUP_RETENTION_COUNT",  CONFIG_TYPE_INT, CONFIG_OFFSET(db_backup_retention_count),  0, NULL, 6, false},
     {"DB_POST_BACKUP_SCRIPT",      CONFIG_TYPE_STRING, CONFIG_OFFSET(db_post_backup_script),    MAX_PATH_LENGTH, "", 0, false},
+    {"DB_STARTUP_CHECK",           CONFIG_TYPE_INT, CONFIG_OFFSET(db_startup_check),           0, NULL, DB_STARTUP_CHECK_QUICK, false},
 
     // Sentinel to mark end of array
     {NULL, CONFIG_TYPE_BOOL, 0, 0, NULL, 0, false}
@@ -280,7 +293,7 @@ void load_default_config(config_t *config) {
     memset(config, 0, sizeof(config_t));
 
     // --- Runtime stream limit ---
-    config->max_streams = 32; // default; overridden by [streams] max_streams in INI
+    config->max_streams = DEFAULT_MAX_STREAMS; // overridden by [streams] max_streams in INI
     config->streams = calloc(config->max_streams, sizeof(stream_config_t));
     if (!config->streams) {
         // Fatal: we can't run without a streams array. Caller will detect NULL.
@@ -358,6 +371,8 @@ void load_default_config(config_t *config) {
     config->default_post_detection_buffer = 10; // 10 seconds after detection
     config->detection_grace_period = 2;         // 2 seconds grace before post-buffer
     safe_strcpy(config->default_buffer_strategy, "auto", 32, 0); // Auto-select buffer strategy
+    safe_strcpy(config->default_playback_transport, "auto",
+                sizeof(config->default_playback_transport), 0);
 
     // In-process LiteRT detection engine defaults
     config->detection_engine.enabled = false;
@@ -367,8 +382,9 @@ void load_default_config(config_t *config) {
     // Database settings
     safe_strcpy(config->db_path, "/var/lib/lightnvr/lightnvr.db", MAX_PATH_LENGTH, 0);
     config->db_backup_interval_minutes = 60;
-    config->db_backup_retention_count = 24;
+    config->db_backup_retention_count = 6;
     config->db_post_backup_script[0] = '\0';
+    config->db_startup_check = DB_STARTUP_CHECK_QUICK;
     
     // Web server settings
     config->web_port = 8080;
@@ -376,7 +392,7 @@ void load_default_config(config_t *config) {
     safe_strcpy(config->web_root, "/var/lib/lightnvr/www", MAX_PATH_LENGTH, 0);
     config->web_auth_enabled = true;
     safe_strcpy(config->web_username, "admin", 32, 0);
-    // No default password - will be generated randomly on first run
+    // Blank means bootstrap admin/admin; db_auth_init requires first-login replacement.
     config->web_password[0] = '\0';
     config->webrtc_disabled = false; // WebRTC is enabled by default
     config->hls_disabled = false;    // HLS is enabled by default (#397)
@@ -592,6 +608,13 @@ int validate_config(config_t *config) {
         config->db_backup_retention_count = 0;
     }
 
+    if (config->db_startup_check < DB_STARTUP_CHECK_OFF ||
+        config->db_startup_check > DB_STARTUP_CHECK_FULL) {
+        log_warn("db startup_check (%d) out of range [%d,%d]; using quick",
+                 config->db_startup_check, DB_STARTUP_CHECK_OFF, DB_STARTUP_CHECK_FULL);
+        config->db_startup_check = DB_STARTUP_CHECK_QUICK;
+    }
+
     // Clamp capacity/pressure settings to sane ranges. min_free_pct must leave
     // room to actually record; anything above ~90% would evict everything.
     if (config->storage_min_free_pct < 0 || config->storage_min_free_pct > 90) {
@@ -803,6 +826,16 @@ static int config_ini_handler(void* user, const char* section, const char* name,
             config->db_backup_retention_count = safe_atoi(value, 0);
         } else if (strcmp(name, "post_backup_script") == 0) {
             safe_strcpy(config->db_post_backup_script, value, MAX_PATH_LENGTH, 0);
+        } else if (strcmp(name, "startup_check") == 0) {
+            if (strcasecmp(value, "off") == 0 || strcasecmp(value, "none") == 0) {
+                config->db_startup_check = DB_STARTUP_CHECK_OFF;
+            } else if (strcasecmp(value, "full") == 0) {
+                config->db_startup_check = DB_STARTUP_CHECK_FULL;
+            } else if (strcasecmp(value, "quick") == 0) {
+                config->db_startup_check = DB_STARTUP_CHECK_QUICK;
+            } else {
+                config->db_startup_check = safe_atoi(value, DB_STARTUP_CHECK_QUICK);
+            }
         }
     }
     // Web server settings
@@ -825,6 +858,15 @@ static int config_ini_handler(void* user, const char* section, const char* name,
             config->hls_disabled = (strcmp(value, "true") == 0 || strcmp(value, "1") == 0);
         } else if (strcmp(name, "mse_disabled") == 0) {
             config->mse_disabled = (strcmp(value, "true") == 0 || strcmp(value, "1") == 0);
+        } else if (strcmp(name, "default_playback_transport") == 0) {
+            if (playback_transport_is_valid(value)) {
+                safe_strcpy(config->default_playback_transport, value,
+                            sizeof(config->default_playback_transport), 0);
+            } else {
+                log_warn("Unknown default playback transport '%s'; using auto", value);
+                safe_strcpy(config->default_playback_transport, "auto",
+                            sizeof(config->default_playback_transport), 0);
+            }
         } else if (strcmp(name, "auth_timeout_hours") == 0) {
             config->auth_timeout_hours = safe_atoi(value, 0);
             if (config->auth_timeout_hours < 1) {
@@ -1103,7 +1145,8 @@ int load_stream_configs(config_t *config) {
                  count, max_streams);
     }
 
-    // Heap-allocate temporary buffer (stream_config_t is ~2 KB; stack array at 256 overflows)
+    // Heap-allocate the temporary buffer; stream_config_t is large and the
+    // configured capacity can be as high as MAX_STREAMS.
     stream_config_t *db_streams = calloc(load_capacity, sizeof(stream_config_t));
     if (!db_streams) {
         log_error("load_stream_configs: out of memory allocating %zu stream configs", load_capacity);
@@ -1127,7 +1170,7 @@ int load_stream_configs(config_t *config) {
 }
 
 // Save stream configurations to database with improved timeout protection
-int save_stream_configs(const config_t *config) {
+int save_stream_configs(config_t *config) {
     if (!config) return -1;
     
     int saved = 0;
@@ -1206,6 +1249,25 @@ int save_stream_configs(const config_t *config) {
         }
 
         if (identical) {
+            /* The database owns stable camera identity and location. Hydrate
+             * both even when no stream configuration write is necessary. */
+            for (int i = 0; i < config->max_streams; i++) {
+                if (config->streams[i].name[0] == '\0') {
+                    continue;
+                }
+                for (int j = 0; j < loaded; j++) {
+                    if (strcmp(config->streams[i].name,
+                               db_streams[j].name) == 0) {
+                        safe_strcpy(config->streams[i].camera_uuid,
+                                    db_streams[j].camera_uuid,
+                                    sizeof(config->streams[i].camera_uuid), 0);
+                        safe_strcpy(config->streams[i].location_uuid,
+                                    db_streams[j].location_uuid,
+                                    sizeof(config->streams[i].location_uuid), 0);
+                        break;
+                    }
+                }
+            }
             log_info("Stream configurations unchanged, skipping update");
             free(db_streams);
             commit_transaction();
@@ -1229,9 +1291,19 @@ int save_stream_configs(const config_t *config) {
     // Add stream configurations to database
     for (int i = 0; i < config->max_streams; i++) {
         if (strlen(config->streams[i].name) > 0) {
+            char stream_name[MAX_STREAM_NAME];
+            safe_strcpy(stream_name, config->streams[i].name,
+                        sizeof(stream_name), 0);
             uint64_t result = add_stream_config(&config->streams[i]);
             if (result == 0) {
-                log_error("Failed to add stream configuration: %s", config->streams[i].name);
+                log_error("Failed to add stream configuration: %s", stream_name);
+                rollback_transaction();
+                return -1;
+            }
+            if (get_stream_config_by_name(stream_name,
+                                          &config->streams[i]) != 0) {
+                log_error("Failed to reload stable identity for stream: %s",
+                          stream_name);
                 rollback_transaction();
                 return -1;
             }
@@ -1663,6 +1735,9 @@ int save_config(const config_t *config, const char *path) {
             config->db_backup_interval_minutes);
     fprintf(file, "backup_retention_count = %d  ; Number of timestamped backups to keep\n",
             config->db_backup_retention_count);
+    fprintf(file, "startup_check = %s  ; Boot consistency check: off, quick (default), or full\n",
+            config->db_startup_check == DB_STARTUP_CHECK_OFF ? "off" :
+            config->db_startup_check == DB_STARTUP_CHECK_FULL ? "full" : "quick");
     fprintf(file, "post_backup_script = %s  ; Optional absolute path to executable hook\n\n",
             config->db_post_backup_script);
     
@@ -1678,6 +1753,8 @@ int save_config(const config_t *config, const char *path) {
     fprintf(file, "webrtc_disabled = %s  ; Hide WebRTC view on dashboard\n", config->webrtc_disabled ? "true" : "false");
     fprintf(file, "hls_disabled = %s     ; Hide HLS view on dashboard\n", config->hls_disabled ? "true" : "false");
     fprintf(file, "mse_disabled = %s     ; Hide MSE view on dashboard\n", config->mse_disabled ? "true" : "false");
+    fprintf(file, "default_playback_transport = %s  ; Default transport profile for new streams\n",
+            config->default_playback_transport);
     fprintf(file, "auth_timeout_hours = %d  ; Session idle timeout in hours (default: 24)\n", config->auth_timeout_hours);
     fprintf(file, "auth_absolute_timeout_hours = %d  ; Absolute session lifetime in hours (default: 168)\n", config->auth_absolute_timeout_hours);
     fprintf(file, "trusted_device_days = %d  ; Remember trusted device for N days (0 disables, default: 30)\n", config->trusted_device_days);
@@ -1691,8 +1768,8 @@ int save_config(const config_t *config, const char *path) {
 
     // Write stream settings
     fprintf(file, "[streams]\n");
-    fprintf(file, "max_streams = %d  ; Runtime stream slot limit (default: 32, ceiling: %d; requires restart)\n\n",
-            config->max_streams, MAX_STREAMS);
+    fprintf(file, "max_streams = %d  ; Runtime stream slot limit (default: %d, ceiling: %d; requires restart)\n\n",
+            config->max_streams, DEFAULT_MAX_STREAMS, MAX_STREAMS);
     
     // Write memory optimization settings
     fprintf(file, "[memory]\n");
@@ -1810,6 +1887,9 @@ void print_config(const config_t *config) {
     printf("    Database Path: %s\n", config->db_path);
     printf("    Backup Interval: %d minutes\n", config->db_backup_interval_minutes);
     printf("    Backup Retention Count: %d\n", config->db_backup_retention_count);
+    printf("    Startup Check: %s\n",
+           config->db_startup_check == DB_STARTUP_CHECK_OFF ? "off" :
+           config->db_startup_check == DB_STARTUP_CHECK_FULL ? "full" : "quick");
     printf("    Post-backup Script: %s\n",
            config->db_post_backup_script[0] ? config->db_post_backup_script : "(disabled)");
     

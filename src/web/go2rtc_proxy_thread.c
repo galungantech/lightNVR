@@ -18,9 +18,12 @@
 #include <pthread.h>
 #include <unistd.h>
 #include <strings.h>
+#include <time.h>
 #include <curl/curl.h>
 
 #include "web/go2rtc_proxy_thread.h"
+#include "web/api_handlers_go2rtc_proxy.h"
+#include "web/httpd_utils.h"
 #include "web/libuv_connection.h"
 #include "web/request_response.h"
 #include "core/config.h"
@@ -45,11 +48,15 @@
  */
 typedef struct proxy_thread_ctx {
     // Captured request data
+    http_request_t request;      // inline copy; body points to body below
     char url[2048];
     char method[16];
     char *body;                 // malloc'd copy, NULL if no body
     size_t body_len;
     char content_type[256];
+    bool capture_hls_session;
+    char capture_stream_name[MAX_STREAM_NAME];
+    char auth_fingerprint[65];
     write_complete_action_t action;
 
     // Connection for response delivery (safe only on event-loop thread)
@@ -61,6 +68,8 @@ typedef struct proxy_thread_ctx {
     char response_content_type[256];
     long http_code;
     bool error;
+    bool authorization_denied;
+    http_response_t auth_response;
 
     // Intrusive linked-list node for the done queue
     struct proxy_thread_ctx *next;
@@ -143,6 +152,14 @@ static proxy_thread_ctx_t *dequeue_all_done(void) {
     return head;
 }
 
+static void free_proxy_context(proxy_thread_ctx_t *ctx) {
+    if (!ctx) return;
+    if (ctx->response_buffer) free(ctx->response_buffer);
+    if (ctx->body) free(ctx->body);
+    http_response_free(&ctx->auth_response);
+    safe_free(ctx);
+}
+
 
 
 // ============================================================================
@@ -152,6 +169,35 @@ static proxy_thread_ctx_t *dequeue_all_done(void) {
 static void *proxy_worker_thread(void *arg) {
     log_set_thread_context("go2rtcProxy", NULL);
     proxy_thread_ctx_t *ctx = (proxy_thread_ctx_t *)arg;
+
+    // Scoped authorization may perform session/token lookups, camera policy
+    // checks and audit writes.  It must not run in llhttp's message-complete
+    // callback because that callback owns the sole libuv event-loop thread.
+    struct timespec auth_started;
+    struct timespec auth_finished;
+    clock_gettime(CLOCK_MONOTONIC, &auth_started);
+    if (!go2rtc_proxy_authorize_request(&ctx->request,
+                                        &ctx->auth_response)) {
+        ctx->authorization_denied = true;
+    }
+    clock_gettime(CLOCK_MONOTONIC, &auth_finished);
+    long auth_elapsed_ms =
+        (auth_finished.tv_sec - auth_started.tv_sec) * 1000L +
+        (auth_finished.tv_nsec - auth_started.tv_nsec) / 1000000L;
+    if (auth_elapsed_ms >= 250) {
+        log_warn("go2rtc proxy authorization took %ld ms for %s",
+                 auth_elapsed_ms, ctx->request.path);
+    }
+    if (ctx->authorization_denied) goto done;
+
+    if (strstr(ctx->request.path, "/api/stream.m3u8") &&
+        http_request_get_query_param(&ctx->request, "src",
+                                     ctx->capture_stream_name,
+                                     sizeof(ctx->capture_stream_name)) >= 0 &&
+        httpd_request_auth_fingerprint(&ctx->request,
+                                       ctx->auth_fingerprint) == 0) {
+        ctx->capture_hls_session = true;
+    }
 
     CURL *curl = curl_easy_init();
     if (!curl) {
@@ -204,6 +250,12 @@ static void *proxy_worker_thread(void *arg) {
         if (cres != CURLE_OK || ctx->error) {
             log_warn("go2rtc proxy thread: curl failed: %s", curl_easy_strerror(cres));
             ctx->error = true;
+        } else {
+            if (ctx->capture_hls_session) {
+                go2rtc_proxy_capture_hls_sessions_for(
+                    ctx->capture_stream_name, ctx->auth_fingerprint,
+                    ctx->response_buffer, ctx->response_size);
+            }
         }
     }
 
@@ -228,14 +280,20 @@ static void proxy_async_cb(uv_async_t *handle) {
 
         if (g_proxy_state.shutting_down) {
             // Server shutting down — connection may already be torn down
-            if (ctx->response_buffer) free(ctx->response_buffer);
-            if (ctx->body) free(ctx->body);
-            safe_free(ctx);
+            free_proxy_context(ctx);
             ctx = next;
             continue;
         }
 
-        if (ctx->error || ctx->http_code == 0) {
+        if (ctx->authorization_denied) {
+            // Transfer the worker-owned response, including an allocated JSON
+            // error body, to the connection before sending it on the loop.
+            http_response_free(&conn->response);
+            conn->response = ctx->auth_response;
+            ctx->auth_response.body = NULL;
+            ctx->auth_response.body_length = 0;
+            ctx->auth_response.body_allocated = false;
+        } else if (ctx->error || ctx->http_code == 0) {
             http_response_set_json_error(&conn->response, 502,
                                          "Proxy error: go2rtc is not responding");
         } else {
@@ -261,9 +319,7 @@ static void proxy_async_cb(uv_async_t *handle) {
         conn->async_response_pending = false;
         libuv_send_response_ex(conn, &conn->response, ctx->action);
 
-        if (ctx->response_buffer) free(ctx->response_buffer);
-        if (ctx->body) free(ctx->body);
-        safe_free(ctx);
+        free_proxy_context(ctx);
         ctx = next;
     }
 }
@@ -335,6 +391,11 @@ int go2rtc_proxy_thread_submit(libuv_connection_t *conn, write_complete_action_t
         log_error("go2rtc_proxy_thread_submit: Failed to allocate context");
         return -1;
     }
+    ctx->request = *req;
+    ctx->request.user_data = NULL;
+    ctx->request.body = NULL;
+    ctx->request.body_len = 0;
+    http_response_init(&ctx->auth_response);
 
     // Forward the full path as-is. go2rtc is configured with base_path: /go2rtc
     // (see GO2RTC_BASE_PATH), so it serves /go2rtc/api/streams directly.
@@ -355,11 +416,13 @@ int go2rtc_proxy_thread_submit(libuv_connection_t *conn, write_complete_action_t
         ctx->body = malloc(req->body_len);
         if (!ctx->body) {
             log_error("go2rtc_proxy_thread_submit: Failed to copy request body");
-            safe_free(ctx);
+            free_proxy_context(ctx);
             return -1;
         }
         memcpy(ctx->body, req->body, req->body_len);
         ctx->body_len = req->body_len;
+        ctx->request.body = ctx->body;
+        ctx->request.body_len = ctx->body_len;
     }
 
     conn->async_response_pending = true;
@@ -375,8 +438,7 @@ int go2rtc_proxy_thread_submit(libuv_connection_t *conn, write_complete_action_t
         pthread_attr_destroy(&attr);
         __sync_sub_and_fetch(&g_proxy_state.active_count, 1);
         conn->async_response_pending = false;
-        if (ctx->body) free(ctx->body);
-        safe_free(ctx);
+        free_proxy_context(ctx);
         return -1;
     }
 
@@ -411,9 +473,7 @@ void go2rtc_proxy_thread_shutdown(void) {
     proxy_thread_ctx_t *ctx = g_proxy_state.done_head;
     while (ctx) {
         proxy_thread_ctx_t *next = ctx->next;
-        if (ctx->response_buffer) free(ctx->response_buffer);
-        if (ctx->body) free(ctx->body);
-        safe_free(ctx);
+        free_proxy_context(ctx);
         ctx = next;
     }
 

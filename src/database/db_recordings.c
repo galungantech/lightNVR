@@ -13,6 +13,7 @@
 
 #include "database/db_recordings.h"
 #include "database/db_core.h"
+#include "database/db_storage_targets.h"
 #include "core/logger.h"
 #include "utils/strings.h"
 
@@ -75,12 +76,43 @@ uint64_t add_recording_metadata(const recording_metadata_t *metadata) {
         return 0;
     }
 
+    char target_uuid[LIGHTNVR_UUID_STRING_SIZE] = {0};
+    char object_key[STORAGE_TARGET_OBJECT_KEY_MAX] = {0};
+    const char *placement_reason = metadata->placement_reason[0]
+        ? metadata->placement_reason : "default-target";
+    int64_t policy_version = metadata->storage_policy_version;
+    bool has_target_uuid = metadata->storage_target_uuid[0] != '\0';
+    bool has_object_key = metadata->object_key[0] != '\0';
+    if (has_target_uuid != has_object_key) {
+        log_error("Recording storage identity requires both target UUID and object key");
+        return 0;
+    }
+    if (has_target_uuid) {
+        char resolved_path[MAX_PATH_LENGTH];
+        if (db_storage_target_resolve_path(metadata->storage_target_uuid,
+                                           metadata->object_key,
+                                           resolved_path) != 0 ||
+            strcmp(resolved_path, metadata->file_path) != 0) {
+            log_error("Recording storage identity does not resolve to its file path");
+            return 0;
+        }
+        safe_strcpy(target_uuid, metadata->storage_target_uuid,
+                    sizeof(target_uuid), 0);
+        safe_strcpy(object_key, metadata->object_key, sizeof(object_key), 0);
+    } else {
+        (void)db_storage_target_classify_path(metadata->file_path, target_uuid,
+                                              object_key);
+    }
+
     pthread_mutex_lock(db_mutex);
 
     const char *sql = "INSERT INTO recordings (stream_name, file_path, start_time, end_time, "
                       "size_bytes, width, height, fps, codec, is_complete, trigger_type, "
-                      "retention_tier, disk_pressure_eligible, schedule_restricted) "
-                      "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);";
+                      "retention_tier, disk_pressure_eligible, schedule_restricted, camera_uuid, "
+                      "storage_target_uuid, object_key, placement_reason, storage_policy_version) "
+                      "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, "
+                      "COALESCE(NULLIF(?, ''), "
+                      "(SELECT camera_uuid FROM streams WHERE name = ?)), ?, ?, ?, ?);";
 
     rc = sqlite3_prepare_v2(db, sql, -1, &stmt, NULL);
     if (rc != SQLITE_OK) {
@@ -134,6 +166,19 @@ uint64_t add_recording_metadata(const recording_metadata_t *metadata) {
     } else {
         sqlite3_bind_int(stmt, 14, metadata->schedule_restricted ? 1 : 0);
     }
+    sqlite3_bind_text(stmt, 15, metadata->camera_uuid, -1, SQLITE_STATIC);
+    sqlite3_bind_text(stmt, 16, metadata->stream_name, -1, SQLITE_STATIC);
+    if (target_uuid[0]) {
+        sqlite3_bind_text(stmt, 17, target_uuid, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(stmt, 18, object_key, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(stmt, 19, placement_reason, -1, SQLITE_TRANSIENT);
+    } else {
+        sqlite3_bind_null(stmt, 17);
+        sqlite3_bind_null(stmt, 18);
+        sqlite3_bind_null(stmt, 19);
+    }
+    if (policy_version > 0) sqlite3_bind_int64(stmt, 20, policy_version);
+    else sqlite3_bind_null(stmt, 20);
 
     // Execute statement
     rc = sqlite3_step(stmt);
@@ -273,11 +318,13 @@ int get_recording_metadata_by_id(uint64_t id, recording_metadata_t *metadata) {
 
     pthread_mutex_lock(db_mutex);
 
-    const char *sql = "SELECT id, stream_name, file_path, start_time, end_time, "
+    const char *sql = "SELECT r.id, r.stream_name, r.file_path, "
+                      "r.start_time, r.end_time, "
                       "size_bytes, width, height, fps, codec, is_complete, trigger_type, "
                       "protected, retention_override_days, retention_tier, disk_pressure_eligible, "
-                      "schedule_restricted "
-                      "FROM recordings WHERE id = ?;";
+                      "schedule_restricted, camera_uuid, r.storage_target_uuid, "
+                      "r.object_key, r.placement_reason, r.storage_policy_version "
+                      "FROM recordings r WHERE r.id = ?;";
 
     rc = sqlite3_prepare_v2(db, sql, -1, &stmt, NULL);
     if (rc != SQLITE_OK) {
@@ -352,6 +399,24 @@ int get_recording_metadata_by_id(uint64_t id, recording_metadata_t *metadata) {
             ? (sqlite3_column_int(stmt, 15) != 0) : true;
         metadata->schedule_restricted = (sqlite3_column_type(stmt, 16) != SQLITE_NULL)
             ? (sqlite3_column_int(stmt, 16) != 0) : -1;
+        const char *camera_uuid = (const char *)sqlite3_column_text(stmt, 17);
+        safe_strcpy(metadata->camera_uuid, camera_uuid ? camera_uuid : "",
+                    sizeof(metadata->camera_uuid), 0);
+        const char *target_uuid = (const char *)sqlite3_column_text(stmt, 18);
+        safe_strcpy(metadata->storage_target_uuid,
+                    target_uuid ? target_uuid : "",
+                    sizeof(metadata->storage_target_uuid), 0);
+        const char *object_key = (const char *)sqlite3_column_text(stmt, 19);
+        safe_strcpy(metadata->object_key, object_key ? object_key : "",
+                    sizeof(metadata->object_key), 0);
+        const char *placement_reason =
+            (const char *)sqlite3_column_text(stmt, 20);
+        safe_strcpy(metadata->placement_reason,
+                    placement_reason ? placement_reason : "",
+                    sizeof(metadata->placement_reason), 0);
+        metadata->storage_policy_version =
+            sqlite3_column_type(stmt, 21) == SQLITE_NULL
+                ? 0 : sqlite3_column_int64(stmt, 21);
 
         result = 0; // Success
     }
@@ -359,6 +424,20 @@ int get_recording_metadata_by_id(uint64_t id, recording_metadata_t *metadata) {
     // Finalize the prepared statement
     sqlite3_finalize(stmt);
     pthread_mutex_unlock(db_mutex);
+
+    if (result == 0 && metadata->storage_target_uuid[0] &&
+        metadata->object_key[0]) {
+        char resolved_path[MAX_PATH_LENGTH];
+        if (db_storage_target_resolve_path(metadata->storage_target_uuid,
+                                           metadata->object_key,
+                                           resolved_path) == 0) {
+            safe_strcpy(metadata->file_path, resolved_path,
+                        sizeof(metadata->file_path), 0);
+        } else {
+            log_warn("Could not resolve storage identity for recording %llu; using compatibility path",
+                     (unsigned long long)id);
+        }
+    }
 
     return result;
 }
@@ -387,7 +466,7 @@ int get_recording_metadata_by_path(const char *file_path, recording_metadata_t *
     const char *sql = "SELECT id, stream_name, file_path, start_time, end_time, "
                       "size_bytes, width, height, fps, codec, is_complete, trigger_type, "
                       "protected, retention_override_days, retention_tier, disk_pressure_eligible, "
-                      "schedule_restricted "
+                      "schedule_restricted, camera_uuid "
                       "FROM recordings WHERE file_path = ?;";
 
     rc = sqlite3_prepare_v2(db, sql, -1, &stmt, NULL);
@@ -459,6 +538,9 @@ int get_recording_metadata_by_path(const char *file_path, recording_metadata_t *
             ? (sqlite3_column_int(stmt, 15) != 0) : true;
         metadata->schedule_restricted = (sqlite3_column_type(stmt, 16) != SQLITE_NULL)
             ? (sqlite3_column_int(stmt, 16) != 0) : -1;
+        const char *camera_uuid = (const char *)sqlite3_column_text(stmt, 17);
+        safe_strcpy(metadata->camera_uuid, camera_uuid ? camera_uuid : "",
+                    sizeof(metadata->camera_uuid), 0);
 
         result = 0; // Success
     }
@@ -497,7 +579,7 @@ int get_recording_metadata(time_t start_time, time_t end_time,
     snprintf(sql, sizeof(sql), "SELECT id, stream_name, file_path, start_time, end_time, "
                  "size_bytes, width, height, fps, codec, is_complete, trigger_type, "
                  "protected, retention_override_days, retention_tier, disk_pressure_eligible, "
-                 "schedule_restricted "
+                 "schedule_restricted, camera_uuid "
                  "FROM recordings WHERE is_complete = 1 AND end_time IS NOT NULL"); // Only complete recordings with end_time set
 
     if (start_time > 0) {
@@ -604,6 +686,10 @@ int get_recording_metadata(time_t start_time, time_t end_time,
                 ? (sqlite3_column_int(stmt, 15) != 0) : true;
             metadata[count].schedule_restricted = (sqlite3_column_type(stmt, 16) != SQLITE_NULL)
                 ? (sqlite3_column_int(stmt, 16) != 0) : -1;
+            const char *camera_uuid = (const char *)sqlite3_column_text(stmt, 17);
+            safe_strcpy(metadata[count].camera_uuid,
+                        camera_uuid ? camera_uuid : "",
+                        sizeof(metadata[count].camera_uuid), 0);
 
             count++;
         }
@@ -728,8 +814,10 @@ int get_recording_count(time_t start_time, time_t end_time,
             safe_strcat(sql, "?", sizeof(sql));
         }
         safe_strcat(sql, ")", sizeof(sql));
-    } else if (allowed_streams && allowed_streams_count > 0) {
-        // Tag-based RBAC: restrict to the user's whitelisted streams via IN clause
+    }
+    if (allowed_streams && allowed_streams_count > 0) {
+        // Server-resolved policy/collection scope intersects any explicit
+        // stream predicate; one must never replace the other.
         safe_strcat(sql, " AND r.stream_name IN (", sizeof(sql));
         for (int i = 0; i < allowed_streams_count; i++) {
             if (i > 0) safe_strcat(sql, ",", sizeof(sql));
@@ -816,7 +904,8 @@ int get_recording_count(time_t start_time, time_t end_time,
         for (int i = 0; i < stream_filter_count; i++) {
             sqlite3_bind_text(stmt, param_index++, stream_filters[i], -1, SQLITE_TRANSIENT);
         }
-    } else if (allowed_streams && allowed_streams_count > 0) {
+    }
+    if (allowed_streams && allowed_streams_count > 0) {
         for (int i = 0; i < allowed_streams_count; i++) {
             sqlite3_bind_text(stmt, param_index++, allowed_streams[i], -1, SQLITE_STATIC);
         }
@@ -917,7 +1006,7 @@ int get_recording_metadata_paginated(time_t start_time, time_t end_time,
             "SELECT r.id, r.stream_name, r.file_path, r.start_time, r.end_time, "
             "r.size_bytes, r.width, r.height, r.fps, r.codec, r.is_complete, r.trigger_type, "
             "r.protected, r.retention_override_days, r.retention_tier, r.disk_pressure_eligible, "
-            "r.schedule_restricted "
+            "r.schedule_restricted, r.camera_uuid "
             "FROM recordings r WHERE r.is_complete = 1 AND r.end_time IS NOT NULL");
 
     if (has_detection == 1) {
@@ -993,8 +1082,10 @@ int get_recording_metadata_paginated(time_t start_time, time_t end_time,
             safe_strcat(sql, "?", sizeof(sql));
         }
         safe_strcat(sql, ")", sizeof(sql));
-    } else if (allowed_streams && allowed_streams_count > 0) {
-        // Tag-based RBAC: restrict to the user's whitelisted streams via IN clause
+    }
+    if (allowed_streams && allowed_streams_count > 0) {
+        // Server-resolved policy/collection scope intersects any explicit
+        // stream predicate; one must never replace the other.
         safe_strcat(sql, " AND r.stream_name IN (", sizeof(sql));
         for (int i = 0; i < allowed_streams_count; i++) {
             if (i > 0) safe_strcat(sql, ",", sizeof(sql));
@@ -1091,7 +1182,8 @@ int get_recording_metadata_paginated(time_t start_time, time_t end_time,
         for (int i = 0; i < stream_filter_count; i++) {
             sqlite3_bind_text(stmt, param_index++, stream_filters[i], -1, SQLITE_TRANSIENT);
         }
-    } else if (allowed_streams && allowed_streams_count > 0) {
+    }
+    if (allowed_streams && allowed_streams_count > 0) {
         for (int i = 0; i < allowed_streams_count; i++) {
             sqlite3_bind_text(stmt, param_index++, allowed_streams[i], -1, SQLITE_STATIC);
         }
@@ -1173,6 +1265,10 @@ int get_recording_metadata_paginated(time_t start_time, time_t end_time,
                 ? (sqlite3_column_int(stmt, 15) != 0) : true;
             metadata[count].schedule_restricted = (sqlite3_column_type(stmt, 16) != SQLITE_NULL)
                 ? (sqlite3_column_int(stmt, 16) != 0) : -1;
+            const char *camera_uuid = (const char *)sqlite3_column_text(stmt, 17);
+            safe_strcpy(metadata[count].camera_uuid,
+                        camera_uuid ? camera_uuid : "",
+                        sizeof(metadata[count].camera_uuid), 0);
 
             count++;
         }
@@ -1467,6 +1563,57 @@ int get_protected_recordings_count(const char *stream_name) {
     pthread_mutex_unlock(db_mutex);
 
     return count;
+}
+
+int get_protected_recordings_count_for_streams(
+    const char *const *stream_names, int stream_count) {
+    if (!stream_names || stream_count <= 0) return 0;
+    sqlite3 *db = get_db_handle();
+    pthread_mutex_t *db_mutex = get_db_mutex();
+    if (!db || !db_mutex) return -1;
+    pthread_mutex_lock(db_mutex);
+    int variable_limit = sqlite3_limit(db, SQLITE_LIMIT_VARIABLE_NUMBER, -1);
+    int batch_limit = variable_limit > 0 ? variable_limit : 1;
+    if (batch_limit > 256) batch_limit = 256;
+    int total = 0;
+    bool failed = false;
+    for (int offset = 0; offset < stream_count; offset += batch_limit) {
+        int batch_count = stream_count - offset;
+        if (batch_count > batch_limit) batch_count = batch_limit;
+        size_t sql_size = 128 + (size_t)batch_count * 3;
+        char *sql = calloc(sql_size, 1);
+        if (!sql) {
+            failed = true;
+            break;
+        }
+        safe_strcpy(sql,
+                    "SELECT COUNT(*) FROM recordings WHERE protected=1 "
+                    "AND stream_name IN (", sql_size, 0);
+        for (int i = 0; i < batch_count; i++) {
+            safe_strcat(sql, i == 0 ? "?" : ",?", sql_size);
+        }
+        safe_strcat(sql, ");", sql_size);
+        sqlite3_stmt *stmt = NULL;
+        int rc = sqlite3_prepare_v2(db, sql, -1, &stmt, NULL);
+        free(sql);
+        if (rc == SQLITE_OK) {
+            for (int i = 0; i < batch_count; i++) {
+                sqlite3_bind_text(stmt, i + 1, stream_names[offset + i], -1,
+                                  SQLITE_TRANSIENT);
+            }
+            if (sqlite3_step(stmt) == SQLITE_ROW) {
+                total += sqlite3_column_int(stmt, 0);
+            } else {
+                failed = true;
+            }
+        } else {
+            failed = true;
+        }
+        if (stmt) sqlite3_finalize(stmt);
+        if (failed) break;
+    }
+    pthread_mutex_unlock(db_mutex);
+    return failed ? -1 : total;
 }
 
 
@@ -2048,8 +2195,9 @@ int get_recordings_for_tiered_retention(const char *stream_name,
  * lower retention tier first, then no manual override, then non-detection,
  * then oldest first; protected recordings are excluded.
  */
-int get_recordings_for_pressure_cleanup(recording_metadata_t *recordings,
-                                        int max_count) {
+static int get_pressure_cleanup_recordings(
+    const char *storage_target_uuid, bool include_unattributed,
+    recording_metadata_t *recordings, int max_count) {
     int rc;
     sqlite3_stmt *stmt;
     int count = 0;
@@ -2062,18 +2210,21 @@ int get_recordings_for_pressure_cleanup(recording_metadata_t *recordings,
         return -1;
     }
 
-    if (!recordings || max_count <= 0) {
+    if (!recordings || max_count <= 0 ||
+        (storage_target_uuid && storage_target_uuid[0] == '\0')) {
         log_error("Invalid parameters for get_recordings_for_pressure_cleanup");
         return -1;
     }
 
     pthread_mutex_lock(db_mutex);
 
-    const char *sql =
+    const char *global_sql =
         "SELECT id, stream_name, file_path, start_time, end_time, "
         "size_bytes, width, height, fps, codec, is_complete, trigger_type, "
         "protected, retention_override_days, retention_tier, disk_pressure_eligible, "
-        "schedule_restricted "
+        "schedule_restricted, COALESCE(storage_target_uuid,''), "
+        "COALESCE(object_key,''), COALESCE(placement_reason,''), "
+        "COALESCE(storage_policy_version,0) "
         "FROM recordings "
         "WHERE protected = 0 "
         "AND disk_pressure_eligible = 1 "
@@ -2083,15 +2234,65 @@ int get_recordings_for_pressure_cleanup(recording_metadata_t *recordings,
         "CASE WHEN trigger_type = 'detection' THEN 1 ELSE 0 END ASC, "
         "start_time ASC "
         "LIMIT ?;";
+    const char *target_sql =
+        "SELECT id, stream_name, file_path, start_time, end_time, "
+        "size_bytes, width, height, fps, codec, is_complete, trigger_type, "
+        "protected, retention_override_days, retention_tier, disk_pressure_eligible, "
+        "schedule_restricted, COALESCE(storage_target_uuid,''), "
+        "COALESCE(object_key,''), COALESCE(placement_reason,''), "
+        "COALESCE(storage_policy_version,0) "
+        "FROM recordings "
+        "WHERE protected = 0 "
+        "AND disk_pressure_eligible = 1 "
+        "AND is_complete = 1 "
+        "AND storage_target_uuid = ? "
+        "ORDER BY retention_tier DESC, "
+        "CASE WHEN retention_override_days IS NULL OR retention_override_days < 0 THEN 0 ELSE 1 END ASC, "
+        "CASE WHEN trigger_type = 'detection' THEN 1 ELSE 0 END ASC, "
+        "start_time ASC "
+        "LIMIT ?;";
+    /*
+     * Same as target_sql but also returns rows written before storage target
+     * attribution existed, or whose path the bootstrap could not classify.
+     * Only the default target may ask for these: they carry no evidence of
+     * which target holds them, so no other target may claim them.
+     */
+    const char *default_target_sql =
+        "SELECT id, stream_name, file_path, start_time, end_time, "
+        "size_bytes, width, height, fps, codec, is_complete, trigger_type, "
+        "protected, retention_override_days, retention_tier, disk_pressure_eligible, "
+        "schedule_restricted, COALESCE(storage_target_uuid,''), "
+        "COALESCE(object_key,''), COALESCE(placement_reason,''), "
+        "COALESCE(storage_policy_version,0) "
+        "FROM recordings "
+        "WHERE protected = 0 "
+        "AND disk_pressure_eligible = 1 "
+        "AND is_complete = 1 "
+        "AND (storage_target_uuid = ? OR storage_target_uuid IS NULL) "
+        "ORDER BY retention_tier DESC, "
+        "CASE WHEN retention_override_days IS NULL OR retention_override_days < 0 THEN 0 ELSE 1 END ASC, "
+        "CASE WHEN trigger_type = 'detection' THEN 1 ELSE 0 END ASC, "
+        "start_time ASC "
+        "LIMIT ?;";
 
-    rc = sqlite3_prepare_v2(db, sql, -1, &stmt, NULL);
+    const char *selected_sql = global_sql;
+    if (storage_target_uuid) {
+        selected_sql = include_unattributed ? default_target_sql : target_sql;
+    }
+    rc = sqlite3_prepare_v2(db, selected_sql, -1, &stmt, NULL);
     if (rc != SQLITE_OK) {
         log_error("Failed to prepare pressure cleanup query: %s", sqlite3_errmsg(db));
         pthread_mutex_unlock(db_mutex);
         return -1;
     }
 
-    sqlite3_bind_int(stmt, 1, max_count);
+    int limit_parameter = 1;
+    if (storage_target_uuid) {
+        sqlite3_bind_text(stmt, 1, storage_target_uuid, -1,
+                          SQLITE_TRANSIENT);
+        limit_parameter = 2;
+    }
+    sqlite3_bind_int(stmt, limit_parameter, max_count);
 
     while (sqlite3_step(stmt) == SQLITE_ROW && count < max_count) {
         recordings[count].id = (uint64_t)sqlite3_column_int64(stmt, 0);
@@ -2138,6 +2339,22 @@ int get_recordings_for_pressure_cleanup(recording_metadata_t *recordings,
         recordings[count].schedule_restricted = (sqlite3_column_type(stmt, 16) != SQLITE_NULL)
             ? (sqlite3_column_int(stmt, 16) != 0) : -1;
 
+        const char *target_uuid = (const char *)sqlite3_column_text(stmt, 17);
+        const char *object_key = (const char *)sqlite3_column_text(stmt, 18);
+        const char *placement_reason =
+            (const char *)sqlite3_column_text(stmt, 19);
+        safe_strcpy(recordings[count].storage_target_uuid,
+                    target_uuid ? target_uuid : "",
+                    sizeof(recordings[count].storage_target_uuid), 0);
+        safe_strcpy(recordings[count].object_key,
+                    object_key ? object_key : "",
+                    sizeof(recordings[count].object_key), 0);
+        safe_strcpy(recordings[count].placement_reason,
+                    placement_reason ? placement_reason : "",
+                    sizeof(recordings[count].placement_reason), 0);
+        recordings[count].storage_policy_version =
+            sqlite3_column_int64(stmt, 20);
+
         count++;
     }
 
@@ -2146,6 +2363,25 @@ int get_recordings_for_pressure_cleanup(recording_metadata_t *recordings,
 
     log_info("Found %d recordings eligible for disk pressure cleanup", count);
     return count;
+}
+
+int get_recordings_for_pressure_cleanup(recording_metadata_t *recordings,
+                                        int max_count) {
+    return get_pressure_cleanup_recordings(NULL, false, recordings, max_count);
+}
+
+int get_recordings_for_pressure_cleanup_target(
+    const char *storage_target_uuid, recording_metadata_t *recordings,
+    int max_count) {
+    return get_pressure_cleanup_recordings(storage_target_uuid, false,
+                                           recordings, max_count);
+}
+
+int get_recordings_for_pressure_cleanup_default_target(
+    const char *storage_target_uuid, recording_metadata_t *recordings,
+    int max_count) {
+    return get_pressure_cleanup_recordings(storage_target_uuid, true,
+                                           recordings, max_count);
 }
 
 /**

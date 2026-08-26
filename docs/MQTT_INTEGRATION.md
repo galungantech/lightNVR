@@ -1,6 +1,8 @@
 # MQTT Integration for Detection Event Streaming
 
-LightNVR can publish detection events to an MQTT broker in real-time, enabling integration with home automation systems, custom alerting, and external processing pipelines.
+LightNVR can publish normalized operational events and detection-compatible
+messages to an MQTT broker in real-time, enabling integration with home
+automation systems, custom alerting, and external processing pipelines.
 
 ## What is MQTT?
 
@@ -65,7 +67,8 @@ broker_port = 1883
 ; Client ID (must be unique per client)
 client_id = lightnvr
 
-; Topic prefix - events published to: {topic_prefix}/detections/{stream_name}
+; Topic prefix - normalized events: {topic_prefix}/v1/events/...
+; Legacy detection compatibility: {topic_prefix}/detections/{stream_name}
 topic_prefix = lightnvr
 
 ; TLS encryption (requires broker TLS support)
@@ -97,7 +100,10 @@ pkill lightnvr && ./lightnvr -c /path/to/lightnvr.ini
 Open a terminal and subscribe to all LightNVR detection events:
 
 ```bash
-# Subscribe to all detection events
+# Subscribe to all normalized events (recommended)
+mosquitto_sub -h localhost -t "lightnvr/v1/events/#" -v
+
+# Subscribe to legacy detection compatibility events
 mosquitto_sub -h localhost -t "lightnvr/detections/#" -v
 ```
 
@@ -108,9 +114,105 @@ To subscribe to a specific stream:
 mosquitto_sub -h localhost -t "lightnvr/detections/front_door" -v
 ```
 
-## Message Format
+## Normalized Event Format (Recommended)
 
-Detection events are published as JSON with the following structure:
+New integrations should subscribe to:
+
+`{topic_prefix}/v1/events/{type}/{camera_uuid}`
+
+For example:
+
+`lightnvr/v1/events/io.lightnvr.detection.object.v1/22222222-2222-4222-8222-222222222222`
+
+The payload is the versioned [lightNVR event envelope](EVENT_CONTRACT.md). Camera
+identity comes from the immutable UUID in `subject`, while `data.stream_name` is
+display and legacy-routing metadata. Transient event messages are not retained.
+Detection and capture threads only enqueue these events. Normalized envelopes
+are persisted in SQLite and published by a dedicated delivery worker; snapshot
+capture, the legacy payload, and Home Assistant state updates remain on the
+asynchronous compatibility worker.
+
+The normalized path survives broker outages and process restarts. It waits for
+libmosquitto's QoS-specific completion signal (PUBACK for QoS 1, PUBCOMP for QoS
+2), retries unacknowledged work with jittered exponential backoff capped at five
+minutes, and preserves the same envelope `id` on every attempt. Consumers must
+still deduplicate by `source + id`: a timeout can make the delivery outcome
+ambiguous even when MQTT QoS is greater than zero. Events expire according to
+their registry policy rather than being delivered indefinitely after they are
+stale.
+
+### Event route configuration
+
+The event route API can persist and validate event type, camera selector,
+schedule, predicate, suppression, and destination configuration for the
+normalized stream. `mqtt:default` refers to the broker configured in `[mqtt]`;
+managed profiles use stable `mqtt:<destination_uuid>` keys. Route preview is
+safe to use while designing a rule: it resolves matching cameras but never
+publishes.
+
+With no route definitions, normalized events retain the compatibility
+publish-all behavior through the enabled default broker. Once a route exists,
+an event is durably enqueued once per unique destination matched by at least one
+enabled route's type, current Fleet scope, detection predicate, and
+occurrence-time schedule. Multiple matching routes to one destination do not
+duplicate a publish. Disabling all configured routes pauses normalized enqueue;
+deleting the final route restores the default. Legacy detection and Home
+Assistant compatibility topics are unchanged.
+
+Schedules use installed IANA timezone data and account for DST and overnight
+windows. Debounce, cooldown, grouping, and fixed-window rate limits are enforced
+per route, event type, and subject. The first event is preserved, and an allowed
+event advances durable suppression state for that destination only after its
+outbox write returns `ENQUEUED` or `DUPLICATE`; a full or failed destination
+write therefore does not consume a cooldown or rate slot or block successful
+fan-out elsewhere.
+
+The destination profile API manages named MQTT brokers with write-only
+credentials, secure system-trust defaults, optional custom CA or mutual TLS
+(with explicit CA, client certificate, and client key paths),
+and per-profile topics, QoS, and keepalive settings. Each enabled profile has an
+independent reconnecting client and durable queue. A disabled profile pauses
+its queue without discarding unexpired events; profile edits reconnect using the
+new revision. Topic templates are expanded and frozen at enqueue time, so an
+edit affects new events without rewriting pending work. Managed profiles remain
+active even when the existing `[mqtt]` default destination is disabled. See
+[Event Routes](API.md#event-routes) for the API contract.
+
+```json
+{
+  "specversion": "1.0",
+  "id": "8a77e095-9079-44d9-8766-b733bc370631",
+  "type": "io.lightnvr.detection.object.v1",
+  "source": "urn:lightnvr:11111111-1111-4111-8111-111111111111",
+  "subject": "camera/22222222-2222-4222-8222-222222222222",
+  "time": "2026-08-23T06:30:00Z",
+  "datacontenttype": "application/json",
+  "severity": "info",
+  "sensitivity": "operational",
+  "data": {
+    "stream_name": "front_door",
+    "count": 1,
+    "detections": [
+      {
+        "label": "person",
+        "confidence": 0.92,
+        "x": 0.25,
+        "y": 0.30,
+        "width": 0.15,
+        "height": 0.45
+      }
+    ]
+  }
+}
+```
+
+## Legacy Detection Format
+
+The existing topic and payload remain available during migration for Home
+Assistant, Node-RED, and other installed automations. New consumers should use
+the normalized format above.
+
+Legacy detection events are published as JSON with the following structure:
 
 **Topic:** `{topic_prefix}/detections/{stream_name}`
 
@@ -413,9 +515,12 @@ If your broker requires authentication:
 |-----|------|-------------|
 | 0 | At most once | Fire and forget. Fastest, but messages may be lost |
 | 1 | At least once | Message delivered at least once. May receive duplicates |
-| 2 | Exactly once | Message delivered exactly once. Slowest, highest overhead |
+| 2 | Exactly once link handshake | Strongest client-to-broker handshake; slowest, highest overhead |
 
-**Recommendation:** Use QoS 1 for most cases. QoS 0 if you have many detections and can tolerate occasional loss.
+**Recommendation:** Use QoS 1 for most cases. QoS 0 if you have many detections
+and can tolerate loss between the client and broker. Regardless of QoS, event
+consumers should deduplicate normalized envelopes by `source + id` because a
+publish timeout can cause a later retry.
 
 ## Advanced Configuration
 
@@ -460,4 +565,3 @@ client_id = lightnvr-garage
 [mqtt]
 client_id = lightnvr-frontyard
 ```
-

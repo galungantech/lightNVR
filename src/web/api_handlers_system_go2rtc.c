@@ -36,9 +36,14 @@ bool get_go2rtc_memory_usage(unsigned long long *memory_usage) {
     // Initialize to 0
     *memory_usage = 0;
 
-    // Get go2rtc process ID from the process manager
-    // This is more reliable than pgrep as it tracks the actual process we started
-    int pid = go2rtc_process_get_pid();
+    // Observability must not wait behind a long-running go2rtc restart or
+    // reconfiguration. Use the verified PID when it is immediately available
+    // and report memory as unavailable while the lifecycle is busy.
+    int pid = -1;
+    if (!go2rtc_process_try_get_pid(&pid)) {
+        log_debug("go2rtc lifecycle busy; memory usage temporarily unavailable");
+        return false;
+    }
     if (pid <= 0) {
         log_warn("No go2rtc process found (PID: %d)", pid);
         return false;
@@ -171,7 +176,7 @@ void handle_get_system_go2rtc_effective_config(const http_request_t *req,
 {
     log_info("Handling GET /api/system/go2rtc/effective-config");
 
-    if (!httpd_check_admin_privileges(req, res)) {
+    if (!httpd_authorize_global_action(req, res, AUTHZ_SYSTEM_ADMIN)) {
         return;
     }
 
@@ -358,7 +363,7 @@ void handle_get_system_go2rtc_override_status(const http_request_t *req,
 {
     log_info("Handling GET /api/system/go2rtc/override-status");
 
-    if (!httpd_check_admin_privileges(req, res)) {
+    if (!httpd_authorize_global_action(req, res, AUTHZ_SYSTEM_ADMIN)) {
         return;
     }
 
@@ -444,8 +449,16 @@ void handle_get_system_go2rtc_override_status(const http_request_t *req,
     free(validated);
 
     /* Runtime state — is there actually a go2rtc to consume the
-     * override? */
-    int pid = go2rtc_process_get_pid();
+     * override? A busy lifecycle means "not observable right now", which is
+     * not the same as "not running": reporting it as stopped would tell the
+     * operator the override is dead during the very restart that applies it.
+     * process_state_known lets the client distinguish the two. */
+    int pid = -1;
+    bool pid_known = go2rtc_process_try_get_pid(&pid);
+    if (!pid_known) {
+        log_debug("go2rtc lifecycle busy; runtime state temporarily unavailable");
+    }
+    cJSON_AddBoolToObject(root, "process_state_known", pid_known);
     cJSON_AddBoolToObject(root, "process_running", pid > 0);
     cJSON_AddNumberToObject(root, "process_pid", pid > 0 ? (double)pid : 0);
 

@@ -13,6 +13,7 @@
 #include "database/db_core.h"
 #include "database/db_schema.h"
 #include "database/db_schema_cache.h"
+#include "database/db_camera_tags.h"
 #include "core/logger.h"
 #include "core/config.h"
 #include "utils/strings.h"
@@ -61,6 +62,30 @@ static void deserialize_recording_schedule(const char *text, uint8_t *schedule) 
     while (idx < 168) {
         schedule[idx++] = 1;
     }
+}
+
+static const char *normalized_playback_transport(const char *value) {
+    return playback_transport_is_valid(value) ? value : "auto";
+}
+
+static bool stream_transaction_begin(sqlite3 *db, bool *owns_transaction) {
+    *owns_transaction = sqlite3_get_autocommit(db) != 0;
+    if (!*owns_transaction) return true;
+    return sqlite3_exec(db, "BEGIN IMMEDIATE;", NULL, NULL, NULL) == SQLITE_OK;
+}
+
+static bool stream_transaction_finish(sqlite3 *db, bool owns_transaction,
+                                      bool success) {
+    if (!owns_transaction) return success;
+    if (!success) {
+        sqlite3_exec(db, "ROLLBACK;", NULL, NULL, NULL);
+        return false;
+    }
+    if (sqlite3_exec(db, "COMMIT;", NULL, NULL, NULL) == SQLITE_OK) {
+        return true;
+    }
+    sqlite3_exec(db, "ROLLBACK;", NULL, NULL, NULL);
+    return false;
 }
 
 /**
@@ -135,7 +160,8 @@ uint64_t add_stream_config(const stream_config_t *stream) {
                                 "privacy_mode = ?, motion_trigger_source = ?, go2rtc_source_override = ?, "
                                 "sub_stream_url = ?, audio_voice_enhancement = ?, "
                                 "detection_url = ?, publish_url = ?, "
-                                "detection_record_on_schedule = ?, detection_recording_schedule = ? "
+                                "detection_record_on_schedule = ?, detection_recording_schedule = ?, "
+                                "playback_transport = ? "
                                 "WHERE id = ?;";
 
         rc = sqlite3_prepare_v2(db, update_sql, -1, &stmt, NULL);
@@ -227,9 +253,21 @@ uint64_t add_stream_config(const stream_config_t *stream) {
         serialize_recording_schedule(stream->detection_recording_schedule,
                                      detection_schedule_buf, sizeof(detection_schedule_buf));
         sqlite3_bind_text(stmt, 52, detection_schedule_buf, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(stmt, 53,
+                          normalized_playback_transport(stream->playback_transport),
+                          -1, SQLITE_STATIC);
 
         // Bind ID parameter
-        sqlite3_bind_int64(stmt, 53, (sqlite3_int64)existing_id);
+        sqlite3_bind_int64(stmt, 54, (sqlite3_int64)existing_id);
+
+        bool owns_transaction = false;
+        if (!stream_transaction_begin(db, &owns_transaction)) {
+            log_error("Failed to begin reactivation transaction: %s",
+                      sqlite3_errmsg(db));
+            sqlite3_finalize(stmt);
+            pthread_mutex_unlock(db_mutex);
+            return 0;
+        }
 
         // Execute statement
         rc = sqlite3_step(stmt);
@@ -241,6 +279,7 @@ uint64_t add_stream_config(const stream_config_t *stream) {
                 sqlite3_finalize(stmt);
                 stmt = NULL;
             }
+            stream_transaction_finish(db, owns_transaction, false);
             pthread_mutex_unlock(db_mutex);
             return 0;
         }
@@ -249,6 +288,21 @@ uint64_t add_stream_config(const stream_config_t *stream) {
         if (stmt) {
             sqlite3_finalize(stmt);
             stmt = NULL;
+        }
+
+        if (db_camera_tags_sync_legacy_by_name_locked(
+                db, stream->name, stream->tags) != 0) {
+            log_error("Failed to sync normalized tags for reactivated stream %s",
+                      stream->name);
+            stream_transaction_finish(db, owns_transaction, false);
+            pthread_mutex_unlock(db_mutex);
+            return 0;
+        }
+        if (!stream_transaction_finish(db, owns_transaction, true)) {
+            log_error("Failed to commit reactivated stream %s: %s",
+                      stream->name, sqlite3_errmsg(db));
+            pthread_mutex_unlock(db_mutex);
+            return 0;
         }
 
         log_info("Updated disabled stream configuration: name=%s, enabled=%s, detection=%s, model=%s",
@@ -279,8 +333,13 @@ uint64_t add_stream_config(const stream_config_t *stream) {
           "onvif_username, onvif_password, onvif_profile, onvif_port, "
           "record_on_schedule, recording_schedule, tags, admin_url, privacy_mode, motion_trigger_source, "
           "go2rtc_source_override, sub_stream_url, audio_voice_enhancement, detection_url, publish_url, "
-          "detection_record_on_schedule, detection_recording_schedule) "
-          "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);";
+          "detection_record_on_schedule, detection_recording_schedule, playback_transport, camera_uuid, location_uuid) "
+          "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, "
+          "lower(hex(randomblob(4)) || '-' || hex(randomblob(2)) || '-4' || "
+          "substr(hex(randomblob(2)), 2) || '-' || "
+          "substr('89ab', (abs(random()) % 4) + 1, 1) || "
+          "substr(hex(randomblob(2)), 2) || '-' || hex(randomblob(6))), "
+          "(SELECT uuid FROM camera_locations WHERE is_system = 1 LIMIT 1));";
 
     rc = sqlite3_prepare_v2(db, sql, -1, &stmt, NULL);
     if (rc != SQLITE_OK) {
@@ -372,28 +431,50 @@ uint64_t add_stream_config(const stream_config_t *stream) {
     serialize_recording_schedule(stream->detection_recording_schedule,
                                  insert_detection_schedule_buf, sizeof(insert_detection_schedule_buf));
     sqlite3_bind_text(stmt, 53, insert_detection_schedule_buf, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 54,
+                      normalized_playback_transport(stream->playback_transport),
+                      -1, SQLITE_STATIC);
+
+    bool owns_transaction = false;
+    if (!stream_transaction_begin(db, &owns_transaction)) {
+        log_error("Failed to begin stream insert transaction: %s",
+                  sqlite3_errmsg(db));
+        sqlite3_finalize(stmt);
+        pthread_mutex_unlock(db_mutex);
+        return 0;
+    }
 
     // Execute statement
     rc = sqlite3_step(stmt);
     if (rc != SQLITE_DONE) {
         log_error("Failed to add stream configuration: %s", sqlite3_errmsg(db));
-        // Continue to finalize the statement
     } else {
         stream_id = (uint64_t)sqlite3_last_insert_rowid(db);
-        log_debug("Added stream configuration with ID %llu", (unsigned long long)stream_id);
-
-        // Log the addition
-        log_info("Added stream configuration: name=%s, enabled=%s, detection=%s, model=%s",
-                stream->name,
-                stream->enabled ? "true" : "false",
-                stream->detection_based_recording ? "true" : "false",
-                stream->detection_model);
     }
 
     // Finalize the prepared statement
     if (stmt) {
         sqlite3_finalize(stmt);
         stmt = NULL;
+    }
+    bool success = stream_id != 0;
+    if (success && db_camera_tags_sync_legacy_by_name_locked(
+            db, stream->name, stream->tags) != 0) {
+        log_error("Failed to sync normalized tags for new stream %s",
+                  stream->name);
+        success = false;
+    }
+    if (!stream_transaction_finish(db, owns_transaction, success)) {
+        stream_id = 0;
+    }
+    if (stream_id != 0) {
+        log_debug("Added stream configuration with ID %llu",
+                  (unsigned long long)stream_id);
+        log_info("Added stream configuration: name=%s, enabled=%s, detection=%s, model=%s",
+                 stream->name,
+                 stream->enabled ? "true" : "false",
+                 stream->detection_based_recording ? "true" : "false",
+                 stream->detection_model);
     }
     pthread_mutex_unlock(db_mutex);
 
@@ -445,7 +526,8 @@ int update_stream_config(const char *name, const stream_config_t *stream) {
                       "motion_trigger_source = ?, go2rtc_source_override = ?, "
                       "sub_stream_url = ?, audio_voice_enhancement = ?, "
                       "detection_url = ?, publish_url = ?, "
-                      "detection_record_on_schedule = ?, detection_recording_schedule = ? "
+                      "detection_record_on_schedule = ?, detection_recording_schedule = ?, "
+                      "playback_transport = ? "
                       "WHERE name = ?;";
 
     rc = sqlite3_prepare_v2(db, sql, -1, &stmt, NULL);
@@ -538,9 +620,21 @@ int update_stream_config(const char *name, const stream_config_t *stream) {
     serialize_recording_schedule(stream->detection_recording_schedule,
                                  update_detection_schedule_buf, sizeof(update_detection_schedule_buf));
     sqlite3_bind_text(stmt, 53, update_detection_schedule_buf, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 54,
+                      normalized_playback_transport(stream->playback_transport),
+                      -1, SQLITE_STATIC);
 
     // Bind the WHERE clause parameter
-    sqlite3_bind_text(stmt, 54, name, -1, SQLITE_STATIC);
+    sqlite3_bind_text(stmt, 55, name, -1, SQLITE_STATIC);
+
+    bool owns_transaction = false;
+    if (!stream_transaction_begin(db, &owns_transaction)) {
+        log_error("Failed to begin stream update transaction: %s",
+                  sqlite3_errmsg(db));
+        sqlite3_finalize(stmt);
+        pthread_mutex_unlock(db_mutex);
+        return -1;
+    }
 
     // Execute statement
     rc = sqlite3_step(stmt);
@@ -552,6 +646,7 @@ int update_stream_config(const char *name, const stream_config_t *stream) {
             sqlite3_finalize(stmt);
             stmt = NULL;
         }
+        stream_transaction_finish(db, owns_transaction, false);
         pthread_mutex_unlock(db_mutex);
         return -1;
     }
@@ -560,6 +655,20 @@ int update_stream_config(const char *name, const stream_config_t *stream) {
     if (stmt) {
         sqlite3_finalize(stmt);
         stmt = NULL;
+    }
+
+    if (db_camera_tags_sync_legacy_by_name_locked(
+            db, stream->name, stream->tags) != 0) {
+        log_error("Failed to sync normalized tags for stream %s", name);
+        stream_transaction_finish(db, owns_transaction, false);
+        pthread_mutex_unlock(db_mutex);
+        return -1;
+    }
+    if (!stream_transaction_finish(db, owns_transaction, true)) {
+        log_error("Failed to commit stream update for %s: %s", name,
+                  sqlite3_errmsg(db));
+        pthread_mutex_unlock(db_mutex);
+        return -1;
     }
 
     // Log the update
@@ -814,7 +923,7 @@ int get_stream_config_by_name(const char *name, stream_config_t *stream) {
         "onvif_username, onvif_password, onvif_profile, onvif_port, "
         "record_on_schedule, recording_schedule, tags, admin_url, privacy_mode, motion_trigger_source, "
         "go2rtc_source_override, sub_stream_url, audio_voice_enhancement, detection_url, publish_url, "
-        "detection_record_on_schedule, detection_recording_schedule "
+        "detection_record_on_schedule, detection_recording_schedule, camera_uuid, location_uuid, playback_transport "
         "FROM streams WHERE name = ?;";
 
     // Column index constants for readability
@@ -832,7 +941,8 @@ int get_stream_config_by_name(const char *name, stream_config_t *stream) {
         COL_RECORD_ON_SCHEDULE, COL_RECORDING_SCHEDULE, COL_TAGS, COL_ADMIN_URL, COL_PRIVACY_MODE,
         COL_MOTION_TRIGGER_SOURCE, COL_GO2RTC_SOURCE_OVERRIDE, COL_SUB_STREAM_URL,
         COL_AUDIO_VOICE_ENHANCEMENT, COL_DETECTION_URL, COL_PUBLISH_URL,
-        COL_DETECTION_RECORD_ON_SCHEDULE, COL_DETECTION_RECORDING_SCHEDULE
+        COL_DETECTION_RECORD_ON_SCHEDULE, COL_DETECTION_RECORDING_SCHEDULE,
+        COL_CAMERA_UUID, COL_LOCATION_UUID, COL_PLAYBACK_TRANSPORT
     };
 
     rc = sqlite3_prepare_v2(db, sql, -1, &stmt, NULL);
@@ -846,6 +956,19 @@ int get_stream_config_by_name(const char *name, stream_config_t *stream) {
 
     if (sqlite3_step(stmt) == SQLITE_ROW) {
         memset(stream, 0, sizeof(stream_config_t));
+
+        const char *camera_uuid =
+            (const char *)sqlite3_column_text(stmt, COL_CAMERA_UUID);
+        if (camera_uuid) {
+            safe_strcpy(stream->camera_uuid, camera_uuid,
+                        sizeof(stream->camera_uuid), 0);
+        }
+        const char *location_uuid =
+            (const char *)sqlite3_column_text(stmt, COL_LOCATION_UUID);
+        if (location_uuid) {
+            safe_strcpy(stream->location_uuid, location_uuid,
+                        sizeof(stream->location_uuid), 0);
+        }
 
         // Basic stream settings
         const char *stream_name = (const char *)sqlite3_column_text(stmt, COL_NAME);
@@ -1035,6 +1158,12 @@ int get_stream_config_by_name(const char *name, stream_config_t *stream) {
         deserialize_recording_schedule(detection_schedule_text,
                                        stream->detection_recording_schedule);
 
+        const char *playback_transport =
+            (const char *)sqlite3_column_text(stmt, COL_PLAYBACK_TRANSPORT);
+        safe_strcpy(stream->playback_transport,
+                    normalized_playback_transport(playback_transport),
+                    sizeof(stream->playback_transport), 0);
+
         result = 0;
     }
 
@@ -1046,6 +1175,52 @@ int get_stream_config_by_name(const char *name, stream_config_t *stream) {
     pthread_mutex_unlock(db_mutex);
 
     return result;
+}
+
+/**
+ * Get a stream configuration by immutable camera UUID.
+ */
+int get_stream_config_by_uuid(const char *camera_uuid, stream_config_t *stream) {
+    sqlite3 *db = get_db_handle();
+    pthread_mutex_t *db_mutex = get_db_mutex();
+    sqlite3_stmt *stmt = NULL;
+    char stream_name[MAX_STREAM_NAME] = {0};
+
+    if (!db) {
+        log_error("Database not initialized");
+        return -1;
+    }
+    if (!camera_uuid || strlen(camera_uuid) != CAMERA_UUID_STRING_SIZE - 1 ||
+        !stream) {
+        log_error("Valid camera UUID and stream configuration pointer are required");
+        return -1;
+    }
+
+    pthread_mutex_lock(db_mutex);
+
+    int rc = sqlite3_prepare_v2(
+        db, "SELECT name FROM streams WHERE camera_uuid = ?;", -1, &stmt, NULL);
+    if (rc == SQLITE_OK) {
+        sqlite3_bind_text(stmt, 1, camera_uuid, -1, SQLITE_STATIC);
+        if (sqlite3_step(stmt) == SQLITE_ROW) {
+            const char *name = (const char *)sqlite3_column_text(stmt, 0);
+            if (name) {
+                safe_strcpy(stream_name, name, sizeof(stream_name), 0);
+            }
+        }
+    } else {
+        log_error("Failed to prepare camera UUID lookup: %s", sqlite3_errmsg(db));
+    }
+
+    if (stmt) {
+        sqlite3_finalize(stmt);
+    }
+    pthread_mutex_unlock(db_mutex);
+
+    if (stream_name[0] == '\0') {
+        return -1;
+    }
+    return get_stream_config_by_name(stream_name, stream);
 }
 
 /**
@@ -1088,7 +1263,7 @@ int get_all_stream_configs(stream_config_t *streams, int max_count) {
         "onvif_username, onvif_password, onvif_profile, onvif_port, "
         "record_on_schedule, recording_schedule, tags, admin_url, privacy_mode, motion_trigger_source, "
         "go2rtc_source_override, sub_stream_url, audio_voice_enhancement, detection_url, publish_url, "
-        "detection_record_on_schedule, detection_recording_schedule "
+        "detection_record_on_schedule, detection_recording_schedule, camera_uuid, location_uuid, playback_transport "
         "FROM streams ORDER BY name;";
 
     // Column index constants (same as get_stream_config_by_name)
@@ -1106,7 +1281,8 @@ int get_all_stream_configs(stream_config_t *streams, int max_count) {
         COL_RECORD_ON_SCHEDULE, COL_RECORDING_SCHEDULE, COL_TAGS, COL_ADMIN_URL, COL_PRIVACY_MODE,
         COL_MOTION_TRIGGER_SOURCE, COL_GO2RTC_SOURCE_OVERRIDE, COL_SUB_STREAM_URL,
         COL_AUDIO_VOICE_ENHANCEMENT, COL_DETECTION_URL, COL_PUBLISH_URL,
-        COL_DETECTION_RECORD_ON_SCHEDULE, COL_DETECTION_RECORDING_SCHEDULE
+        COL_DETECTION_RECORD_ON_SCHEDULE, COL_DETECTION_RECORDING_SCHEDULE,
+        COL_CAMERA_UUID, COL_LOCATION_UUID, COL_PLAYBACK_TRANSPORT
     };
 
     rc = sqlite3_prepare_v2(db, sql, -1, &stmt, NULL);
@@ -1119,6 +1295,19 @@ int get_all_stream_configs(stream_config_t *streams, int max_count) {
     while (sqlite3_step(stmt) == SQLITE_ROW && count < max_count) {
         stream_config_t *s = &streams[count];
         memset(s, 0, sizeof(stream_config_t));
+
+        const char *camera_uuid =
+            (const char *)sqlite3_column_text(stmt, COL_CAMERA_UUID);
+        if (camera_uuid) {
+            safe_strcpy(s->camera_uuid, camera_uuid,
+                        sizeof(s->camera_uuid), 0);
+        }
+        const char *location_uuid =
+            (const char *)sqlite3_column_text(stmt, COL_LOCATION_UUID);
+        if (location_uuid) {
+            safe_strcpy(s->location_uuid, location_uuid,
+                        sizeof(s->location_uuid), 0);
+        }
 
         // Basic settings
         const char *name = (const char *)sqlite3_column_text(stmt, COL_NAME);
@@ -1307,6 +1496,12 @@ int get_all_stream_configs(stream_config_t *streams, int max_count) {
             (const char *)sqlite3_column_text(stmt, COL_DETECTION_RECORDING_SCHEDULE);
         deserialize_recording_schedule(detection_schedule_text,
                                        s->detection_recording_schedule);
+
+        const char *playback_transport =
+            (const char *)sqlite3_column_text(stmt, COL_PLAYBACK_TRANSPORT);
+        safe_strcpy(s->playback_transport,
+                    normalized_playback_transport(playback_transport),
+                    sizeof(s->playback_transport), 0);
 
         count++;
     }

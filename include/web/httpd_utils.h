@@ -11,8 +11,10 @@
 #define HTTPD_UTILS_H
 
 #include <cjson/cJSON.h>
+#include <stdbool.h>
 #include "web/request_response.h"
 #include "database/db_auth.h"
+#include "core/authorization.h"
 
 /**
  * @brief Parse JSON body from an HTTP request
@@ -52,6 +54,15 @@ int httpd_get_api_key(const http_request_t *req, char *api_key, size_t api_key_s
  * @return 0 on success, -1 on error
  */
 int httpd_get_effective_client_ip(const http_request_t *req, char *client_ip, size_t client_ip_size);
+
+/**
+ * @brief Whether the direct peer is inside trusted_proxy_cidrs.
+ *
+ * Request metadata that a client can set freely (forwarded addresses, an
+ * inbound correlation ID) may only be believed when it came from a proxy the
+ * operator declared. Defaults to false when no proxies are configured.
+ */
+bool httpd_peer_is_trusted_proxy(const http_request_t *req);
 
 /**
  * @brief Get the authenticated user from the HTTP request
@@ -122,10 +133,95 @@ void httpd_clear_trusted_device_cookie(http_response_t *res);
 int httpd_check_viewer_access(const http_request_t *req, user_t *user);
 
 /**
+ * Authenticate for a handler that immediately applies centralized action
+ * authorization. This additionally accepts scoped API tokens. Do not use it
+ * in handlers that rely only on legacy role or allowed-tag checks.
+ */
+int httpd_check_action_access(const http_request_t *req, user_t *user);
+
+/**
+ * Authenticate and authorize a request through the centralized action policy.
+ * A NULL camera is valid for global actions and all-fleet grants. Evaluation
+ * errors fail closed with a 500 response; denials return 403.
+ */
+int httpd_authorize_action(const http_request_t *req, http_response_t *res,
+                           authorization_action_t action,
+                           const fleet_camera_t *camera, user_t *user,
+                           authorization_evaluation_t *evaluation);
+
+/* Authorize a system-wide action when the handler does not need principal
+ * context after the decision. Camera-scoped actions passed here require an
+ * all-fleet grant, which is appropriate for fleet-wide metadata mutations. */
+int httpd_authorize_global_action(const http_request_t *req,
+                                  http_response_t *res,
+                                  authorization_action_t action);
+
+/**
+ * Resolve a stream to its immutable fleet camera and authorize a camera-scoped
+ * action. Missing streams return 404, query failures return 500, and policy
+ * denials return 403. This avoids trusting a client-supplied selector or UUID.
+ */
+int httpd_authorize_stream_action(const http_request_t *req,
+                                  http_response_t *res,
+                                  authorization_action_t action,
+                                  const char *stream_name);
+
+/**
+ * Authorize a high-volume media request with a short-lived, bounded decision
+ * cache. Allowed decisions are reused for at most 30 seconds and therefore do
+ * not append one durable audit row per HLS segment. Denials and evaluation
+ * errors always take the normal audited path.
+ */
+int httpd_authorize_media_stream_action(const http_request_t *req,
+                                        http_response_t *res,
+                                        authorization_action_t action,
+                                        const char *stream_name);
+
+/** Hash the request's presented authentication material for in-process cache
+ * binding. The raw credential is never retained or logged. */
+int httpd_request_auth_fingerprint(const http_request_t *req,
+                                   char fingerprint[65]);
+
+/**
+ * Resolve and authorize a camera-scoped action while returning the trusted
+ * principal, immutable camera identity, and policy evaluation to the caller.
+ * The output structures are cleared before use and are valid only when the
+ * function returns 1.
+ */
+int httpd_authorize_stream_action_with_context(
+    const http_request_t *req, http_response_t *res,
+    authorization_action_t action, const char *stream_name, user_t *user,
+    fleet_camera_t *camera, authorization_evaluation_t *evaluation);
+
+/**
+ * Authorize historical media using its immutable capture-time camera UUID.
+ * legacy_stream_name is consulted only for pre-migration rows whose UUID is
+ * unresolved. This prevents a camera rename from orphaning authorized media.
+ */
+int httpd_authorize_camera_identity_action_with_context(
+    const http_request_t *req, http_response_t *res,
+    authorization_action_t action, const char *camera_uuid,
+    const char *legacy_stream_name, user_t *user, fleet_camera_t *camera,
+    authorization_evaluation_t *evaluation);
+
+/**
+ * Evaluate an already-authenticated user against a server-resolved stream.
+ * Returns 0 with an allow/deny evaluation, 1 if the stream does not exist, and
+ * -1 on a database or policy evaluation error. Useful for batch operations.
+ */
+int httpd_evaluate_stream_action(const user_t *user,
+                                 authorization_action_t action,
+                                 const char *stream_name,
+                                 authorization_evaluation_t *evaluation);
+
+/** Copy a basename into an HTTP attachment-safe ASCII filename. */
+void httpd_sanitize_attachment_filename(const char *input, char *output,
+                                        size_t output_size);
+
+/**
  * @brief Check if demo mode is enabled
  * @return 1 if demo mode is enabled, 0 otherwise
  */
 int httpd_is_demo_mode(void);
 
 #endif /* HTTPD_UTILS_H */
-

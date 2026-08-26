@@ -181,7 +181,7 @@ webrtc_connection_timeout_ms = 45000
 webrtc_ice_recovery_timeout_ms = 8000
 ```
 
-Environment-variable equivalents (useful for Docker): `WEBRTC_CONNECTION_TIMEOUT_MS` and `WEBRTC_ICE_RECOVERY_TIMEOUT_MS`. The web client reads these from `/api/settings`, so a plain container restart applies them.
+Environment-variable equivalents (useful for Docker): `WEBRTC_CONNECTION_TIMEOUT_MS` and `WEBRTC_ICE_RECOVERY_TIMEOUT_MS`. The web client reads these from the authenticated `/api/client-config` bootstrap endpoint, so a plain container restart applies them.
 
 **HLS live view** — the following buffer/timeout tuning currently still requires a source rebuild:
 
@@ -346,7 +346,10 @@ when the admin account is first created.
    sudo systemctl start lightnvr
    ```
 
-4. Log back in and set a real password under **Settings → Users**.
+4. Log back in. If the fallback `admin` password was used, complete the mandatory
+   password-change screen and then sign in with the new password. If `[web] password` was
+   supplied before the account was recreated, that operator-selected credential skips the
+   first-login gate.
 
 ## Performance Optimization
 

@@ -25,7 +25,8 @@
  * @param recording_id Recording ID to link detections to (0 for no link)
  * @return 0 on success, non-zero on failure
  */
-static int store_detections_with_source(const char *stream_name,
+static int store_detections_with_source(const char *camera_uuid,
+                                        const char *stream_name,
                                         const detection_result_t *result,
                                         time_t timestamp,
                                         uint64_t recording_id,
@@ -83,8 +84,11 @@ static int store_detections_with_source(const char *stream_name,
         return -1;
     }
     
-    const char *sql = "INSERT INTO detections (stream_name, timestamp, label, confidence, x, y, width, height, track_id, zone_id, recording_id, source, event_end_time) "
-                      "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);";
+    const char *sql = "INSERT INTO detections (stream_name, timestamp, label, confidence, x, y, width, height, track_id, zone_id, recording_id, source, event_end_time, camera_uuid) "
+                      "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, "
+                      "COALESCE((SELECT camera_uuid FROM recordings WHERE id = NULLIF(?, 0)), "
+                      "NULLIF(?, ''), "
+                      "(SELECT camera_uuid FROM streams WHERE name = ?)));";
 
     rc = sqlite3_prepare_v2(db, sql, -1, &stmt, NULL);
     if (rc != SQLITE_OK) {
@@ -120,6 +124,10 @@ static int store_detections_with_source(const char *stream_name,
         } else {
             sqlite3_bind_int64(stmt, 13, (sqlite3_int64)timestamp);
         }
+        sqlite3_bind_int64(stmt, 14, (sqlite3_int64)recording_id);
+        sqlite3_bind_text(stmt, 15, camera_uuid ? camera_uuid : "", -1,
+                          SQLITE_STATIC);
+        sqlite3_bind_text(stmt, 16, stream_name, -1, SQLITE_STATIC);
         
         // Execute statement
         rc = sqlite3_step(stmt);
@@ -175,15 +183,23 @@ int store_detections_in_db(const char *stream_name,
                            const detection_result_t *result,
                            time_t timestamp,
                            uint64_t recording_id) {
-    return store_detections_with_source(stream_name, result, timestamp,
+    return store_detections_with_source(NULL, stream_name, result, timestamp,
                                         recording_id, "", false);
+}
+
+int store_detections_in_db_for_camera(
+    const char *camera_uuid, const char *stream_name,
+    const detection_result_t *result, time_t timestamp,
+    uint64_t recording_id) {
+    return store_detections_with_source(camera_uuid, stream_name, result,
+                                        timestamp, recording_id, "", false);
 }
 
 int store_external_motion_detections(const char *stream_name,
                                      const detection_result_t *result,
                                      time_t timestamp,
                                      uint64_t recording_id) {
-    return store_detections_with_source(stream_name, result, timestamp,
+    return store_detections_with_source(NULL, stream_name, result, timestamp,
                                         recording_id, "external_motion", true);
 }
 
@@ -817,6 +833,72 @@ int delete_old_detections(uint64_t max_age) {
     return deleted_count;
 }
 
+int delete_old_detections_for_stream(const char *stream_name, uint64_t max_age, int batch_limit) {
+    int rc;
+    sqlite3_stmt *stmt;
+    int deleted_count = 0;
+
+    if (!stream_name || stream_name[0] == '\0' || batch_limit <= 0) {
+        return -1;
+    }
+
+    sqlite3 *db = get_db_handle();
+    pthread_mutex_t *db_mutex = get_db_mutex();
+
+    if (!db) {
+        log_error("Database not initialized");
+        return -1;
+    }
+
+    pthread_mutex_lock(db_mutex);
+
+    // Selecting the ids first keeps the delete on idx_detections_stream_timestamp
+    // and lets LIMIT bound the batch without depending on SQLite being built
+    // with SQLITE_ENABLE_UPDATE_DELETE_LIMIT.
+    //
+    // An external_motion row with no event_end_time is an interval still open,
+    // so it is measured from now and never expires mid-event -- matching the
+    // age expression delete_old_detections() uses.
+    const char *sql =
+        "DELETE FROM detections WHERE id IN ("
+        "  SELECT id FROM detections"
+        "  WHERE stream_name = ?"
+        "    AND CASE WHEN source = 'external_motion' AND event_end_time IS NULL"
+        "             THEN CAST(strftime('%s','now') AS INTEGER)"
+        "             ELSE COALESCE(event_end_time, timestamp) END < ?"
+        "  LIMIT ?"
+        ");";
+
+    rc = sqlite3_prepare_v2(db, sql, -1, &stmt, NULL);
+    if (rc != SQLITE_OK) {
+        log_error("Failed to prepare detection prune statement: %s", sqlite3_errmsg(db));
+        pthread_mutex_unlock(db_mutex);
+        return -1;
+    }
+
+    time_t cutoff_time = time(NULL) - (time_t)max_age;
+
+    sqlite3_bind_text(stmt, 1, stream_name, -1, SQLITE_STATIC);
+    sqlite3_bind_int64(stmt, 2, (sqlite3_int64)cutoff_time);
+    sqlite3_bind_int(stmt, 3, batch_limit);
+
+    rc = sqlite3_step(stmt);
+    if (rc != SQLITE_DONE) {
+        log_error("Failed to prune detections for stream %s: %s",
+                  stream_name, sqlite3_errmsg(db));
+        sqlite3_finalize(stmt);
+        pthread_mutex_unlock(db_mutex);
+        return -1;
+    }
+
+    deleted_count = sqlite3_changes(db);
+
+    sqlite3_finalize(stmt);
+    pthread_mutex_unlock(db_mutex);
+
+    return deleted_count;
+}
+
 /**
  * Get a summary of detection labels for a stream within a time range
  * Returns unique labels with their counts, sorted by count descending
@@ -910,6 +992,126 @@ int get_detection_labels_summary(const char *stream_name, time_t start_time, tim
     return count;
 }
 
+#define RECORDING_DETECTION_QUERY_BATCH_SIZE 100
+
+int get_recording_detection_summaries(
+    const recording_metadata_t *recordings, int count,
+    recording_detection_summary_t *summaries) {
+    if (!recordings || count <= 0 || !summaries) {
+        return -1;
+    }
+
+    sqlite3 *db = get_db_handle();
+    pthread_mutex_t *db_mutex = get_db_mutex();
+    if (!db) {
+        log_error("Database not initialized");
+        return -1;
+    }
+
+    memset(summaries, 0, (size_t)count * sizeof(*summaries));
+
+    for (int batch_start = 0; batch_start < count;
+         batch_start += RECORDING_DETECTION_QUERY_BATCH_SIZE) {
+        int batch_count = count - batch_start;
+        if (batch_count > RECORDING_DETECTION_QUERY_BATCH_SIZE) {
+            batch_count = RECORDING_DETECTION_QUERY_BATCH_SIZE;
+        }
+
+        char sql[8192];
+        safe_strcpy(sql,
+            "WITH requested(recording_id, stream_name, start_time, end_time) AS (VALUES ",
+            sizeof(sql), 0);
+        for (int i = 0; i < batch_count; i++) {
+            if (i > 0) safe_strcat(sql, ",", sizeof(sql));
+            safe_strcat(sql, "(?,?,?,?)", sizeof(sql));
+        }
+        safe_strcat(sql,
+            "), label_counts AS ("
+            "SELECT q.recording_id, d.label, COUNT(*) AS cnt "
+            "FROM requested q JOIN detections d ON d.recording_id = q.recording_id "
+            "WHERE d.source != 'external_motion' "
+            "GROUP BY q.recording_id, d.label "
+            "UNION ALL "
+            "SELECT q.recording_id, d.label, COUNT(*) AS cnt "
+            "FROM requested q JOIN detections d "
+            "ON d.stream_name = q.stream_name "
+            "AND d.timestamp >= q.start_time AND d.timestamp <= q.end_time "
+            "WHERE (d.recording_id IS NULL OR d.recording_id != q.recording_id) "
+            "AND d.source != 'external_motion' "
+            "GROUP BY q.recording_id, d.label "
+            "UNION ALL "
+            "SELECT q.recording_id, d.label, COUNT(*) AS cnt "
+            "FROM requested q JOIN detections d "
+            "ON d.stream_name = q.stream_name AND d.timestamp <= q.end_time "
+            "WHERE d.source = 'external_motion' "
+            "AND COALESCE(d.event_end_time, CAST(strftime('%s','now') AS INTEGER)) >= q.start_time "
+            "GROUP BY q.recording_id, d.label"
+            ") "
+            "SELECT recording_id, label, SUM(cnt) AS label_count "
+            "FROM label_counts GROUP BY recording_id, label "
+            "ORDER BY recording_id, label_count DESC, label;",
+            sizeof(sql));
+
+        pthread_mutex_lock(db_mutex);
+        sqlite3_stmt *stmt = NULL;
+        int rc = sqlite3_prepare_v2(db, sql, -1, &stmt, NULL);
+        if (rc != SQLITE_OK) {
+            log_error("Failed to prepare recording detection summaries: %s",
+                      sqlite3_errmsg(db));
+            pthread_mutex_unlock(db_mutex);
+            return -1;
+        }
+
+        int param_index = 1;
+        for (int i = 0; i < batch_count; i++) {
+            const recording_metadata_t *recording = &recordings[batch_start + i];
+            sqlite3_bind_int64(stmt, param_index++,
+                               (sqlite3_int64)recording->id);
+            sqlite3_bind_text(stmt, param_index++, recording->stream_name, -1,
+                              SQLITE_STATIC);
+            sqlite3_bind_int64(stmt, param_index++,
+                               (sqlite3_int64)recording->start_time);
+            sqlite3_bind_int64(stmt, param_index++,
+                               (sqlite3_int64)recording->end_time);
+        }
+
+        while ((rc = sqlite3_step(stmt)) == SQLITE_ROW) {
+            uint64_t recording_id = (uint64_t)sqlite3_column_int64(stmt, 0);
+            const char *label = (const char *)sqlite3_column_text(stmt, 1);
+            int label_count = sqlite3_column_int(stmt, 2);
+            if (!label) continue;
+
+            for (int i = 0; i < batch_count; i++) {
+                int output_index = batch_start + i;
+                if (recordings[output_index].id != recording_id) continue;
+
+                recording_detection_summary_t *summary = &summaries[output_index];
+                summary->has_detection = true;
+                if (summary->label_count < MAX_DETECTION_LABELS) {
+                    detection_label_summary_t *output =
+                        &summary->labels[summary->label_count];
+                    safe_strcpy(output->label, label, sizeof(output->label), 0);
+                    output->count = label_count;
+                    summary->label_count++;
+                }
+                break;
+            }
+        }
+
+        if (rc != SQLITE_DONE) {
+            log_error("Failed to fetch recording detection summaries: %s",
+                      sqlite3_errmsg(db));
+            sqlite3_finalize(stmt);
+            pthread_mutex_unlock(db_mutex);
+            return -1;
+        }
+        sqlite3_finalize(stmt);
+        pthread_mutex_unlock(db_mutex);
+    }
+
+    return 0;
+}
+
 int get_all_unique_detection_labels(char labels[][MAX_LABEL_LENGTH], int max_labels) {
     int rc;
     sqlite3_stmt *stmt;
@@ -970,6 +1172,77 @@ int get_all_unique_detection_labels(char labels[][MAX_LABEL_LENGTH], int max_lab
     return count;
 }
 
+int get_unique_detection_labels_for_streams(
+    const char *const *stream_names, int stream_count,
+    char labels[][MAX_LABEL_LENGTH], int max_labels) {
+    if (!stream_names || stream_count <= 0 || !labels || max_labels <= 0) return 0;
+    sqlite3 *db = get_db_handle();
+    pthread_mutex_t *db_mutex = get_db_mutex();
+    if (!db || !db_mutex) return -1;
+    memset(labels, 0, (size_t)max_labels * MAX_LABEL_LENGTH);
+    pthread_mutex_lock(db_mutex);
+    int variable_limit = sqlite3_limit(db, SQLITE_LIMIT_VARIABLE_NUMBER, -1);
+    int batch_limit = variable_limit > 1 ? variable_limit - 1 : 1;
+    if (batch_limit > 256) batch_limit = 256;
+    int count = 0;
+    int final_rc = SQLITE_DONE;
+    for (int offset = 0; offset < stream_count; offset += batch_limit) {
+        int batch_count = stream_count - offset;
+        if (batch_count > batch_limit) batch_count = batch_limit;
+        size_t sql_size = 256 + (size_t)batch_count * 3;
+        char *sql = calloc(sql_size, 1);
+        if (!sql) {
+            final_rc = SQLITE_NOMEM;
+            break;
+        }
+        safe_strcpy(sql,
+            "SELECT DISTINCT label FROM detections WHERE label IS NOT NULL "
+            "AND TRIM(label)<>'' AND stream_name IN (", sql_size, 0);
+        for (int i = 0; i < batch_count; i++) {
+            safe_strcat(sql, i == 0 ? "?" : ",?", sql_size);
+        }
+        safe_strcat(sql, ") ORDER BY label ASC LIMIT ?;", sql_size);
+
+        sqlite3_stmt *stmt = NULL;
+        int rc = sqlite3_prepare_v2(db, sql, -1, &stmt, NULL);
+        free(sql);
+        if (rc == SQLITE_OK) {
+            for (int i = 0; i < batch_count; i++) {
+                sqlite3_bind_text(stmt, i + 1, stream_names[offset + i], -1,
+                                  SQLITE_TRANSIENT);
+            }
+            sqlite3_bind_int(stmt, batch_count + 1, max_labels);
+        }
+        while (rc == SQLITE_OK && (rc = sqlite3_step(stmt)) == SQLITE_ROW) {
+            const char *label = (const char *)sqlite3_column_text(stmt, 0);
+            if (!label) continue;
+            int insert_at = 0;
+            while (insert_at < count &&
+                   strcmp(labels[insert_at], label) < 0) insert_at++;
+            if (insert_at < count && strcmp(labels[insert_at], label) == 0) {
+                continue;
+            }
+            if (insert_at < max_labels) {
+                int move_count = count < max_labels ? count - insert_at
+                                                    : max_labels - insert_at - 1;
+                if (move_count > 0) {
+                    memmove(labels[insert_at + 1], labels[insert_at],
+                            (size_t)move_count * MAX_LABEL_LENGTH);
+                }
+                safe_strcpy(labels[insert_at], label, MAX_LABEL_LENGTH, 0);
+                if (count < max_labels) count++;
+            }
+        }
+        if (stmt) sqlite3_finalize(stmt);
+        if (rc != SQLITE_DONE) {
+            final_rc = rc;
+            break;
+        }
+    }
+    pthread_mutex_unlock(db_mutex);
+    return final_rc == SQLITE_DONE ? count : -1;
+}
+
 /**
  * Update recent detections with a recording_id
  * This links detections that were stored before the recording was created to the recording.
@@ -997,7 +1270,8 @@ int update_detections_recording_id(const char *stream_name, uint64_t recording_i
     // Update detections where recording_id is NULL or 0 for the given stream and time range
     const char *sql =
         "UPDATE detections "
-        "SET recording_id = ? "
+        "SET recording_id = ?, "
+        "camera_uuid = COALESCE((SELECT camera_uuid FROM recordings WHERE id = ?), camera_uuid) "
         "WHERE stream_name = ? AND timestamp >= ? AND (recording_id IS NULL OR recording_id = 0);";
 
     rc = sqlite3_prepare_v2(db, sql, -1, &stmt, NULL);
@@ -1009,8 +1283,9 @@ int update_detections_recording_id(const char *stream_name, uint64_t recording_i
 
     // Bind parameters
     sqlite3_bind_int64(stmt, 1, (sqlite3_int64)recording_id);
-    sqlite3_bind_text(stmt, 2, stream_name, -1, SQLITE_STATIC);
-    sqlite3_bind_int64(stmt, 3, (sqlite3_int64)since_time);
+    sqlite3_bind_int64(stmt, 2, (sqlite3_int64)recording_id);
+    sqlite3_bind_text(stmt, 3, stream_name, -1, SQLITE_STATIC);
+    sqlite3_bind_int64(stmt, 4, (sqlite3_int64)since_time);
 
     rc = sqlite3_step(stmt);
     if (rc != SQLITE_DONE) {

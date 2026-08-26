@@ -57,6 +57,13 @@ void test_stream_config_t_size_under_16k(void) {
     TEST_ASSERT_LESS_THAN(16 * 1024, (int)sizeof(stream_config_t));
 }
 
+void test_max_stream_ceiling_is_valid(void) {
+    TEST_ASSERT_TRUE(MAX_STREAMS >= 1);
+    TEST_ASSERT_TRUE(MAX_STREAMS <= 1024);
+    TEST_ASSERT_EQUAL_INT(MAX_STREAMS < 32 ? MAX_STREAMS : 32,
+                          DEFAULT_MAX_STREAMS);
+}
+
 /* ================================================================
  * load_default_config
  * ================================================================ */
@@ -94,8 +101,41 @@ void test_default_config_db_path_nonempty(void) {
 void test_default_config_db_backup_settings(void) {
     load_default_config(&cfg);
     TEST_ASSERT_EQUAL_INT(60, cfg.db_backup_interval_minutes);
-    TEST_ASSERT_EQUAL_INT(24, cfg.db_backup_retention_count);
+    /* Each retained backup is a full copy of the database, so this count
+     * multiplies disk usage by the database size. */
+    TEST_ASSERT_EQUAL_INT(6, cfg.db_backup_retention_count);
     TEST_ASSERT_EQUAL_STRING("", cfg.db_post_backup_script);
+}
+
+void test_default_config_db_startup_check_is_quick(void) {
+    load_default_config(&cfg);
+    /* The boot check runs before the HTTP listener binds, so the default must
+     * be the cheap one; full integrity_check is opt-in. */
+    TEST_ASSERT_EQUAL_INT(DB_STARTUP_CHECK_QUICK, cfg.db_startup_check);
+}
+
+void test_validate_config_clamps_out_of_range_startup_check(void) {
+    load_default_config(&cfg);
+    cfg.db_startup_check = 99;
+    TEST_ASSERT_EQUAL_INT(0, validate_config(&cfg));
+    TEST_ASSERT_EQUAL_INT(DB_STARTUP_CHECK_QUICK, cfg.db_startup_check);
+
+    load_default_config(&cfg);
+    cfg.db_startup_check = -1;
+    TEST_ASSERT_EQUAL_INT(0, validate_config(&cfg));
+    TEST_ASSERT_EQUAL_INT(DB_STARTUP_CHECK_QUICK, cfg.db_startup_check);
+}
+
+void test_validate_config_preserves_valid_startup_check(void) {
+    load_default_config(&cfg);
+    cfg.db_startup_check = DB_STARTUP_CHECK_FULL;
+    TEST_ASSERT_EQUAL_INT(0, validate_config(&cfg));
+    TEST_ASSERT_EQUAL_INT(DB_STARTUP_CHECK_FULL, cfg.db_startup_check);
+
+    load_default_config(&cfg);
+    cfg.db_startup_check = DB_STARTUP_CHECK_OFF;
+    TEST_ASSERT_EQUAL_INT(0, validate_config(&cfg));
+    TEST_ASSERT_EQUAL_INT(DB_STARTUP_CHECK_OFF, cfg.db_startup_check);
 }
 
 void test_default_config_models_path_nonempty(void) {
@@ -472,6 +512,7 @@ int main(void) {
     UNITY_BEGIN();
 
     RUN_TEST(test_stream_config_t_size_under_16k);
+    RUN_TEST(test_max_stream_ceiling_is_valid);
 
     RUN_TEST(test_default_config_web_port);
     RUN_TEST(test_default_config_log_level);
@@ -496,6 +537,9 @@ int main(void) {
     RUN_TEST(test_validate_config_buffer_size_zero);
     RUN_TEST(test_validate_config_clamps_absolute_timeout_to_idle_timeout);
     RUN_TEST(test_validate_config_clamps_negative_db_backup_values);
+    RUN_TEST(test_default_config_db_startup_check_is_quick);
+    RUN_TEST(test_validate_config_clamps_out_of_range_startup_check);
+    RUN_TEST(test_validate_config_preserves_valid_startup_check);
 
     RUN_TEST(test_default_config_web_auth_enabled);
     RUN_TEST(test_default_config_username);

@@ -6,6 +6,8 @@
 #define _POSIX_C_SOURCE 200809L
 #define _GNU_SOURCE
 
+#include <pthread.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -22,11 +24,16 @@
 #include "utils/strings.h"
 #include "database/db_core.h"
 #include "database/db_auth.h"
+#include "database/db_onvif_discovery_inventory.h"
 #include "database/db_streams.h"
+#include "database/db_system_settings.h"
 #include "web/api_handlers.h"
+#include "web/api_handlers_onvif.h"
 #include "web/api_handlers_recording_control.h"
 #include "web/api_handlers_system.h"
+#include "web/api_handlers_setup.h"
 #include "web/request_response.h"
+#include "video/go2rtc/go2rtc_lifecycle.h"
 #include "video/stream_manager.h"
 #include "video/stream_state.h"
 
@@ -35,6 +42,10 @@ extern config_t g_config;
 static char g_tmp_root[MAX_PATH_LENGTH];
 static char g_db_path[MAX_PATH_LENGTH];
 static char g_storage_path[MAX_PATH_LENGTH];
+static pthread_mutex_t g_lifecycle_test_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t g_lifecycle_test_cond = PTHREAD_COND_INITIALIZER;
+static bool g_lifecycle_owner_ready;
+static atomic_bool g_lifecycle_owner_active;
 
 static cJSON *parse_response_json(const http_response_t *res) {
     TEST_ASSERT_NOT_NULL(res);
@@ -59,6 +70,13 @@ static cJSON *find_version_item(cJSON *items, const char *name) {
 static void clear_db_streams(void) {
     sqlite3 *db = get_db_handle();
     sqlite3_exec(db, "DELETE FROM streams;", NULL, NULL, NULL);
+}
+
+static void clear_onvif_inventory(void) {
+    sqlite3_exec(get_db_handle(),
+                 "DELETE FROM onvif_discovery_addresses;"
+                 "DELETE FROM onvif_discovery_inventory;",
+                 NULL, NULL, NULL);
 }
 
 static stream_config_t make_test_stream(const char *name) {
@@ -105,6 +123,30 @@ void setUp(void) {
 
 void tearDown(void) {}
 
+static void *hold_go2rtc_lifecycle(void *arg) {
+    (void)arg;
+    go2rtc_lifecycle_guard_t guard;
+    bool acquired = go2rtc_lifecycle_begin(
+        GO2RTC_LIFECYCLE_RECONFIGURE, false, true, &guard);
+
+    atomic_store(&g_lifecycle_owner_active, acquired);
+    pthread_mutex_lock(&g_lifecycle_test_mutex);
+    g_lifecycle_owner_ready = true;
+    pthread_cond_broadcast(&g_lifecycle_test_cond);
+    pthread_mutex_unlock(&g_lifecycle_test_mutex);
+
+    if (acquired) {
+        struct timespec hold_time = {
+            .tv_sec = 1,
+            .tv_nsec = 0,
+        };
+        nanosleep(&hold_time, NULL);
+        atomic_store(&g_lifecycle_owner_active, false);
+        go2rtc_lifecycle_end(&guard, true);
+    }
+    return NULL;
+}
+
 void test_handle_get_system_info_includes_versions_summary(void) {
     http_request_t req;
     http_response_t res;
@@ -135,6 +177,38 @@ void test_handle_get_system_info_includes_versions_summary(void) {
     TEST_ASSERT_TRUE(uptime->valuedouble >= 0.0);
 
     cJSON_Delete(root);
+    http_response_free(&res);
+}
+
+void test_handle_get_system_info_does_not_wait_for_go2rtc_lifecycle(void) {
+    pthread_mutex_lock(&g_lifecycle_test_mutex);
+    g_lifecycle_owner_ready = false;
+    pthread_mutex_unlock(&g_lifecycle_test_mutex);
+    atomic_store(&g_lifecycle_owner_active, false);
+
+    pthread_t owner;
+    TEST_ASSERT_EQUAL_INT(0, pthread_create(&owner, NULL,
+                                            hold_go2rtc_lifecycle, NULL));
+
+    pthread_mutex_lock(&g_lifecycle_test_mutex);
+    while (!g_lifecycle_owner_ready) {
+        pthread_cond_wait(&g_lifecycle_test_cond, &g_lifecycle_test_mutex);
+    }
+    pthread_mutex_unlock(&g_lifecycle_test_mutex);
+    TEST_ASSERT_TRUE(atomic_load(&g_lifecycle_owner_active));
+
+    http_request_t req;
+    http_response_t res;
+    http_request_init(&req);
+    http_response_init(&res);
+
+    handle_get_system_info(&req, &res);
+    bool returned_while_lifecycle_busy =
+        atomic_load(&g_lifecycle_owner_active);
+    pthread_join(owner, NULL);
+
+    TEST_ASSERT_TRUE(returned_while_lifecycle_busy);
+    TEST_ASSERT_EQUAL_INT(200, res.status_code);
     http_response_free(&res);
 }
 
@@ -383,6 +457,15 @@ void test_handle_get_streams_includes_audio_voice_enhancement(void) {
     TEST_ASSERT_EQUAL_INT(1, cJSON_GetArraySize(root));
 
     cJSON *stream = cJSON_GetArrayItem(root, 0);
+    cJSON *camera_uuid = cJSON_GetObjectItemCaseSensitive(stream, "camera_uuid");
+    TEST_ASSERT_TRUE(cJSON_IsString(camera_uuid));
+    TEST_ASSERT_EQUAL_UINT(CAMERA_UUID_STRING_SIZE - 1,
+                           strlen(camera_uuid->valuestring));
+    cJSON *location_uuid =
+        cJSON_GetObjectItemCaseSensitive(stream, "location_uuid");
+    TEST_ASSERT_TRUE(cJSON_IsString(location_uuid));
+    TEST_ASSERT_EQUAL_UINT(CAMERA_UUID_STRING_SIZE - 1,
+                           strlen(location_uuid->valuestring));
     cJSON *avoe = cJSON_GetObjectItemCaseSensitive(stream, "audio_voice_enhancement");
     TEST_ASSERT_NOT_NULL(avoe);
     TEST_ASSERT_TRUE(cJSON_IsBool(avoe));
@@ -401,6 +484,10 @@ void test_handle_get_stream_by_name_includes_audio_voice_enhancement(void) {
     stream_config_t s = make_test_stream("cam_avoe_one");
     s.audio_voice_enhancement = true;
     add_stream_config(&s);
+    TEST_ASSERT_EQUAL_INT(0,
+                          get_stream_config_by_name("cam_avoe_one", &s));
+    TEST_ASSERT_EQUAL_UINT(CAMERA_UUID_STRING_SIZE - 1,
+                           strlen(s.camera_uuid));
 
     init_stream_state_manager(16);
     init_stream_manager(16);
@@ -418,6 +505,14 @@ void test_handle_get_stream_by_name_includes_audio_voice_enhancement(void) {
         TEST_ASSERT_EQUAL_INT(200, res.status_code);
 
         cJSON *root = parse_response_json(&res);
+        cJSON *camera_uuid =
+            cJSON_GetObjectItemCaseSensitive(root, "camera_uuid");
+        TEST_ASSERT_TRUE(cJSON_IsString(camera_uuid));
+        TEST_ASSERT_EQUAL_STRING(s.camera_uuid, camera_uuid->valuestring);
+        cJSON *location_uuid =
+            cJSON_GetObjectItemCaseSensitive(root, "location_uuid");
+        TEST_ASSERT_TRUE(cJSON_IsString(location_uuid));
+        TEST_ASSERT_EQUAL_STRING(s.location_uuid, location_uuid->valuestring);
         cJSON *avoe = cJSON_GetObjectItemCaseSensitive(root, "audio_voice_enhancement");
         TEST_ASSERT_NOT_NULL(avoe);
         TEST_ASSERT_TRUE(cJSON_IsTrue(avoe));
@@ -440,6 +535,14 @@ void test_handle_get_stream_by_name_includes_audio_voice_enhancement(void) {
         cJSON *root = parse_response_json(&res);
         cJSON *stream_obj = cJSON_GetObjectItemCaseSensitive(root, "stream");
         TEST_ASSERT_NOT_NULL(stream_obj);
+        cJSON *camera_uuid =
+            cJSON_GetObjectItemCaseSensitive(stream_obj, "camera_uuid");
+        TEST_ASSERT_TRUE(cJSON_IsString(camera_uuid));
+        TEST_ASSERT_EQUAL_STRING(s.camera_uuid, camera_uuid->valuestring);
+        cJSON *location_uuid =
+            cJSON_GetObjectItemCaseSensitive(stream_obj, "location_uuid");
+        TEST_ASSERT_TRUE(cJSON_IsString(location_uuid));
+        TEST_ASSERT_EQUAL_STRING(s.location_uuid, location_uuid->valuestring);
         cJSON *avoe = cJSON_GetObjectItemCaseSensitive(stream_obj, "audio_voice_enhancement");
         TEST_ASSERT_NOT_NULL(avoe);
         TEST_ASSERT_TRUE(cJSON_IsTrue(avoe));
@@ -649,6 +752,173 @@ void test_manual_start_rejects_continuous_config_before_runtime_starts(void) {
     clear_db_streams();
 }
 
+void test_completed_setup_post_requires_system_admin(void) {
+    TEST_ASSERT_EQUAL_INT(0, db_mark_setup_complete());
+    bool prior_auth = g_config.web_auth_enabled;
+    g_config.web_auth_enabled = true;
+    http_request_t req;
+    http_response_t res;
+    http_request_init(&req);
+    http_response_init(&res);
+    safe_strcpy(req.path, "/api/setup/status", sizeof(req.path), 0);
+    safe_strcpy(req.method_str, "POST", sizeof(req.method_str), 0);
+    req.body = "{\"complete\":false}";
+    req.body_len = strlen((const char *)req.body);
+    handle_post_setup_complete(&req, &res);
+    TEST_ASSERT_EQUAL_INT(401, res.status_code);
+    TEST_ASSERT_TRUE(db_is_setup_complete());
+    http_response_free(&res);
+    g_config.web_auth_enabled = prior_auth;
+}
+
+void test_stream_retention_routes_require_camera_configure(void) {
+    bool prior_auth = g_config.web_auth_enabled;
+    g_config.web_auth_enabled = true;
+    http_request_t req;
+    http_response_t res;
+    http_request_init(&req);
+    http_response_init(&res);
+    safe_strcpy(req.path, "/api/streams/private/retention",
+                sizeof(req.path), 0);
+    safe_strcpy(req.method_str, "GET", sizeof(req.method_str), 0);
+    handle_get_stream_retention(&req, &res);
+    TEST_ASSERT_EQUAL_INT(401, res.status_code);
+    http_response_free(&res);
+    g_config.web_auth_enabled = prior_auth;
+}
+
+void test_handle_post_stream_persists_playback_transport(void) {
+    clear_db_streams();
+    init_stream_state_manager(16);
+    init_stream_manager(16);
+
+    http_request_t req;
+    http_response_t res;
+    http_request_init(&req);
+    http_response_init(&res);
+    static const char json_body[] =
+        "{\"name\":\"cam_transport_post\",\"url\":\"rtsp://localhost/stream\","
+        "\"playback_transport\":\"webrtc_then_mse\"}";
+    req.body = (uint8_t *)json_body;
+    req.body_len = sizeof(json_body) - 1;
+
+    handle_post_stream(&req, &res);
+
+    stream_config_t got;
+    TEST_ASSERT_EQUAL_INT(0,
+                          get_stream_config_by_name("cam_transport_post", &got));
+    TEST_ASSERT_EQUAL_STRING("webrtc_then_mse", got.playback_transport);
+
+    usleep(200000);
+    http_response_free(&res);
+    shutdown_stream_manager();
+    shutdown_stream_state_manager();
+    clear_db_streams();
+}
+
+void test_handle_post_stream_rejects_invalid_playback_transport(void) {
+    clear_db_streams();
+
+    http_request_t req;
+    http_response_t res;
+    http_request_init(&req);
+    http_response_init(&res);
+    static const char json_body[] =
+        "{\"name\":\"cam_transport_bad\",\"url\":\"rtsp://localhost/stream\","
+        "\"playback_transport\":\"rtsp_magic\"}";
+    req.body = (uint8_t *)json_body;
+    req.body_len = sizeof(json_body) - 1;
+
+    handle_post_stream(&req, &res);
+
+    TEST_ASSERT_EQUAL_INT(400, res.status_code);
+    stream_config_t got;
+    TEST_ASSERT_NOT_EQUAL(0,
+                          get_stream_config_by_name("cam_transport_bad", &got));
+    http_response_free(&res);
+}
+
+void test_get_onvif_devices_returns_persisted_inventory_metadata(void) {
+    clear_onvif_inventory();
+    onvif_device_info_t observed;
+    memset(&observed, 0, sizeof(observed));
+    safe_strcpy(observed.endpoint,
+                "urn:uuid:aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee",
+                sizeof(observed.endpoint), 0);
+    safe_strcpy(observed.device_service,
+                "http://192.0.2.80/onvif/device_service",
+                sizeof(observed.device_service), 0);
+    safe_strcpy(observed.ip_address, "192.0.2.80",
+                sizeof(observed.ip_address), 0);
+    safe_strcpy(observed.serial_number, "API-SERIAL",
+                sizeof(observed.serial_number), 0);
+    TEST_ASSERT_EQUAL_INT(
+        1, db_onvif_inventory_record_scan(
+               "192.0.2.0/24", &observed, 1, 1234));
+
+    http_request_t req;
+    http_response_t res;
+    http_request_init(&req);
+    http_response_init(&res);
+    handle_get_discovered_onvif_devices(&req, &res);
+    TEST_ASSERT_EQUAL_INT(200, res.status_code);
+    cJSON *root = parse_response_json(&res);
+    cJSON *devices = cJSON_GetObjectItemCaseSensitive(root, "devices");
+    TEST_ASSERT_TRUE(cJSON_IsArray(devices));
+    TEST_ASSERT_EQUAL_INT(1, cJSON_GetArraySize(devices));
+    cJSON *device_json = cJSON_GetArrayItem(devices, 0);
+    TEST_ASSERT_EQUAL_STRING(observed.inventory_uuid,
+        cJSON_GetObjectItemCaseSensitive(
+            device_json, "inventory_uuid")->valuestring);
+    TEST_ASSERT_EQUAL_STRING("unclaimed",
+        cJSON_GetObjectItemCaseSensitive(
+            device_json, "claim_state")->valuestring);
+    TEST_ASSERT_EQUAL_INT64(1234,
+        (int64_t)cJSON_GetObjectItemCaseSensitive(
+            device_json, "first_seen_at")->valuedouble);
+    TEST_ASSERT_TRUE(cJSON_IsArray(cJSON_GetObjectItemCaseSensitive(
+        device_json, "addresses")));
+    TEST_ASSERT_GREATER_OR_EQUAL_INT(
+        3, cJSON_GetArraySize(cJSON_GetObjectItemCaseSensitive(
+               device_json, "addresses")));
+    cJSON_Delete(root);
+    http_response_free(&res);
+    clear_onvif_inventory();
+}
+
+void test_claim_onvif_device_api_requires_existing_stream(void) {
+    clear_onvif_inventory();
+    clear_db_streams();
+    onvif_device_info_t observed;
+    memset(&observed, 0, sizeof(observed));
+    safe_strcpy(observed.endpoint,
+                "urn:uuid:bbbbbbbb-cccc-4ddd-8eee-ffffffffffff",
+                sizeof(observed.endpoint), 0);
+    safe_strcpy(observed.device_service,
+                "http://192.0.2.81/onvif/device_service",
+                sizeof(observed.device_service), 0);
+    safe_strcpy(observed.ip_address, "192.0.2.81",
+                sizeof(observed.ip_address), 0);
+    TEST_ASSERT_EQUAL_INT(
+        1, db_onvif_inventory_record_scan(
+               "192.0.2.0/24", &observed, 1, 1235));
+
+    char json_body[256];
+    snprintf(json_body, sizeof(json_body),
+             "{\"inventory_uuid\":\"%s\",\"stream_name\":\"missing\"}",
+             observed.inventory_uuid);
+    http_request_t req;
+    http_response_t res;
+    http_request_init(&req);
+    http_response_init(&res);
+    req.body = (uint8_t *)json_body;
+    req.body_len = strlen(json_body);
+    handle_post_claim_onvif_device(&req, &res);
+    TEST_ASSERT_EQUAL_INT(404, res.status_code);
+    http_response_free(&res);
+    clear_onvif_inventory();
+}
+
 int main(void) {
     init_logger();
     load_default_config(&g_config);
@@ -672,6 +942,7 @@ int main(void) {
 
     UNITY_BEGIN();
     RUN_TEST(test_handle_get_system_info_includes_versions_summary);
+    RUN_TEST(test_handle_get_system_info_does_not_wait_for_go2rtc_lifecycle);
     RUN_TEST(test_handle_get_system_info_includes_empty_stream_storage_array);
     RUN_TEST(test_get_json_logs_tail_owns_level_reference_nodes);
     RUN_TEST(test_handle_get_streams_includes_motion_trigger_source);
@@ -686,6 +957,12 @@ int main(void) {
     RUN_TEST(test_handle_post_stream_rejects_disallowed_detection_url);
     RUN_TEST(test_handle_put_stream_rejects_disallowed_detection_url);
     RUN_TEST(test_manual_start_rejects_continuous_config_before_runtime_starts);
+    RUN_TEST(test_completed_setup_post_requires_system_admin);
+    RUN_TEST(test_stream_retention_routes_require_camera_configure);
+    RUN_TEST(test_handle_post_stream_persists_playback_transport);
+    RUN_TEST(test_handle_post_stream_rejects_invalid_playback_transport);
+    RUN_TEST(test_get_onvif_devices_returns_persisted_inventory_metadata);
+    RUN_TEST(test_claim_onvif_device_api_requires_existing_stream);
     int result = UNITY_END();
 
     shutdown_database();

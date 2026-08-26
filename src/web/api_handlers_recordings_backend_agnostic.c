@@ -17,10 +17,12 @@
 
 #include "web/request_response.h"
 #include "web/httpd_utils.h"
+#include "web/audit_log.h"
 #include "web/batch_delete_progress.h"
 #define LOG_COMPONENT "RecordingsAPI"
 #include "core/logger.h"
 #include "core/config.h"
+#include "core/camera_collection_filter.h"
 #include "core/shutdown_coordinator.h"
 #include "database/database_manager.h"
 #include "database/db_recordings.h"
@@ -29,6 +31,26 @@
 #include "utils/strings.h"
 #include "web/api_handlers_recordings_thumbnail.h"
 #include "storage/storage_manager_streams_cache.h"
+
+static void audit_recording_delete_operation(
+    const http_request_t *req, const user_t *user,
+    const fleet_camera_t *camera, uint64_t recording_id,
+    const char *outcome, const char *reason, const char *file_cleanup) {
+    char recording_uuid[32];
+    snprintf(recording_uuid, sizeof(recording_uuid), "%llu",
+             (unsigned long long)recording_id);
+    cJSON *details = cJSON_CreateObject();
+    if (details) {
+        cJSON_AddStringToObject(details, "camera_uuid", camera->camera_uuid);
+        cJSON_AddStringToObject(details, "reason", reason);
+        if (file_cleanup) {
+            cJSON_AddStringToObject(details, "file_cleanup", file_cleanup);
+        }
+    }
+    audit_log_operation(req, user, "recording.delete", "recording",
+                        recording_uuid, "delete_recording", outcome, details);
+    cJSON_Delete(details);
+}
 
 /**
  * @brief Backend-agnostic handler for GET /api/recordings/:id
@@ -66,6 +88,15 @@ void handle_get_recording(const http_request_t *req, http_response_t *res) {
     if (get_recording_metadata_by_id(id, &recording) != 0) {
         log_error("Recording not found: %llu", (unsigned long long)id);
         http_response_set_json_error(res, 404, "Recording not found");
+        return;
+    }
+
+    user_t user;
+    fleet_camera_t camera;
+    authorization_evaluation_t evaluation;
+    if (!httpd_authorize_camera_identity_action_with_context(
+            req, res, AUTHZ_RECORDINGS_REPLAY, recording.camera_uuid,
+            recording.stream_name, &user, &camera, &evaluation)) {
         return;
     }
     
@@ -111,6 +142,12 @@ void handle_get_recording(const http_request_t *req, http_response_t *res) {
     // Add recording properties
     cJSON_AddNumberToObject(recording_obj, "id", (double)recording.id);
     cJSON_AddStringToObject(recording_obj, "stream", recording.stream_name);
+    if (recording.camera_uuid[0] != '\0') {
+        cJSON_AddStringToObject(recording_obj, "camera_uuid",
+                                recording.camera_uuid);
+    } else {
+        cJSON_AddNullToObject(recording_obj, "camera_uuid");
+    }
     cJSON_AddStringToObject(recording_obj, "file_path", recording.file_path);
     cJSON_AddStringToObject(recording_obj, "start_time", start_time_str);
     cJSON_AddStringToObject(recording_obj, "end_time", end_time_str);
@@ -188,33 +225,11 @@ void handle_get_recording(const http_request_t *req, http_response_t *res) {
 }
 
 /**
- * @brief Check if the user has permission to delete recordings
- */
-static int check_delete_permission(const http_request_t *req) {
-    user_t user;
-
-    // Get the authenticated user
-    if (!httpd_get_authenticated_user(req, &user)) {
-        return 0; // Not authenticated
-    }
-
-    // Only admin and regular users can delete recordings, viewers cannot
-    return (user.role == USER_ROLE_ADMIN || user.role == USER_ROLE_USER);
-}
-
-/**
  * @brief Backend-agnostic handler for DELETE /api/recordings/:id
  *
  * Deletes a single recording from the database and filesystem.
  */
 void handle_delete_recording(const http_request_t *req, http_response_t *res) {
-    // Check authentication and permissions
-    if (!check_delete_permission(req)) {
-        log_error("Permission denied for DELETE /api/recordings/:id");
-        http_response_set_json_error(res, 403, "Permission denied: Only admin and regular users can delete recordings");
-        return;
-    }
-
     // Extract recording ID from URL
     char id_str[32];
     if (http_request_extract_path_param(req, "/api/recordings/", id_str, sizeof(id_str)) != 0) {
@@ -242,6 +257,14 @@ void handle_delete_recording(const http_request_t *req, http_response_t *res) {
         http_response_set_json_error(res, 404, "Recording not found");
         return;
     }
+    user_t user;
+    fleet_camera_t camera;
+    authorization_evaluation_t evaluation;
+    if (!httpd_authorize_stream_action_with_context(
+            req, res, AUTHZ_RECORDING_DELETE, recording.stream_name, &user,
+            &camera, &evaluation)) {
+        return;
+    }
 
     // Save file path before deleting from database
     char file_path_copy[MAX_PATH_LENGTH];
@@ -249,6 +272,9 @@ void handle_delete_recording(const http_request_t *req, http_response_t *res) {
 
     // Delete from database FIRST
     if (delete_recording_metadata(id) != 0) {
+        audit_recording_delete_operation(
+            req, &user, &camera, id, "error", "database_delete_failed",
+            "not_attempted");
         log_error("Failed to delete recording from database: %llu", (unsigned long long)id);
         http_response_set_json_error(res, 500, "Failed to delete recording from database");
         return;
@@ -258,11 +284,14 @@ void handle_delete_recording(const http_request_t *req, http_response_t *res) {
 
     // Then delete the file from disk.
     // Attempt unlink directly instead of stat-then-unlink to avoid TOCTOU (#38).
+    const char *file_cleanup = "deleted";
     if (unlink(file_path_copy) != 0) {
         if (errno == ENOENT) {
+            file_cleanup = "already_missing";
             log_warn("Recording file does not exist: %s (already deleted or never created)", file_path_copy);
             // This is acceptable - DB entry is removed
         } else {
+            file_cleanup = "failed";
             log_warn("Failed to delete recording file: %s (error: %s)",
                     file_path_copy, strerror(errno));
             // File deletion failed but DB entry is already removed
@@ -278,6 +307,9 @@ void handle_delete_recording(const http_request_t *req, http_response_t *res) {
     // Update stream storage cache so System page stats reflect the deletion immediately.
     update_stream_storage_cache_remove_recording(recording.stream_name, recording.size_bytes);
 
+    audit_recording_delete_operation(req, &user, &camera, id, "success",
+                                     "completed", file_cleanup);
+
     // Send success response
     http_response_set_json(res, 200, "{\"success\":true,\"message\":\"Recording deleted successfully\"}");
 
@@ -290,7 +322,51 @@ void handle_delete_recording(const http_request_t *req, http_response_t *res) {
 typedef struct {
     char job_id[64];
     cJSON *json;  // Parsed JSON request (will be freed by thread)
+    int preflight_error_count;
+    int64_t owner_user_id;
+    char owner_username[64];
+    char owner_auth_method[USER_AUTH_METHOD_MAX];
+    char owner_api_token_uuid[USER_API_TOKEN_UUID_MAX];
+    char audit_request_id[REQUEST_ID_MAX];
+    char audit_client_ip[64];
 } batch_delete_thread_data_t;
+
+static void audit_batch_delete_job(const batch_delete_thread_data_t *data,
+                                   const char *outcome, const char *reason,
+                                   int total_count, int success_count,
+                                   int error_count) {
+    if (!data) return;
+    user_t user = {0};
+    user.id = data->owner_user_id;
+    safe_strcpy(user.username, data->owner_username, sizeof(user.username), 0);
+    safe_strcpy(user.authentication_method, data->owner_auth_method,
+                sizeof(user.authentication_method), 0);
+    if (data->owner_api_token_uuid[0]) {
+        user.authenticated_via_scoped_token = true;
+        safe_strcpy(user.api_token_uuid, data->owner_api_token_uuid,
+                    sizeof(user.api_token_uuid), 0);
+    }
+    http_request_t request = {0};
+    request.method = HTTP_METHOD_POST;
+    safe_strcpy(request.method_str, "POST", sizeof(request.method_str), 0);
+    safe_strcpy(request.path, "/api/recordings/batch-delete",
+                sizeof(request.path), 0);
+    safe_strcpy(request.uri, request.path, sizeof(request.uri), 0);
+    safe_strcpy(request.client_ip, data->audit_client_ip,
+                sizeof(request.client_ip), 0);
+    safe_strcpy(request.request_id, data->audit_request_id,
+                sizeof(request.request_id), 0);
+    cJSON *details = cJSON_CreateObject();
+    if (details) {
+        cJSON_AddStringToObject(details, "reason", reason);
+        cJSON_AddNumberToObject(details, "total_count", total_count);
+        cJSON_AddNumberToObject(details, "success_count", success_count);
+        cJSON_AddNumberToObject(details, "error_count", error_count);
+    }
+    audit_log_operation(&request, &user, "recording.delete", "delete_job",
+                        data->job_id, "batch_delete", outcome, details);
+    cJSON_Delete(details);
+}
 
 /**
  * @brief Thread function to perform batch delete with progress updates
@@ -321,7 +397,7 @@ static void *batch_delete_worker_thread(void *arg) {
 
         // Process each ID
         int success_count = 0;
-        int error_count = 0;
+        int error_count = data->preflight_error_count;
 
         for (int i = 0; i < array_size; i++) {
             cJSON *id_item = cJSON_GetArrayItem(ids_array, i);
@@ -384,6 +460,10 @@ static void *batch_delete_worker_thread(void *arg) {
 
         // Mark as complete
         batch_delete_progress_complete(job_id, success_count, error_count);
+        audit_batch_delete_job(
+            data, error_count == 0 ? "success" : "failure",
+            error_count == 0 ? "completed" : "partial_failure", array_size,
+            success_count, error_count);
         log_info("Batch delete job completed: %s (succeeded: %d, failed: %d)", job_id, success_count, error_count);
 
     } else if (filter && cJSON_IsObject(filter)) {
@@ -395,6 +475,7 @@ static void *batch_delete_worker_thread(void *arg) {
         char detection_label[256] = {0};
         char tag_filter[512] = {0};
         char capture_method_filter[128] = {0};
+        char collection_uuid[CAMERA_UUID_STRING_SIZE] = {0};
         // protected_filter: -1=all, 0=not protected, 1=protected
         int protected_filter = -1;
 
@@ -410,6 +491,7 @@ static void *batch_delete_worker_thread(void *arg) {
         cJSON *tag_item = cJSON_GetObjectItem(filter, "tag");
         cJSON *capture_method_item = cJSON_GetObjectItem(filter, "capture_method");
         cJSON *protected_item = cJSON_GetObjectItem(filter, "protected");
+        cJSON *collection_item = cJSON_GetObjectItem(filter, "collection_uuid");
 
         if (start && cJSON_IsString(start)) {
             struct tm tm = {0};
@@ -435,6 +517,19 @@ static void *batch_delete_worker_thread(void *arg) {
 
         if (stream && cJSON_IsString(stream)) {
             safe_strcpy(stream_name, stream->valuestring, sizeof(stream_name), 0);
+        }
+        if (collection_item && cJSON_IsString(collection_item)) {
+            safe_strcpy(collection_uuid, collection_item->valuestring,
+                        sizeof(collection_uuid), 0);
+        }
+        if (stream_name[0] && collection_uuid[0]) {
+            batch_delete_progress_error(
+                job_id, "Collection and stream filters cannot be combined");
+            audit_batch_delete_job(data, "failure", "invalid_filter", 0, 0,
+                                   0);
+            cJSON_Delete(json);
+            free(data);
+            return NULL;
         }
 
         if (detection && cJSON_IsNumber(detection)) {
@@ -464,18 +559,53 @@ static void *batch_delete_worker_thread(void *arg) {
             log_info("Batch delete: protected_filter=%d", protected_filter);
         }
 
+        char **collection_streams = NULL;
+        int collection_stream_count = 0;
+        if (collection_uuid[0]) {
+            camera_collection_filter_result_t result =
+                camera_collection_filter_resolve_stream_names_for_authorization(
+                    collection_uuid, &collection_streams,
+                    &collection_stream_count);
+            if (result != CAMERA_COLLECTION_FILTER_OK) {
+                batch_delete_progress_error(job_id,
+                                            "Failed to resolve camera collection");
+                audit_batch_delete_job(data, "error",
+                                       "collection_resolution_failed", 0, 0,
+                                       0);
+                cJSON_Delete(json);
+                free(data);
+                return NULL;
+            }
+            if (collection_stream_count == 0) {
+                camera_collection_filter_free_stream_names(
+                    collection_streams, collection_stream_count);
+                batch_delete_progress_complete(job_id, 0, 0);
+                audit_batch_delete_job(data, "success", "no_matches", 0, 0,
+                                       0);
+                cJSON_Delete(json);
+                free(data);
+                return NULL;
+            }
+        }
+
         // Get total count
         int total_count = get_recording_count(start_time, end_time,
                                             stream_name[0] != '\0' ? stream_name : NULL,
                                             has_detection,
                                             detection_label[0] != '\0' ? detection_label : NULL,
                                             protected_filter,
-                                            NULL, 0,
+                                            collection_uuid[0]
+                                                ? (const char * const *)collection_streams
+                                                : NULL,
+                                            collection_uuid[0] ? collection_stream_count : 0,
                                             tag_filter[0] != '\0' ? tag_filter : NULL,
                                             capture_method_filter[0] != '\0' ? capture_method_filter : NULL);
 
         if (total_count <= 0) {
+            camera_collection_filter_free_stream_names(
+                collection_streams, collection_stream_count);
             batch_delete_progress_complete(job_id, 0, 0);
+            audit_batch_delete_job(data, "success", "no_matches", 0, 0, 0);
             cJSON_Delete(json);
             free(data);
             return NULL;
@@ -491,7 +621,11 @@ static void *batch_delete_worker_thread(void *arg) {
         recording_metadata_t *recordings = (recording_metadata_t *)malloc(total_count * sizeof(recording_metadata_t));
         if (!recordings) {
             log_error("Failed to allocate memory for recordings");
+            camera_collection_filter_free_stream_names(
+                collection_streams, collection_stream_count);
             batch_delete_progress_error(job_id, "Failed to allocate memory");
+            audit_batch_delete_job(data, "error", "allocation_failed",
+                                   total_count, 0, 0);
             cJSON_Delete(json);
             free(data);
             return NULL;
@@ -504,17 +638,25 @@ static void *batch_delete_worker_thread(void *arg) {
                                                   detection_label[0] != '\0' ? detection_label : NULL,
                                                   protected_filter, "id", "asc",
                                                   recordings, total_count, 0,
-                                                  NULL, 0,
+                                                  collection_uuid[0]
+                                                      ? (const char * const *)collection_streams
+                                                      : NULL,
+                                                  collection_uuid[0] ? collection_stream_count : 0,
                                                   tag_filter[0] != '\0' ? tag_filter : NULL,
                                                   capture_method_filter[0] != '\0' ? capture_method_filter : NULL);
 
         if (count <= 0) {
             free(recordings);
+            camera_collection_filter_free_stream_names(
+                collection_streams, collection_stream_count);
             batch_delete_progress_complete(job_id, 0, 0);
+            audit_batch_delete_job(data, "success", "no_matches", 0, 0, 0);
             cJSON_Delete(json);
             free(data);
             return NULL;
         }
+        camera_collection_filter_free_stream_names(
+            collection_streams, collection_stream_count);
 
         // Process each recording
         int success_count = 0;
@@ -567,10 +709,15 @@ static void *batch_delete_worker_thread(void *arg) {
 
         free(recordings);
         batch_delete_progress_complete(job_id, success_count, error_count);
+        audit_batch_delete_job(
+            data, error_count == 0 ? "success" : "failure",
+            error_count == 0 ? "completed" : "partial_failure", count,
+            success_count, error_count);
         log_info("Batch delete job completed: %s (succeeded: %d, failed: %d)", job_id, success_count, error_count);
     } else {
         log_error("Invalid request format");
         batch_delete_progress_error(job_id, "Invalid request format");
+        audit_batch_delete_job(data, "failure", "invalid_request", 0, 0, 0);
     }
 
     // Cleanup
@@ -578,6 +725,98 @@ static void *batch_delete_worker_thread(void *arg) {
     free(data);
 
     return NULL;
+}
+
+static int authorize_batch_delete_ids(const user_t *user, cJSON *json,
+                                      int *failure_count,
+                                      http_response_t *res) {
+    cJSON *ids = cJSON_GetObjectItemCaseSensitive(json, "ids");
+    cJSON *authorized = cJSON_CreateArray();
+    if (!authorized) {
+        http_response_set_json_error(res, 500, "Failed to authorize batch");
+        return 0;
+    }
+
+    *failure_count = 0;
+    cJSON *item = NULL;
+    cJSON_ArrayForEach(item, ids) {
+        if (!cJSON_IsNumber(item) || item->valuedouble <= 0) {
+            (*failure_count)++;
+            continue;
+        }
+        uint64_t id = (uint64_t)item->valuedouble;
+        recording_metadata_t recording;
+        if (get_recording_metadata_by_id(id, &recording) != 0) {
+            (*failure_count)++;
+            continue;
+        }
+        authorization_evaluation_t evaluation;
+        int result = httpd_evaluate_stream_action(
+            user, AUTHZ_RECORDING_DELETE, recording.stream_name, &evaluation);
+        if (result < 0) {
+            cJSON_Delete(authorized);
+            http_response_set_json_error(
+                res, 500, "Authorization policy evaluation failed");
+            return 0;
+        }
+        if (result > 0 || evaluation.decision != AUTHZ_DECISION_ALLOW) {
+            (*failure_count)++;
+            continue;
+        }
+        cJSON_AddItemToArray(authorized, cJSON_CreateNumber((double)id));
+    }
+
+    cJSON_DeleteItemFromObjectCaseSensitive(json, "ids");
+    cJSON_AddItemToObject(json, "ids", authorized);
+    return 1;
+}
+
+static int authorize_batch_delete_filter(const user_t *user,
+                                         const cJSON *filter,
+                                         http_response_t *res) {
+    cJSON *stream = cJSON_GetObjectItemCaseSensitive(filter, "stream_name");
+    if (!stream) stream = cJSON_GetObjectItemCaseSensitive(filter, "stream");
+    if (cJSON_IsString(stream) && stream->valuestring[0] != '\0') {
+        char names[256];
+        if (strlen(stream->valuestring) >= sizeof(names)) {
+            http_response_set_json_error(res, 400, "Stream filter is too long");
+            return 0;
+        }
+        safe_strcpy(names, stream->valuestring, sizeof(names), 0);
+        char *saveptr = NULL;
+        for (char *name = strtok_r(names, ",", &saveptr); name;
+             name = strtok_r(NULL, ",", &saveptr)) {
+            name = trim_ascii_whitespace(name);
+            authorization_evaluation_t evaluation;
+            int result = httpd_evaluate_stream_action(
+                user, AUTHZ_RECORDING_DELETE, name, &evaluation);
+            if (result < 0) {
+                http_response_set_json_error(
+                    res, 500, "Authorization policy evaluation failed");
+                return 0;
+            }
+            if (result > 0 || evaluation.decision != AUTHZ_DECISION_ALLOW) {
+                http_response_set_json_error(res, 403, "Forbidden");
+                return 0;
+            }
+        }
+        return 1;
+    }
+
+    // Open-ended filters can expand after this request. Only an all-fleet
+    // grant (or an unrestricted compatible legacy role) may launch them.
+    authorization_evaluation_t evaluation;
+    if (authorization_evaluate(user, AUTHZ_RECORDING_DELETE, NULL,
+                               &evaluation) != 0) {
+        http_response_set_json_error(
+            res, 500, "Authorization policy evaluation failed");
+        return 0;
+    }
+    if (evaluation.decision != AUTHZ_DECISION_ALLOW) {
+        http_response_set_json_error(res, 403, "Forbidden");
+        return 0;
+    }
+    return 1;
 }
 
 /**
@@ -588,10 +827,9 @@ static void *batch_delete_worker_thread(void *arg) {
 void handle_batch_delete_recordings(const http_request_t *req, http_response_t *res) {
     log_info("Handling POST /api/recordings/batch-delete request");
 
-    // Check authentication and permissions
-    if (!check_delete_permission(req)) {
-        log_error("Permission denied for batch delete");
-        http_response_set_json_error(res, 403, "Permission denied: Only admin and regular users can delete recordings");
+    user_t user;
+    if (!httpd_check_action_access(req, &user)) {
+        http_response_set_json_error(res, 401, "Unauthorized");
         return;
     }
 
@@ -610,6 +848,7 @@ void handle_batch_delete_recordings(const http_request_t *req, http_response_t *
     // Determine total count for job creation
     int total_count = 0;
 
+    int preflight_error_count = 0;
     if (ids_array && cJSON_IsArray(ids_array)) {
         // Delete by IDs
         total_count = cJSON_GetArraySize(ids_array);
@@ -619,9 +858,18 @@ void handle_batch_delete_recordings(const http_request_t *req, http_response_t *
             http_response_set_json_error(res, 400, "Empty 'ids' array");
             return;
         }
+        if (!authorize_batch_delete_ids(&user, json,
+                                        &preflight_error_count, res)) {
+            cJSON_Delete(json);
+            return;
+        }
     } else if (filter && cJSON_IsObject(filter)) {
         // Delete by filter - total count will be determined by worker thread
         total_count = 0;
+        if (!authorize_batch_delete_filter(&user, filter, res)) {
+            cJSON_Delete(json);
+            return;
+        }
     } else {
         log_error("Request must contain either 'ids' array or 'filter' object");
         cJSON_Delete(json);
@@ -631,7 +879,10 @@ void handle_batch_delete_recordings(const http_request_t *req, http_response_t *
 
     // Create a batch delete job
     char job_id[64];
-    if (batch_delete_progress_create_job(total_count, job_id) != 0) {
+    const char *owner_token_uuid = user.authenticated_via_scoped_token
+        ? user.api_token_uuid : NULL;
+    if (batch_delete_progress_create_job_for_principal(
+            total_count, user.id, owner_token_uuid, job_id) != 0) {
         log_error("Failed to create batch delete job");
         cJSON_Delete(json);
         http_response_set_json_error(res, 500, "Failed to create batch delete job");
@@ -650,8 +901,27 @@ void handle_batch_delete_recordings(const http_request_t *req, http_response_t *
         return;
     }
 
+    memset(thread_data, 0, sizeof(*thread_data));
     safe_strcpy(thread_data->job_id, job_id, sizeof(thread_data->job_id), 0);
     thread_data->json = json;  // Transfer ownership to thread
+    thread_data->preflight_error_count = preflight_error_count;
+    thread_data->owner_user_id = user.id;
+    safe_strcpy(thread_data->owner_username, user.username,
+                sizeof(thread_data->owner_username), 0);
+    safe_strcpy(thread_data->owner_auth_method, user.authentication_method,
+                sizeof(thread_data->owner_auth_method), 0);
+    if (user.authenticated_via_scoped_token) {
+        safe_strcpy(thread_data->owner_api_token_uuid, user.api_token_uuid,
+                    sizeof(thread_data->owner_api_token_uuid), 0);
+    }
+    safe_strcpy(thread_data->audit_request_id, req->request_id,
+                sizeof(thread_data->audit_request_id), 0);
+    if (httpd_get_effective_client_ip(req, thread_data->audit_client_ip,
+                                      sizeof(thread_data->audit_client_ip)) !=
+        0) {
+        safe_strcpy(thread_data->audit_client_ip, req->client_ip,
+                    sizeof(thread_data->audit_client_ip), 0);
+    }
 
     // Spawn worker thread
     pthread_t thread;
@@ -662,6 +932,8 @@ void handle_batch_delete_recordings(const http_request_t *req, http_response_t *
     if (pthread_create(&thread, &attr, batch_delete_worker_thread, thread_data) != 0) {
         log_error("Failed to create worker thread");
         batch_delete_progress_error(job_id, "Failed to create worker thread");
+        audit_batch_delete_job(thread_data, "error", "worker_start_failed",
+                               total_count, 0, preflight_error_count);
         cJSON_Delete(json);
         free(thread_data);
         pthread_attr_destroy(&attr);
@@ -700,6 +972,12 @@ void handle_batch_delete_recordings(const http_request_t *req, http_response_t *
 void handle_batch_delete_progress(const http_request_t *req, http_response_t *res) {
     log_info("Handling GET /api/recordings/batch-delete/progress request");
 
+    user_t user;
+    if (!httpd_check_action_access(req, &user)) {
+        http_response_set_json_error(res, 401, "Unauthorized");
+        return;
+    }
+
     // Extract job ID from URL
     // URL format: /api/recordings/batch-delete/progress/:job_id
     char job_id[64] = {0};
@@ -715,6 +993,13 @@ void handle_batch_delete_progress(const http_request_t *req, http_response_t *re
     batch_delete_progress_t progress;
     if (batch_delete_progress_get(job_id, &progress) != 0) {
         log_error("Job not found: %s", job_id);
+        http_response_set_json_error(res, 404, "Job not found");
+        return;
+    }
+    const char *request_token_uuid = user.authenticated_via_scoped_token
+        ? user.api_token_uuid : "";
+    if (progress.owner_user_id != user.id ||
+        strcmp(progress.owner_api_token_uuid, request_token_uuid) != 0) {
         http_response_set_json_error(res, 404, "Job not found");
         return;
     }

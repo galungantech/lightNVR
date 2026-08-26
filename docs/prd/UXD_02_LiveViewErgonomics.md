@@ -1,10 +1,13 @@
 # PRD — Live View Ergonomics
 
-**Status**: Draft
+**Status**: Implementation complete — P0–P3 are present. Manual coarse-pointer,
+iOS/Android fullscreen, and cross-device acceptance remains to reconcile
 **Created**: 2026-04-22
 **Owner**: TBD
 **Driving signal**: [#326 (CDx4f3kCAf3Y)](https://github.com/opensensor/lightNVR/issues/326), [#397 (AndyIsHereBoi)](https://github.com/opensensor/lightNVR/issues/397), and the Live View / mobile items from [#399](https://github.com/opensensor/lightNVR/issues/399).
-**Scope**: `web/js/components/preact/LiveView.jsx`, `HLSVideoCell.jsx`, `MSEVideoCell.jsx`, `GridPicker.jsx`, `FullscreenManager.jsx`, plus a new per-stream "Playback profile" model.
+**Scope**: `web/js/components/preact/LiveView.jsx`, `PlaybackTransportCell.jsx`,
+`HLSVideoCell.jsx`, `MSEVideoCell.jsx`, `WebRTCVideoCell.jsx`, `GridPicker.jsx`,
+`FullscreenManager.jsx`, and the per-stream playback transport model.
 
 ---
 
@@ -49,6 +52,9 @@ Add a new field to `stream_config_t` (and `db_streams`) and a UI control on the 
 - **`playback_transport`** enum: `auto` (default), `webrtc_only`, `mse_only`, `hls_only`, `webrtc_then_mse`, `mse_then_hls`.
 - **`auto`** behavior matches today's: try WebRTC if globally enabled, else MSE, else HLS.
 - The Live View tile reads the per-stream value and only attempts the listed transports in order, surfacing a "fallback used" badge when it had to drop down.
+- The default **Auto** viewer honors those per-stream chains. Selecting the
+  WebRTC, HLS, or MSE viewer tab is an operator override that forces every tile
+  to that one transport; it does not silently substitute another renderer.
 
 UI:
 - Stream edit modal grows a "Playback transport" select, default Auto.
@@ -101,6 +107,8 @@ Both glyphs live in a 28×28 pill on desktop, full-size 36×36 on mobile.
 
 ## 5. Data model changes
 
+Implemented in migration `0069_add_stream_playback_transport.sql`:
+
 ```
 ALTER TABLE streams
   ADD COLUMN playback_transport TEXT NOT NULL DEFAULT 'auto'
@@ -109,11 +117,12 @@ ALTER TABLE streams
        'webrtc_then_mse','mse_then_hls'));
 ```
 
-`system_settings` adds:
-- `transport_webrtc_offered` (bool, default true)
-- `transport_mse_offered` (bool, default true)
-- `transport_hls_offered` (bool, default true)
-- `live_view_grid_layout_v2` (JSON, single source of truth)
+The existing `[web]` configuration flags `webrtc_disabled`, `mse_disabled`,
+and `hls_disabled` gate the globally offered transports. The implemented
+`[web] default_playback_transport` setting supplies the initial profile for new
+streams. Shared grid order currently persists client-side through the common
+camera-order store rather than a `system_settings.live_view_grid_layout_v2`
+database key.
 
 Migration: run-once on boot (similar to T14 from the go2rtc work) — merges legacy `grid_layout_webrtc/mse/hls` keys into the new field, last-write-wins.
 
@@ -121,10 +130,28 @@ Migration: run-once on boot (similar to T14 from the go2rtc work) — merges leg
 
 | Phase | Scope | Estimate |
 |---|---|---|
-| P0 — Glyph badges + fullscreen polish | Pure-frontend; no schema work | 2 days |
-| P1 — Per-stream transport (#397) | Schema + migration + UI + LiveView routing | 3–5 days |
-| P2 — Unified grid model (#326) | Migration + LiveView refactor | 3 days |
-| P3 — Mobile gestures | Add gesture library, instrumentation for the tip toasts | 4–5 days |
+| P0 — Glyph badges + fullscreen polish | Implemented: accessible recording/health glyphs, double-click fullscreen, digital zoom, native PiP, and persisted single-tap fullscreen preference | 2 days |
+| P1 — Per-stream transport (#397) | Implemented: migration 0069, stream API and defaults UI, global offering gates, mixed per-tile routing, ordered runtime fallback, fallback badges, and unavailable-profile warnings | 3–5 days |
+| P2 — Unified grid model (#326) | Implemented: renderers share one persisted camera order | 3 days |
+| P3 — Mobile gestures | Implemented: timed tap chrome, long-press actions, pull-to-refresh with player reload, fullscreen cycling/exit swipes, pinch zoom, and a persisted contextual tip | 4–5 days |
+
+Implementation note (2026-08-25): P0 now renders the same compact status pill
+for WebRTC, MSE, and HLS tiles. Recording flags remain independently visible in
+the accessible label and health distinguishes playing, recovering/buffering,
+and unavailable states. Native Picture-in-Picture uses the standard API with a
+Safari presentation-mode fallback. The off-by-default single-tap fullscreen
+preference is shared across both Live entry points and disabled during reorder
+mode; double-click remains the default interaction.
+
+Implementation note (2026-08-25): P3 uses small pointer/touch recognizers rather
+than a gesture dependency. The HLS, MSE, and WebRTC tiles share a four-second
+mobile chrome window and long-press menu for exclusive audio, snapshots,
+stream-scoped recordings, and reorder mode. Pull-to-refresh refetches the
+stream inventory and remounts active players so manifests/connections reload.
+Native fullscreen supports horizontal grid-order cycling and swipe-down exit;
+swipes are ignored while digitally zoomed, and a reversible CSS fullscreen
+fallback covers browsers that reject element fullscreen. The manual fullscreen
+button shows the one-time double-tap tip after its third use.
 
 ## 7. Acceptance criteria
 

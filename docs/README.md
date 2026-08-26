@@ -14,7 +14,8 @@ will need them.
    - [Home Assistant add-on](HOME_ASSISTANT.md) — for Home Assistant OS / Supervised
    - [Windows via Podman + WSL2](WINDOWS_PODMAN.md)
    - [Build from source](BUILD.md) — for embedded targets or development
-2. **Log in and change the password.** The default is `admin` / `admin` and the web server
+2. **Log in and complete the required password change.** The default is `admin` / `admin`;
+   a new installation blocks the rest of the UI until you replace it. The web server
    listens on all interfaces — see the warning in [CONFIGURATION.md](CONFIGURATION.md#web-server-settings).
 3. **Add a camera.** Use ONVIF discovery if your cameras support it
    ([ONVIF_DETECTION.md](ONVIF_DETECTION.md)); otherwise add the RTSP URL by hand.
@@ -64,6 +65,7 @@ covers a blank or broken web UI specifically.
 | Document | What it covers |
 |---|---|
 | [API.md](API.md) | The REST API |
+| [EVENT_CONTRACT.md](EVENT_CONTRACT.md) | Versioned operational event envelope, registry, schemas, and privacy rules |
 | [MQTT_INTEGRATION.md](MQTT_INTEGRATION.md) | Publishing detection events, with Home Assistant examples |
 | [CAMERAS.md](CAMERAS.md) | Camera compatibility, finding RTSP URLs, vendor interop notes |
 | [ONVIF_DETECTION.md](ONVIF_DETECTION.md) | ONVIF discovery and camera-side motion events |

@@ -37,6 +37,7 @@
 #include "web/api_handlers_health.h"
 #include "web/request_response.h"
 #include "web/httpd_utils.h"
+#include "web/audit_log.h"
 #define LOG_COMPONENT "SystemAPI"
 #include "core/logger.h"
 #include "core/config.h"
@@ -696,7 +697,7 @@ void handle_get_system_info(const http_request_t *req, http_response_t *res) {
     log_info("Handling GET /api/system/info request");
 
     // System info is sensitive — require admin privileges
-    if (!httpd_check_admin_privileges(req, res)) {
+    if (!httpd_authorize_global_action(req, res, AUTHZ_SYSTEM_ADMIN)) {
         return;  // Error response already set
     }
 
@@ -1208,7 +1209,10 @@ void handle_post_system_restart(const http_request_t *req, http_response_t *res)
     log_info("Handling POST /api/system/restart request");
 
     // Restart is a destructive admin operation — require admin privileges
-    if (!httpd_check_admin_privileges(req, res)) {
+    user_t audit_user;
+    authorization_evaluation_t evaluation;
+    if (!httpd_authorize_action(req, res, AUTHZ_SYSTEM_ADMIN, NULL,
+                                &audit_user, &evaluation)) {
         return;  // Error response already set
     }
 
@@ -1217,6 +1221,8 @@ void handle_post_system_restart(const http_request_t *req, http_response_t *res)
     if (!success) {
         log_error("Failed to create success JSON object");
         http_response_set_json_error(res, 500, "Failed to create success JSON");
+        audit_log_operation(req, &audit_user, "system.admin", "system", NULL,
+                            "system.restart", "error", NULL);
         return;
     }
 
@@ -1229,6 +1235,8 @@ void handle_post_system_restart(const http_request_t *req, http_response_t *res)
         log_error("Failed to convert success JSON to string");
         cJSON_Delete(success);
         http_response_set_json_error(res, 500, "Failed to convert success JSON to string");
+        audit_log_operation(req, &audit_user, "system.admin", "system", NULL,
+                            "system.restart", "error", NULL);
         return;
     }
 
@@ -1241,6 +1249,11 @@ void handle_post_system_restart(const http_request_t *req, http_response_t *res)
 
     // Log restart
     log_info("System restart requested via API");
+
+    /* Persist the outcome before stopping the process; cleanup can otherwise
+     * race the append and lose the operator-attributed restart event. */
+    audit_log_operation(req, &audit_user, "system.admin", "system", NULL,
+                        "system.restart", "success", NULL);
 
     // Request restart - this sets restart_requested flag and running to false
     // After cleanup, main() will re-exec the program
@@ -1256,7 +1269,10 @@ void handle_post_system_shutdown(const http_request_t *req, http_response_t *res
     log_info("Handling POST /api/system/shutdown request");
 
     // Shutdown is a destructive admin operation — require admin privileges
-    if (!httpd_check_admin_privileges(req, res)) {
+    user_t audit_user;
+    authorization_evaluation_t evaluation;
+    if (!httpd_authorize_action(req, res, AUTHZ_SYSTEM_ADMIN, NULL,
+                                &audit_user, &evaluation)) {
         return;  // Error response already set
     }
 
@@ -1265,6 +1281,8 @@ void handle_post_system_shutdown(const http_request_t *req, http_response_t *res
     if (!success) {
         log_error("Failed to create success JSON object");
         http_response_set_json_error(res, 500, "Failed to create success JSON");
+        audit_log_operation(req, &audit_user, "system.admin", "system", NULL,
+                            "system.shutdown", "error", NULL);
         return;
     }
 
@@ -1277,6 +1295,8 @@ void handle_post_system_shutdown(const http_request_t *req, http_response_t *res
         log_error("Failed to convert success JSON to string");
         cJSON_Delete(success);
         http_response_set_json_error(res, 500, "Failed to convert success JSON to string");
+        audit_log_operation(req, &audit_user, "system.admin", "system", NULL,
+                            "system.shutdown", "error", NULL);
         return;
     }
 
@@ -1289,6 +1309,9 @@ void handle_post_system_shutdown(const http_request_t *req, http_response_t *res
 
     // Log shutdown
     log_info("System shutdown requested via API");
+
+    audit_log_operation(req, &audit_user, "system.admin", "system", NULL,
+                        "system.shutdown", "success", NULL);
 
     // Include shutdown coordinator header
     #include "core/shutdown_coordinator.h"
@@ -1320,7 +1343,10 @@ void handle_post_system_backup(const http_request_t *req, http_response_t *res) 
     log_info("Handling POST /api/system/backup request");
 
     // Backup is an admin operation — require admin privileges
-    if (!httpd_check_admin_privileges(req, res)) {
+    user_t audit_user;
+    authorization_evaluation_t evaluation;
+    if (!httpd_authorize_action(req, res, AUTHZ_SYSTEM_ADMIN, NULL,
+                                &audit_user, &evaluation)) {
         return;  // Error response already set
     }
 
@@ -1343,6 +1369,8 @@ void handle_post_system_backup(const http_request_t *req, http_response_t *res) 
     if (ensure_dir(backup_path)) {
         log_error("Failed to create backup directory %s: %s", backup_path, strerror(errno));
         http_response_set_json_error(res, 500, "Failed to create backup directory");
+        audit_log_operation(req, &audit_user, "system.admin", "backup", NULL,
+                            "backup.create", "failure", NULL);
         return;
     }
 
@@ -1353,6 +1381,8 @@ void handle_post_system_backup(const http_request_t *req, http_response_t *res) 
     int backup_fd = open(backup_path, O_WRONLY | O_CREAT | O_TRUNC, 0600);
     if (backup_fd < 0) {
         log_error("Failed to create backup file: %s", strerror(errno));
+        audit_log_operation(req, &audit_user, "system.admin", "backup", NULL,
+                            "backup.create", "failure", NULL);
 
         // Create error response using cJSON
         cJSON *error = cJSON_CreateObject();
@@ -1392,6 +1422,8 @@ void handle_post_system_backup(const http_request_t *req, http_response_t *res) 
         log_error("Failed to open backup file stream: %s", strerror(errno));
         close(backup_fd);
         http_response_set_json_error(res, 500, "Failed to open backup file stream");
+        audit_log_operation(req, &audit_user, "system.admin", "backup", NULL,
+                            "backup.create", "failure", NULL);
         return;
     }
 
@@ -1401,6 +1433,8 @@ void handle_post_system_backup(const http_request_t *req, http_response_t *res) 
         log_error("Failed to create backup JSON object");
         fclose(backup_file);
         http_response_set_json_error(res, 500, "Failed to create backup JSON");
+        audit_log_operation(req, &audit_user, "system.admin", "backup", NULL,
+                            "backup.create", "failure", NULL);
         return;
     }
 
@@ -1415,6 +1449,8 @@ void handle_post_system_backup(const http_request_t *req, http_response_t *res) 
         cJSON_Delete(backup);
         fclose(backup_file);
         http_response_set_json_error(res, 500, "Failed to create config JSON");
+        audit_log_operation(req, &audit_user, "system.admin", "backup", NULL,
+                            "backup.create", "failure", NULL);
         return;
     }
 
@@ -1437,6 +1473,8 @@ void handle_post_system_backup(const http_request_t *req, http_response_t *res) 
         cJSON_Delete(backup);
         fclose(backup_file);
         http_response_set_json_error(res, 500, "Failed to create streams JSON");
+        audit_log_operation(req, &audit_user, "system.admin", "backup", NULL,
+                            "backup.create", "failure", NULL);
         return;
     }
 
@@ -1449,6 +1487,10 @@ void handle_post_system_backup(const http_request_t *req, http_response_t *res) 
                 continue;
             }
 
+            cJSON_AddStringToObject(stream, "camera_uuid",
+                                    g_config.streams[i].camera_uuid);
+            cJSON_AddStringToObject(stream, "location_uuid",
+                                    g_config.streams[i].location_uuid);
             cJSON_AddStringToObject(stream, "name", g_config.streams[i].name);
             cJSON_AddStringToObject(stream, "url", g_config.streams[i].url);
             cJSON_AddBoolToObject(stream, "enabled", g_config.streams[i].enabled);
@@ -1482,16 +1524,29 @@ void handle_post_system_backup(const http_request_t *req, http_response_t *res) 
         cJSON_Delete(backup);
         fclose(backup_file);
         http_response_set_json_error(res, 500, "Failed to convert backup JSON to string");
+        audit_log_operation(req, &audit_user, "system.admin", "backup", NULL,
+                            "backup.create", "failure", NULL);
         return;
     }
 
     // Write to file
-    fprintf(backup_file, "%s", json_str);
+    int write_result = fputs(json_str, backup_file);
 
     // Clean up
     free(json_str);
     cJSON_Delete(backup);
-    fclose(backup_file);
+    int close_result = fclose(backup_file);
+
+    if (write_result == EOF || close_result != 0) {
+        log_error("Failed to finish backup file: %s", strerror(errno));
+        audit_log_operation(req, &audit_user, "system.admin", "backup", NULL,
+                            "backup.create", "failure", NULL);
+        http_response_set_json_error(res, 500, "Failed to write backup file");
+        return;
+    }
+
+    audit_log_operation(req, &audit_user, "system.admin", "backup", NULL,
+                        "backup.create", "success", NULL);
 
     log_info("Configuration backup created: %s", backup_path);
 
@@ -1536,6 +1591,8 @@ void handle_post_system_backup(const http_request_t *req, http_response_t *res) 
  */
 void handle_get_system_status(const http_request_t *req, http_response_t *res) {
     log_info("Handling GET /api/system/status request");
+
+    if (!httpd_authorize_global_action(req, res, AUTHZ_SYSTEM_ADMIN)) return;
 
     // Create status response using cJSON
     cJSON *status = cJSON_CreateObject();

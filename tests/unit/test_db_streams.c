@@ -14,6 +14,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <ctype.h>
 #include <unistd.h>
 #include <sqlite3.h>
 
@@ -65,6 +66,21 @@ static void exec_sql_or_fail(sqlite3 *db, const char *sql) {
     TEST_ASSERT_EQUAL_INT(SQLITE_OK, rc);
 }
 
+static void assert_valid_camera_uuid(const char *uuid) {
+    TEST_ASSERT_NOT_NULL(uuid);
+    TEST_ASSERT_EQUAL_UINT(CAMERA_UUID_STRING_SIZE - 1, strlen(uuid));
+
+    for (size_t i = 0; i < CAMERA_UUID_STRING_SIZE - 1; i++) {
+        if (i == 8 || i == 13 || i == 18 || i == 23) {
+            TEST_ASSERT_EQUAL_CHAR('-', uuid[i]);
+        } else {
+            TEST_ASSERT_TRUE(isxdigit((unsigned char)uuid[i]) != 0);
+        }
+    }
+    TEST_ASSERT_EQUAL_CHAR('4', uuid[14]);
+    TEST_ASSERT_NOT_NULL(strchr("89ab", uuid[19]));
+}
+
 /* ---- Unity boilerplate ---- */
 void setUp(void)    { clear_streams(); }
 void tearDown(void) {}
@@ -88,6 +104,62 @@ void test_get_stream_config_by_name_round_trip(void) {
     TEST_ASSERT_EQUAL_INT(0, rc);
     TEST_ASSERT_EQUAL_STRING("cam_rt", got.name);
     TEST_ASSERT_TRUE(got.enabled);
+}
+
+void test_camera_uuid_is_generated_unique_and_queryable(void) {
+    stream_config_t first = make_stream("uuid_cam_1", true);
+    stream_config_t second = make_stream("uuid_cam_2", true);
+    TEST_ASSERT_NOT_EQUAL(0, add_stream_config(&first));
+    TEST_ASSERT_NOT_EQUAL(0, add_stream_config(&second));
+
+    stream_config_t got_first;
+    stream_config_t got_second;
+    TEST_ASSERT_EQUAL_INT(0,
+                          get_stream_config_by_name("uuid_cam_1", &got_first));
+    TEST_ASSERT_EQUAL_INT(0,
+                          get_stream_config_by_name("uuid_cam_2", &got_second));
+    assert_valid_camera_uuid(got_first.camera_uuid);
+    assert_valid_camera_uuid(got_second.camera_uuid);
+    TEST_ASSERT_NOT_EQUAL(0,
+                          strcmp(got_first.camera_uuid,
+                                 got_second.camera_uuid));
+
+    stream_config_t by_uuid;
+    TEST_ASSERT_EQUAL_INT(0,
+                          get_stream_config_by_uuid(got_first.camera_uuid,
+                                                    &by_uuid));
+    TEST_ASSERT_EQUAL_STRING("uuid_cam_1", by_uuid.name);
+    TEST_ASSERT_EQUAL_STRING(got_first.camera_uuid, by_uuid.camera_uuid);
+}
+
+void test_camera_uuid_survives_update_and_reactivation(void) {
+    stream_config_t stream = make_stream("uuid_stable", true);
+    TEST_ASSERT_NOT_EQUAL(0, add_stream_config(&stream));
+
+    stream_config_t persisted;
+    TEST_ASSERT_EQUAL_INT(0,
+                          get_stream_config_by_name("uuid_stable", &persisted));
+    char original_uuid[CAMERA_UUID_STRING_SIZE];
+    safe_strcpy(original_uuid, persisted.camera_uuid, sizeof(original_uuid), 0);
+
+    /* UUID is output-only: ordinary config updates cannot replace it. */
+    safe_strcpy(persisted.camera_uuid,
+                "11111111-1111-4111-8111-111111111111",
+                sizeof(persisted.camera_uuid), 0);
+    safe_strcpy(persisted.url, "rtsp://camera/updated",
+                sizeof(persisted.url), 0);
+    TEST_ASSERT_EQUAL_INT(0,
+                          update_stream_config("uuid_stable", &persisted));
+    TEST_ASSERT_EQUAL_INT(0,
+                          get_stream_config_by_name("uuid_stable", &persisted));
+    TEST_ASSERT_EQUAL_STRING(original_uuid, persisted.camera_uuid);
+
+    TEST_ASSERT_EQUAL_INT(0, delete_stream_config("uuid_stable"));
+    stream.enabled = true;
+    TEST_ASSERT_NOT_EQUAL(0, add_stream_config(&stream));
+    TEST_ASSERT_EQUAL_INT(0,
+                          get_stream_config_by_name("uuid_stable", &persisted));
+    TEST_ASSERT_EQUAL_STRING(original_uuid, persisted.camera_uuid);
 }
 
 void test_stream_admin_url_round_trip(void) {
@@ -447,9 +519,10 @@ void test_repair_onvif_embedded_credentials_migration_normalizes_legacy_rows(voi
         "detection_based_recording, detection_model, detection_threshold, detection_interval, pre_detection_buffer, post_detection_buffer, "
         "detection_api_url, detection_object_filter, detection_object_filter_list, protocol, is_onvif, record_audio, backchannel_enabled, "
         "retention_days, detection_retention_days, max_storage_mb, tier_critical_multiplier, tier_important_multiplier, tier_ephemeral_multiplier, storage_priority, "
-        "ptz_enabled, ptz_max_x, ptz_max_y, ptz_max_z, ptz_has_home, onvif_username, onvif_password, onvif_profile, onvif_port, record_on_schedule, recording_schedule, tags) VALUES ("
+        "ptz_enabled, ptz_max_x, ptz_max_y, ptz_max_z, ptz_has_home, onvif_username, onvif_password, onvif_profile, onvif_port, record_on_schedule, recording_schedule, tags, camera_uuid) VALUES ("
         "'legacy_onvif', 'rtsp://legacy_user:legacy_pass@camera.example/live', 1, 1, 1920, 1080, 25, 'h264', 5, 1, 60, "
-        "0, '', 0.5, 10, 0, 3, '', 'none', '', 0, 1, 1, 0, 0, 0, 0, 3.0, 2.0, 0.25, 0, 0, 0.0, 0.0, 0.0, 0, '', '', 'profile1', 8899, 0, '', '');");
+        "0, '', 0.5, 10, 0, 3, '', 'none', '', 0, 1, 1, 0, 0, 0, 0, 3.0, 2.0, 0.25, 0, 0, 0.0, 0.0, 0.0, 0, '', '', 'profile1', 8899, 0, '', '', "
+        "'20000000-0000-4000-8000-000000000001');");
     exec_sql_or_fail(db, "DELETE FROM schema_migrations WHERE version = '0034';");
 
     shutdown_database();
@@ -531,6 +604,51 @@ void test_audio_voice_enhancement_in_get_all(void) {
 }
 
 /* ================================================================
+ * per-stream playback transport (UXD02 P1)
+ * ================================================================ */
+
+void test_playback_transport_defaults_to_auto(void) {
+    stream_config_t s = make_stream("cam_transport_default", true);
+    TEST_ASSERT_GREATER_THAN(0, add_stream_config(&s));
+
+    stream_config_t got;
+    TEST_ASSERT_EQUAL_INT(0,
+                          get_stream_config_by_name("cam_transport_default", &got));
+    TEST_ASSERT_EQUAL_STRING("auto", got.playback_transport);
+}
+
+void test_playback_transport_round_trip_and_update(void) {
+    stream_config_t s = make_stream("cam_transport_update", true);
+    safe_strcpy(s.playback_transport, "webrtc_then_mse",
+                sizeof(s.playback_transport), 0);
+    TEST_ASSERT_GREATER_THAN(0, add_stream_config(&s));
+
+    stream_config_t got;
+    TEST_ASSERT_EQUAL_INT(0,
+                          get_stream_config_by_name("cam_transport_update", &got));
+    TEST_ASSERT_EQUAL_STRING("webrtc_then_mse", got.playback_transport);
+
+    safe_strcpy(got.playback_transport, "mse_only",
+                sizeof(got.playback_transport), 0);
+    TEST_ASSERT_EQUAL_INT(0,
+                          update_stream_config("cam_transport_update", &got));
+    TEST_ASSERT_EQUAL_INT(0,
+                          get_stream_config_by_name("cam_transport_update", &got));
+    TEST_ASSERT_EQUAL_STRING("mse_only", got.playback_transport);
+}
+
+void test_playback_transport_is_returned_by_get_all(void) {
+    stream_config_t s = make_stream("cam_transport_all", true);
+    safe_strcpy(s.playback_transport, "mse_then_hls",
+                sizeof(s.playback_transport), 0);
+    TEST_ASSERT_GREATER_THAN(0, add_stream_config(&s));
+
+    stream_config_t out[2];
+    TEST_ASSERT_EQUAL_INT(1, get_all_stream_configs(out, 2));
+    TEST_ASSERT_EQUAL_STRING("mse_then_hls", out[0].playback_transport);
+}
+
+/* ================================================================
  * main
  * ================================================================ */
 
@@ -544,6 +662,8 @@ int main(void) {
 
     RUN_TEST(test_add_stream_config_returns_nonzero_id);
     RUN_TEST(test_get_stream_config_by_name_round_trip);
+    RUN_TEST(test_camera_uuid_is_generated_unique_and_queryable);
+    RUN_TEST(test_camera_uuid_survives_update_and_reactivation);
     RUN_TEST(test_stream_admin_url_round_trip);
     RUN_TEST(test_update_stream_config_changes_url);
     RUN_TEST(test_delete_stream_config_disables);
@@ -572,6 +692,9 @@ int main(void) {
     RUN_TEST(test_audio_voice_enhancement_round_trip);
     RUN_TEST(test_audio_voice_enhancement_update);
     RUN_TEST(test_audio_voice_enhancement_in_get_all);
+    RUN_TEST(test_playback_transport_defaults_to_auto);
+    RUN_TEST(test_playback_transport_round_trip_and_update);
+    RUN_TEST(test_playback_transport_is_returned_by_get_all);
 
     int result = UNITY_END();
     shutdown_database();

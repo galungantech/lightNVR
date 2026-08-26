@@ -2,7 +2,9 @@
 #define LIGHTNVR_DB_DETECTIONS_H
 
 #include <stdint.h>
+#include <stdbool.h>
 #include <time.h>
+#include "database/db_recordings.h"
 #include "video/detection_result.h"
 
 /**
@@ -17,6 +19,12 @@
  */
 int store_detections_in_db(const char *stream_name, const detection_result_t *result,
                            time_t timestamp, uint64_t recording_id);
+
+/** Store detections with an immutable capture-time camera identity. */
+int store_detections_in_db_for_camera(
+    const char *camera_uuid, const char *stream_name,
+    const detection_result_t *result, time_t timestamp,
+    uint64_t recording_id);
 
 /** Store detections as one open external-motion interval. */
 int store_external_motion_detections(const char *stream_name,
@@ -104,6 +112,20 @@ int has_detections_in_time_range(const char *stream_name, time_t start_time, tim
 int delete_old_detections(uint64_t max_age);
 
 /**
+ * Delete one stream's detections past its retention window
+ *
+ * Deletes in bounded batches so a large backlog does not hold the database
+ * mutex for the length of a single multi-million-row statement. Call in a loop
+ * until it returns fewer rows than the batch size.
+ *
+ * @param stream_name Stream whose detections should be pruned
+ * @param max_age Maximum age in seconds
+ * @param batch_limit Maximum rows to delete in this call (must be > 0)
+ * @return Number of detections deleted, or -1 on error
+ */
+int delete_old_detections_for_stream(const char *stream_name, uint64_t max_age, int batch_limit);
+
+/**
  * Maximum number of unique labels to return in a summary
  */
 #define MAX_DETECTION_LABELS 10
@@ -121,6 +143,12 @@ typedef struct {
     int count;                      // Number of times this label was detected
 } detection_label_summary_t;
 
+typedef struct {
+    bool has_detection;
+    int label_count;
+    detection_label_summary_t labels[MAX_DETECTION_LABELS];
+} recording_detection_summary_t;
+
 /**
  * Get a summary of detection labels for a stream within a time range
  * Returns unique labels with their counts, sorted by count descending
@@ -136,6 +164,20 @@ int get_detection_labels_summary(const char *stream_name, time_t start_time, tim
                                  detection_label_summary_t *labels, int max_labels);
 
 /**
+ * Load detection summaries for a page of recordings in bounded batches.
+ * Linked point detections use recording_id directly; unlinked legacy/API
+ * detections and external-motion intervals retain time-overlap fallback.
+ *
+ * @param recordings Recording metadata for the requested page
+ * @param count Number of recordings and output summaries
+ * @param summaries Output summaries in the same order as recordings
+ * @return 0 on success, or -1 on error
+ */
+int get_recording_detection_summaries(
+    const recording_metadata_t *recordings, int count,
+    recording_detection_summary_t *summaries);
+
+/**
  * Get all unique detection labels across all detections.
  *
  * @param labels Output array of label strings (caller provides buffer)
@@ -143,6 +185,9 @@ int get_detection_labels_summary(const char *stream_name, time_t start_time, tim
  * @return Number of unique labels found, or -1 on error
  */
 int get_all_unique_detection_labels(char labels[][MAX_LABEL_LENGTH], int max_labels);
+int get_unique_detection_labels_for_streams(
+    const char *const *stream_names, int stream_count,
+    char labels[][MAX_LABEL_LENGTH], int max_labels);
 
 /**
  * Update recent detections with a recording_id

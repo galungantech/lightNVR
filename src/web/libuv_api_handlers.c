@@ -26,6 +26,8 @@
 #include "web/api_handlers_recordings.h"
 #include "web/api_handlers_recordings_batch_download.h"
 #include "web/api_handlers_timeline.h"
+#include "web/api_handlers_investigations.h"
+#include "web/api_handlers_investigation_bookmarks.h"
 #include "web/api_handlers_onvif.h"
 #include "web/api_handlers_users.h"
 #include "web/api_handlers_totp.h"
@@ -36,6 +38,18 @@
 #include "web/api_handlers_metrics.h"
 #include "web/api_handlers_motion.h"
 #include "web/api_handlers_recording_control.h"
+#include "web/api_handlers_locations.h"
+#include "web/api_handlers_camera_tags.h"
+#include "web/api_handlers_fleet.h"
+#include "web/api_handlers_fleet_views.h"
+#include "web/api_handlers_camera_collections.h"
+#include "web/api_handlers_authorization.h"
+#include "web/api_handlers_audit.h"
+#include "web/api_handlers_event_routes.h"
+#include "web/api_handlers_event_destinations.h"
+#include "web/api_handlers_storage_targets.h"
+#include "web/api_handlers_storage_migrations.h"
+#include "web/api_handlers_storage_policies.h"
 #define LOG_COMPONENT "HTTP"
 #include "core/logger.h"
 #include "core/config.h"
@@ -84,6 +98,67 @@ int register_all_libuv_handlers(http_server_handle_t server) {
     http_server_register_handler(server, "/api/streams", "POST", handle_post_stream);
     http_server_register_handler(server, "/api/streams/test", "POST", handle_test_stream);
 
+    // Fleet location hierarchy (UUID-based, admin-only until scoped auth lands)
+    http_server_register_handler(server, "/api/locations", "GET", handle_get_locations);
+    http_server_register_handler(server, "/api/locations", "POST", handle_post_location);
+    http_server_register_handler(server, "/api/locations/#", "GET", handle_get_location);
+    http_server_register_handler(server, "/api/locations/#", "PUT", handle_put_location);
+    http_server_register_handler(server, "/api/locations/#", "DELETE", handle_delete_location);
+    http_server_register_handler(server, "/api/cameras/#/location", "PUT",
+                                 handle_put_camera_location);
+
+    // Normalized camera tag dictionary and UUID-based assignments
+    http_server_register_handler(server, "/api/camera-tags", "GET",
+                                 handle_get_camera_tags);
+    http_server_register_handler(server, "/api/camera-tags", "POST",
+                                 handle_post_camera_tag);
+    http_server_register_handler(server, "/api/camera-tags/#/merge", "POST",
+                                 handle_post_camera_tag_merge);
+    http_server_register_handler(server, "/api/camera-tags/#", "GET",
+                                 handle_get_camera_tag);
+    http_server_register_handler(server, "/api/camera-tags/#", "PUT",
+                                 handle_put_camera_tag);
+    http_server_register_handler(server, "/api/camera-tags/#", "DELETE",
+                                 handle_delete_camera_tag);
+    http_server_register_handler(server, "/api/cameras/#/tags", "GET",
+                                 handle_get_camera_tag_assignments);
+    http_server_register_handler(server, "/api/cameras/#/tags", "PUT",
+                                 handle_put_camera_tag_assignments);
+
+    // Shared selector evaluation and server-side fleet inventory query
+    http_server_register_handler(server, "/api/fleet/cameras/query", "POST",
+                                 handle_post_fleet_camera_query);
+    http_server_register_handler(server, "/api/fleet/selectors/preview", "POST",
+                                 handle_post_fleet_selector_preview);
+    http_server_register_handler(server, "/api/fleet/views", "GET",
+                                 handle_get_fleet_saved_views);
+    http_server_register_handler(server, "/api/fleet/views", "POST",
+                                 handle_post_fleet_saved_view);
+    http_server_register_handler(server, "/api/fleet/views/#", "GET",
+                                 handle_get_fleet_saved_view);
+    http_server_register_handler(server, "/api/fleet/views/#", "PUT",
+                                 handle_put_fleet_saved_view);
+    http_server_register_handler(server, "/api/fleet/views/#", "DELETE",
+                                 handle_delete_fleet_saved_view);
+
+    // Saved static and selector-backed smart camera collections
+    http_server_register_handler(server, "/api/camera-collections", "GET",
+                                 handle_get_camera_collections);
+    http_server_register_handler(server, "/api/camera-collections", "POST",
+                                 handle_post_camera_collection);
+    http_server_register_handler(server, "/api/camera-collections/#/members", "GET",
+                                 handle_get_camera_collection_members);
+    http_server_register_handler(server, "/api/camera-collections/#/members", "PUT",
+                                 handle_put_camera_collection_members);
+    http_server_register_handler(server, "/api/camera-collections/#/preview", "POST",
+                                 handle_post_camera_collection_preview);
+    http_server_register_handler(server, "/api/camera-collections/#", "GET",
+                                 handle_get_camera_collection);
+    http_server_register_handler(server, "/api/camera-collections/#", "PUT",
+                                 handle_put_camera_collection);
+    http_server_register_handler(server, "/api/camera-collections/#", "DELETE",
+                                 handle_delete_camera_collection);
+
     // Stream-specific routes (must come before /api/streams/# wildcard)
     http_server_register_handler(server, "/api/streams/#/recording", "GET",
                                  handle_get_stream_recording);
@@ -129,6 +204,8 @@ int register_all_libuv_handlers(http_server_handle_t server) {
 
     // Settings API
     http_server_register_handler(server, "/api/settings", "GET", handle_get_settings);
+    http_server_register_handler(server, "/api/client-config", "GET",
+                                 handle_get_client_config);
     http_server_register_handler(server, "/api/settings", "POST", handle_post_settings);
     http_server_register_handler(server, "/api/settings/go2rtc/validate", "POST",
                                  handle_post_settings_go2rtc_validate);
@@ -184,6 +261,101 @@ int register_all_libuv_handlers(http_server_handle_t server) {
     http_server_register_handler(server, "/api/auth/users/#/password-lock", "PUT", handle_users_password_lock);
     http_server_register_handler(server, "/api/auth/users/#/login-lockout/clear", "POST", handle_users_clear_login_lockout);
 
+    // Action-level authorization catalog and administrator policy simulation
+    http_server_register_handler(server, "/api/authorization/actions", "GET",
+                                 handle_get_authorization_actions);
+    http_server_register_handler(server, "/api/authorization/simulate", "POST",
+                                 handle_post_authorization_simulate);
+    http_server_register_handler(server, "/api/authorization/roles", "GET",
+                                 handle_get_authorization_roles);
+    http_server_register_handler(server, "/api/authorization/roles", "POST",
+                                 handle_post_authorization_role);
+    http_server_register_handler(server, "/api/authorization/roles/#", "PUT",
+                                 handle_put_authorization_role);
+    http_server_register_handler(server, "/api/authorization/roles/#", "DELETE",
+                                 handle_delete_authorization_role);
+    http_server_register_handler(server,
+                                 "/api/authorization/users/#/tokens", "GET",
+                                 handle_get_user_api_tokens);
+    http_server_register_handler(server,
+                                 "/api/authorization/users/#/tokens", "POST",
+                                 handle_post_user_api_token);
+    http_server_register_handler(server,
+                                 "/api/authorization/users/#/tokens/#", "DELETE",
+                                 handle_delete_user_api_token);
+    http_server_register_handler(server, "/api/authorization/users/#", "GET",
+                                 handle_get_user_authorization);
+    http_server_register_handler(server, "/api/authorization/users/#", "PUT",
+                                 handle_put_user_authorization);
+
+    // Append-only audit history and retention controls
+    http_server_register_handler(server, "/api/audit/events/export", "GET",
+                                 handle_get_audit_export);
+    http_server_register_handler(server, "/api/audit/events", "GET",
+                                 handle_get_audit_events);
+    http_server_register_handler(server, "/api/audit/settings", "GET",
+                                 handle_get_audit_settings);
+    http_server_register_handler(server, "/api/audit/settings", "PUT",
+                                 handle_put_audit_settings);
+
+    // Versioned event catalog, destination profiles, and route management
+    http_server_register_handler(server, "/api/events/catalog", "GET",
+                                 handle_get_event_catalog);
+    http_server_register_handler(server, "/api/event-destinations", "GET",
+                                 handle_get_event_destinations);
+    http_server_register_handler(server, "/api/event-destinations", "POST",
+                                 handle_post_event_destination);
+    http_server_register_handler(server, "/api/event-destinations/#", "GET",
+                                 handle_get_event_destination);
+    http_server_register_handler(server, "/api/event-destinations/#", "PUT",
+                                 handle_put_event_destination);
+    http_server_register_handler(server, "/api/event-destinations/#", "DELETE",
+                                 handle_delete_event_destination);
+
+    // Multi-target storage configuration and safe filesystem probes.
+    http_server_register_handler(server, "/api/storage-targets", "GET",
+                                 handle_get_storage_targets);
+    http_server_register_handler(server, "/api/storage-targets", "POST",
+                                 handle_post_storage_target);
+    http_server_register_handler(server, "/api/storage-targets/#/probe", "POST",
+                                 handle_post_storage_target_probe);
+    http_server_register_handler(server, "/api/storage-targets/#", "GET",
+                                 handle_get_storage_target);
+    http_server_register_handler(server, "/api/storage-targets/#", "PUT",
+                                 handle_put_storage_target);
+    http_server_register_handler(server, "/api/storage-targets/#", "DELETE",
+                                 handle_delete_storage_target);
+    http_server_register_handler(server, "/api/storage-migrations", "GET",
+                                 handle_get_storage_migrations);
+    http_server_register_handler(server, "/api/storage-migrations", "POST",
+                                 handle_post_storage_migration);
+    http_server_register_handler(server, "/api/storage-migrations/#", "GET",
+                                 handle_get_storage_migration);
+    http_server_register_handler(server, "/api/storage-policies", "GET",
+                                 handle_get_storage_policies);
+    http_server_register_handler(server, "/api/storage-policies", "POST",
+                                 handle_post_storage_policy);
+    http_server_register_handler(server, "/api/storage-policies/preview", "POST",
+                                 handle_post_storage_policy_preview);
+    http_server_register_handler(server, "/api/storage-policies/#", "GET",
+                                 handle_get_storage_policy);
+    http_server_register_handler(server, "/api/storage-policies/#", "PUT",
+                                 handle_put_storage_policy);
+    http_server_register_handler(server, "/api/storage-policies/#", "DELETE",
+                                 handle_delete_storage_policy);
+    http_server_register_handler(server, "/api/event-routes/preview", "POST",
+                                 handle_post_event_route_preview);
+    http_server_register_handler(server, "/api/event-routes", "GET",
+                                 handle_get_event_routes);
+    http_server_register_handler(server, "/api/event-routes", "POST",
+                                 handle_post_event_route);
+    http_server_register_handler(server, "/api/event-routes/#", "GET",
+                                 handle_get_event_route);
+    http_server_register_handler(server, "/api/event-routes/#", "PUT",
+                                 handle_put_event_route);
+    http_server_register_handler(server, "/api/event-routes/#", "DELETE",
+                                 handle_delete_event_route);
+
     // TOTP MFA API (backend-agnostic handlers)
     http_server_register_handler(server, "/api/auth/users/#/totp/setup", "POST", handle_totp_setup);
     http_server_register_handler(server, "/api/auth/users/#/totp/verify", "POST", handle_totp_verify);
@@ -197,6 +369,7 @@ int register_all_libuv_handlers(http_server_handle_t server) {
     http_server_register_handler(server, "/api/onvif/discovery/discover", "POST", handle_post_discover_onvif_devices);
     http_server_register_handler(server, "/api/onvif/device/profiles", "GET", handle_get_onvif_device_profiles);
     http_server_register_handler(server, "/api/onvif/device/add", "POST", handle_post_add_onvif_device_as_stream);
+    http_server_register_handler(server, "/api/onvif/device/claim", "POST", handle_post_claim_onvif_device);
     http_server_register_handler(server, "/api/onvif/device/test", "POST", handle_post_test_onvif_connection);
 
     // Recordings API (backend-agnostic handlers)
@@ -230,6 +403,16 @@ int register_all_libuv_handlers(http_server_handle_t server) {
     http_server_register_handler(server, "/api/timeline/segments", "GET", handle_get_timeline_segments);
     http_server_register_handler(server, "/api/timeline/manifest", "GET", handle_timeline_manifest);
     http_server_register_handler(server, "/api/timeline/play", "GET", handle_timeline_playback);
+    http_server_register_handler(server, "/api/investigations/timeline", "POST", handle_post_investigation_timeline);
+    http_server_register_handler(server, "/api/investigations/search", "POST", handle_post_investigation_search);
+    http_server_register_handler(server, "/api/investigations/recordings/preview", "POST", handle_post_investigation_recording_preview);
+    http_server_register_handler(server, "/api/investigations/thumbnail-samples", "POST", handle_post_investigation_thumbnail_samples);
+    http_server_register_handler(server, "/api/investigations/thumbnail/#/#", "GET", handle_investigation_thumbnail);
+    http_server_register_handler(server, "/api/investigation-bookmarks/#", "GET", handle_get_investigation_bookmark);
+    http_server_register_handler(server, "/api/investigation-bookmarks/#", "PUT", handle_put_investigation_bookmark);
+    http_server_register_handler(server, "/api/investigation-bookmarks/#", "DELETE", handle_delete_investigation_bookmark);
+    http_server_register_handler(server, "/api/investigation-bookmarks", "GET", handle_get_investigation_bookmarks);
+    http_server_register_handler(server, "/api/investigation-bookmarks", "POST", handle_post_investigation_bookmark);
 
     // HLS Streaming (backend-agnostic handler)
     // Pattern uses # for single-segment wildcards: /hls/{stream_name}/{filename}

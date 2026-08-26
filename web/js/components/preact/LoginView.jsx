@@ -127,6 +127,8 @@ export function LoginView() {
       }
     } else if (urlParams.has('logout')) {
       setErrorMessage(t('login.error.loggedOut'));
+    } else if (urlParams.has('password_changed')) {
+      setErrorMessage(t('login.passwordChanged'));
     } else {
       setErrorMessage('');
     }
@@ -215,6 +217,11 @@ export function LoginView() {
         // Successful login (no TOTP required or force MFA verified)
         console.log('Login successful, proceeding to redirect');
 
+        if (data.must_change_password) {
+          window.location.href = '/index.html';
+          return;
+        }
+
         // Redirect to the requested page, or the index if none / unsafe.
         const urlParams = new URLSearchParams(window.location.search);
         window.location.href = safeRedirectPath(urlParams.get('redirect'));
@@ -290,7 +297,8 @@ export function LoginView() {
 
     // Check for success messages
     const isSuccess = (
-      errorMessage === t('login.error.loggedOut')
+      errorMessage === t('login.error.loggedOut') ||
+      errorMessage === t('login.passwordChanged')
     );
 
     return baseClass + (
@@ -366,7 +374,7 @@ export function LoginView() {
               </div>
             )}
             {rememberDeviceEnabled && (
-              <label className="flex items-center gap-2 text-sm text-muted-foreground">
+              <label className="touch-target flex cursor-pointer items-center gap-2 text-sm text-muted-foreground">
                 <input
                   type="checkbox"
                   checked={rememberDevice}
@@ -410,7 +418,7 @@ export function LoginView() {
               />
             </div>
             {rememberDeviceEnabled && (
-              <label className="flex items-center gap-2 text-sm text-muted-foreground">
+              <label className="touch-target flex cursor-pointer items-center gap-2 text-sm text-muted-foreground">
                 <input
                   type="checkbox"
                   checked={rememberDevice}

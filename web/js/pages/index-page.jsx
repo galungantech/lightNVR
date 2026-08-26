@@ -13,6 +13,7 @@ import { Footer } from "../components/preact/Footer.jsx";
 import { ToastContainer } from "../components/preact/ToastContainer.jsx";
 import { setupSessionValidation } from '../utils/auth-utils.js';
 import { SetupWizard } from '../components/preact/SetupWizard.jsx';
+import { AuthGate } from '../components/preact/AuthGate.jsx';
 import { initI18n } from '../i18n.js';
 
 /**
@@ -33,7 +34,7 @@ function App() {
         async function init() {
             try {
                 const [settingsRes, setupRes] = await Promise.all([
-                    fetch('/api/settings'),
+                    fetch('/api/client-config'),
                     fetch('/api/setup/status'),
                 ]);
 
@@ -78,11 +79,7 @@ function App() {
     // HLS / MSE remain. The LiveView component itself handles HLS↔MSE
     // tab switching and will hide tabs for disabled methods. #397
     const useWebRTC = !viewFlags.webrtcDisabled;
-    if (!useWebRTC) {
-        document.title = 'HLS View - LightNVR';
-    } else {
-        document.title = 'Live View - LightNVR';
-    }
+    document.title = 'Live View - LightNVR';
 
     return (
         <>
@@ -114,10 +111,12 @@ document.addEventListener('DOMContentLoaded', async () => {
     if (container) {
         render(
             <QueryClientProvider client={queryClient}>
-                <Header />
-                <ToastContainer />
-                <App />
-                <Footer />
+                <AuthGate>
+                    <Header />
+                    <ToastContainer />
+                    <App />
+                    <Footer />
+                </AuthGate>
             </QueryClientProvider>,
             container
         );
