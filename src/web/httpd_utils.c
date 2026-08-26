@@ -8,6 +8,9 @@
 #include <string.h>
 #include <strings.h>
 #include <arpa/inet.h>
+#include <pthread.h>
+#include <time.h>
+#include <mbedtls/sha256.h>
 
 #include "web/httpd_utils.h"
 #include "web/request_response.h"
@@ -16,6 +19,26 @@
 #include "core/config.h"
 #include "utils/strings.h"
 #include "database/db_auth.h"
+#include "database/db_api_tokens.h"
+#include "database/db_fleet_query.h"
+#include "database/db_streams.h"
+#include "web/audit_log.h"
+
+#define MEDIA_AUTH_CACHE_CAPACITY \
+    ((MAX_STREAMS * 2 < 64) ? 64 : ((MAX_STREAMS * 2 > 2048) ? 2048 : MAX_STREAMS * 2))
+#define MEDIA_AUTH_CACHE_TTL_SECONDS 30
+
+typedef struct {
+    bool occupied;
+    char fingerprint[65];
+    char stream_name[MAX_STREAM_NAME];
+    authorization_action_t action;
+    time_t authorized_until;
+    time_t last_used;
+} media_auth_cache_entry_t;
+
+static media_auth_cache_entry_t g_media_auth_cache[MEDIA_AUTH_CACHE_CAPACITY];
+static pthread_mutex_t g_media_auth_cache_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 cJSON* httpd_parse_json_body(const http_request_t *req) {
     if (!req || !req->body || req->body_len == 0) {
@@ -227,6 +250,16 @@ int httpd_get_api_key(const http_request_t *req, char *api_key, size_t api_key_s
     return copy_trimmed_value(api_key, api_key_size, auth + 7, 0) ? 0 : -1;
 }
 
+bool httpd_peer_is_trusted_proxy(const http_request_t *req) {
+    if (!req || req->client_ip[0] == '\0') return false;
+    if (g_config.trusted_proxy_cidrs[0] == '\0') return false;
+    char peer_ip[INET6_ADDRSTRLEN] = {0};
+    if (!normalize_ip_literal(req->client_ip, peer_ip, sizeof(peer_ip))) {
+        return false;
+    }
+    return ip_matches_cidr_list(g_config.trusted_proxy_cidrs, peer_ip);
+}
+
 int httpd_get_effective_client_ip(const http_request_t *req, char *client_ip, size_t client_ip_size) {
     if (!req || !client_ip || client_ip_size == 0) {
         return -1;
@@ -342,7 +375,28 @@ void httpd_clear_trusted_device_cookie(http_response_t *res) {
                              "trusted_device=; Path=/; Max-Age=0; HttpOnly; SameSite=Lax");
 }
 
-int httpd_get_authenticated_user(const http_request_t *req, user_t *user) {
+static bool request_allowed_during_required_password_change(
+    const http_request_t *req, const user_t *user) {
+    if (!req || !user || !user->must_change_password || g_config.demo_mode) {
+        return true;
+    }
+
+    if (req->method == HTTP_METHOD_GET &&
+        strcmp(req->path, "/api/auth/verify") == 0) {
+        return true;
+    }
+
+    char password_path[128];
+    int written = snprintf(password_path, sizeof(password_path),
+                           "/api/auth/users/%lld/password",
+                           (long long)user->id);
+    return written > 0 && (size_t)written < sizeof(password_path) &&
+           req->method == HTTP_METHOD_PUT &&
+           strcmp(req->path, password_path) == 0;
+}
+
+static int get_authenticated_user(const http_request_t *req, user_t *user,
+                                  bool allow_scoped_token) {
     if (!req || !user) return 0;
 
     char effective_client_ip[64] = {0};
@@ -354,6 +408,8 @@ int httpd_get_authenticated_user(const http_request_t *req, user_t *user) {
     if (!g_config.web_auth_enabled) {
         memset(user, 0, sizeof(user_t));
         safe_strcpy(user->username, "admin", sizeof(user->username), 0);
+        safe_strcpy(user->authentication_method, "auth_disabled",
+                    sizeof(user->authentication_method), 0);
         user->role = USER_ROLE_ADMIN;
         user->is_active = true;
         return 1;
@@ -370,7 +426,13 @@ int httpd_get_authenticated_user(const http_request_t *req, user_t *user) {
                 rc = db_auth_validate_session_with_context(session_token, &user_id,
                                                            effective_client_ip, req->user_agent);
                 if (rc == 0) {
-                    return 1;
+                    safe_strcpy(user->authentication_method, "session",
+                                sizeof(user->authentication_method), 0);
+                    if (request_allowed_during_required_password_change(req, user)) {
+                        return 1;
+                    }
+                    log_warn("Session access restricted pending password change for user '%s'",
+                             user->username);
                 }
             } else if (rc == 0) {
                 log_warn("Session auth blocked by allowed_login_cidrs for user '%s' from IP %s",
@@ -390,7 +452,13 @@ int httpd_get_authenticated_user(const http_request_t *req, user_t *user) {
             if (rc == 0) {
                 rc = db_auth_get_user_by_id(user_id, user);
                 if (rc == 0 && db_auth_ip_allowed_for_user(user, effective_client_ip)) {
-                    return 1;
+                    safe_strcpy(user->authentication_method, "basic",
+                                sizeof(user->authentication_method), 0);
+                    if (request_allowed_during_required_password_change(req, user)) {
+                        return 1;
+                    }
+                    log_warn("Basic auth access restricted pending password change for user '%s'",
+                             user->username);
                 } else if (rc == 0) {
                     log_warn("Basic auth blocked by allowed_login_cidrs for user '%s' from IP %s",
                              user->username, effective_client_ip[0] != '\0' ? effective_client_ip : "(unknown)");
@@ -401,19 +469,89 @@ int httpd_get_authenticated_user(const http_request_t *req, user_t *user) {
         }
     }
 
+    // API keys and scoped tokens are deliberately exempt from the pending
+    // password-change gate: they are separate credentials with their own
+    // lifecycle, and a bootstrap admin flagged by db_auth_init() would
+    // otherwise take every token-authenticated integration down with it. An
+    // attacker who guesses the default password holds no key, and the gate
+    // blocks the endpoints that would disclose one.
     char api_key[128] = {0};
     if (httpd_get_api_key(req, api_key, sizeof(api_key)) == 0) {
         int rc = db_auth_get_user_by_api_key(api_key, user);
         if (rc == 0 && user->is_active && db_auth_ip_allowed_for_user(user, effective_client_ip)) {
+            safe_strcpy(user->authentication_method, "legacy_api_key",
+                        sizeof(user->authentication_method), 0);
             return 1;
         }
         if (rc == 0 && user->is_active) {
             log_warn("API key auth blocked by allowed_login_cidrs for user '%s' from IP %s",
                      user->username, effective_client_ip[0] != '\0' ? effective_client_ip : "(unknown)");
         }
+        if (rc != 0 && allow_scoped_token) {
+            int64_t user_id = 0;
+            char token_uuid[CAMERA_UUID_STRING_SIZE] = {0};
+            bool usage_audit_due = false;
+            db_api_token_result_t token_result = db_api_token_authenticate(
+                api_key, &user_id, token_uuid, &usage_audit_due);
+            if (token_result == DB_API_TOKEN_OK &&
+                db_auth_get_user_by_id(user_id, user) == 0 &&
+                user->is_active &&
+                db_auth_ip_allowed_for_user(user, effective_client_ip)) {
+                user->authenticated_via_scoped_token = true;
+                safe_strcpy(user->authentication_method, "scoped_token",
+                            sizeof(user->authentication_method), 0);
+                safe_strcpy(user->api_token_uuid, token_uuid,
+                            sizeof(user->api_token_uuid), 0);
+                if (usage_audit_due) {
+                    cJSON *details = cJSON_CreateObject();
+                    if (details) {
+                        cJSON_AddStringToObject(details, "event_type",
+                                                "api_token.use");
+                        cJSON_AddStringToObject(details, "reason", "active");
+                    }
+                    audit_log_append(req, user, "api_token.use", "api_token",
+                                     token_uuid, "success", details);
+                    cJSON_Delete(details);
+                }
+                return 1;
+            }
+            if (strncmp(api_key, "lnvr_", 5) == 0) {
+                user_t denied_user = {0};
+                user_t *principal = NULL;
+                if (user_id > 0 &&
+                    db_auth_get_user_by_id(user_id, &denied_user) == 0) {
+                    safe_strcpy(denied_user.authentication_method,
+                                "scoped_token",
+                                sizeof(denied_user.authentication_method), 0);
+                    denied_user.authenticated_via_scoped_token = true;
+                    safe_strcpy(denied_user.api_token_uuid, token_uuid,
+                                sizeof(denied_user.api_token_uuid), 0);
+                    principal = &denied_user;
+                }
+                const char *reason = token_result == DB_API_TOKEN_EXPIRED
+                    ? "expired" : token_result == DB_API_TOKEN_REVOKED
+                    ? "revoked" : token_result == DB_API_TOKEN_INACTIVE_OWNER
+                    ? "inactive_owner" : token_result == DB_API_TOKEN_ERROR
+                    ? "error" : "unknown";
+                cJSON *details = cJSON_CreateObject();
+                if (details) {
+                    cJSON_AddStringToObject(details, "event_type",
+                                            "api_token.use");
+                    cJSON_AddStringToObject(details, "reason", reason);
+                }
+                audit_log_append(req, principal, "api_token.use", "api_token",
+                                 token_uuid[0] ? token_uuid : NULL, "denied",
+                                 details);
+                cJSON_Delete(details);
+            }
+        }
     }
 
     return 0;
+}
+
+int httpd_get_authenticated_user(const http_request_t *req, user_t *user) {
+    return get_authenticated_user(req, user, false);
 }
 
 int httpd_check_admin_privileges(const http_request_t *req, http_response_t *res) {
@@ -441,30 +579,27 @@ int httpd_is_demo_mode(void) {
     return g_config.demo_mode ? 1 : 0;
 }
 
-int httpd_check_viewer_access(const http_request_t *req, user_t *user) {
+static int check_viewer_access(const http_request_t *req, user_t *user,
+                               bool allow_scoped_token) {
     if (!user) return 0;
 
     // First, try to get an authenticated user
-    if (httpd_get_authenticated_user(req, user)) {
+    if (get_authenticated_user(req, user, allow_scoped_token)) {
         // User is authenticated - they have at least viewer access
         return 1;
     }
 
-    // If authentication is disabled entirely, grant viewer access
-    if (!g_config.web_auth_enabled) {
-        // Create a pseudo-user for unauthenticated access
-        memset(user, 0, sizeof(user_t));
-        safe_strcpy(user->username, "anonymous", sizeof(user->username), 0);
-        user->role = USER_ROLE_VIEWER;
-        user->is_active = true;
-        return 1;
-    }
+    // Authentication being disabled is already handled inside
+    // get_authenticated_user(), which returns a dummy admin, so there is no
+    // unauthenticated fall-through for that case to handle here.
 
     // If demo mode is enabled, grant viewer access to unauthenticated users
     if (g_config.demo_mode) {
         // Create a demo viewer pseudo-user
         memset(user, 0, sizeof(user_t));
         safe_strcpy(user->username, "demo", sizeof(user->username), 0);
+        safe_strcpy(user->authentication_method, "demo",
+                    sizeof(user->authentication_method), 0);
         user->role = USER_ROLE_VIEWER;
         user->is_active = true;
         log_debug("Demo mode: granting viewer access to unauthenticated user");
@@ -475,3 +610,265 @@ int httpd_check_viewer_access(const http_request_t *req, user_t *user) {
     return 0;
 }
 
+
+int httpd_check_viewer_access(const http_request_t *req, user_t *user) {
+    return check_viewer_access(req, user, false);
+}
+
+int httpd_check_action_access(const http_request_t *req, user_t *user) {
+    return check_viewer_access(req, user, true);
+}
+
+int httpd_authorize_action(const http_request_t *req, http_response_t *res,
+                           authorization_action_t action,
+                           const fleet_camera_t *camera, user_t *user,
+                           authorization_evaluation_t *evaluation) {
+    if (!req || !res || !user || !evaluation) return 0;
+    memset(user, 0, sizeof(*user));
+    memset(evaluation, 0, sizeof(*evaluation));
+    if (!httpd_check_action_access(req, user)) {
+        audit_log_authorization(req, NULL, action, camera, NULL, "denied");
+        http_response_set_json_error(res, 401, "Unauthorized");
+        return 0;
+    }
+    if (authorization_evaluate(user, action, camera, evaluation) != 0) {
+        audit_log_authorization(req, user, action, camera, NULL, "error");
+        log_error("Authorization evaluation failed for user '%s' and action %d",
+                  user->username, (int)action);
+        http_response_set_json_error(res, 500,
+                                     "Authorization policy evaluation failed");
+        return 0;
+    }
+    if (evaluation->decision != AUTHZ_DECISION_ALLOW) {
+        audit_log_authorization(req, user, action, camera, evaluation, "denied");
+        log_warn("Access denied: User '%s' action %d: %s", user->username,
+                 (int)action, evaluation->explanation);
+        http_response_set_json_error(res, 403, "Forbidden");
+        return 0;
+    }
+    audit_log_authorization(req, user, action, camera, evaluation, "allowed");
+    return 1;
+}
+
+int httpd_authorize_global_action(const http_request_t *req,
+                                  http_response_t *res,
+                                  authorization_action_t action) {
+    user_t user;
+    authorization_evaluation_t evaluation;
+    return httpd_authorize_action(req, res, action, NULL, &user, &evaluation);
+}
+
+int httpd_evaluate_stream_action(const user_t *user,
+                                 authorization_action_t action,
+                                 const char *stream_name,
+                                 authorization_evaluation_t *evaluation) {
+    if (!user || !stream_name || !evaluation) return -1;
+    fleet_camera_t camera;
+    memset(&camera, 0, sizeof(camera));
+    int result = db_fleet_camera_find_by_name(stream_name, &camera);
+    if (result != 0) return result;
+    return authorization_evaluate(user, action, &camera, evaluation);
+}
+
+int httpd_authorize_stream_action(const http_request_t *req,
+                                  http_response_t *res,
+                                  authorization_action_t action,
+                                  const char *stream_name) {
+    user_t user;
+    fleet_camera_t camera;
+    authorization_evaluation_t evaluation;
+    return httpd_authorize_stream_action_with_context(
+        req, res, action, stream_name, &user, &camera, &evaluation);
+}
+
+int httpd_request_auth_fingerprint(const http_request_t *req,
+                                   char fingerprint[65]) {
+    if (!req || !fingerprint) return -1;
+    char material[1152] = {0};
+    char session_token[64] = {0};
+    const char *authorization = http_request_get_header(req, "Authorization");
+    const char *api_key = http_request_get_header(req, "X-API-Key");
+
+    if (httpd_get_session_token(req, session_token,
+                                sizeof(session_token)) == 0) {
+        snprintf(material, sizeof(material), "session:%s", session_token);
+    } else if (authorization && strncasecmp(authorization, "Basic ", 6) == 0) {
+        snprintf(material, sizeof(material), "basic:%s", authorization + 6);
+    } else if (api_key && api_key[0] != '\0') {
+        snprintf(material, sizeof(material), "api:%s", api_key);
+    } else if (authorization && strncasecmp(authorization, "Bearer ", 7) == 0) {
+        snprintf(material, sizeof(material), "bearer:%s", authorization + 7);
+    } else if (!g_config.web_auth_enabled) {
+        snprintf(material, sizeof(material), "auth-disabled:%s", req->client_ip);
+    } else if (g_config.demo_mode) {
+        snprintf(material, sizeof(material), "demo:%s", req->client_ip);
+    } else {
+        return -1;
+    }
+
+    unsigned char digest[32];
+    if (mbedtls_sha256((const unsigned char *)material, strlen(material),
+                       digest, 0) != 0) {
+        memset(material, 0, sizeof(material));
+        return -1;
+    }
+    static const char hex[] = "0123456789abcdef";
+    for (size_t i = 0; i < sizeof(digest); i++) {
+        fingerprint[i * 2] = hex[digest[i] >> 4];
+        fingerprint[i * 2 + 1] = hex[digest[i] & 0x0f];
+    }
+    fingerprint[64] = '\0';
+    memset(digest, 0, sizeof(digest));
+    memset(material, 0, sizeof(material));
+    return 0;
+}
+
+int httpd_authorize_media_stream_action(const http_request_t *req,
+                                        http_response_t *res,
+                                        authorization_action_t action,
+                                        const char *stream_name) {
+    if (!req || !res || !stream_name || stream_name[0] == '\0') return 0;
+    char fingerprint[65];
+    time_t now = time(NULL);
+    if (httpd_request_auth_fingerprint(req, fingerprint) == 0) {
+        pthread_mutex_lock(&g_media_auth_cache_mutex);
+        for (int i = 0; i < MEDIA_AUTH_CACHE_CAPACITY; i++) {
+            media_auth_cache_entry_t *entry = &g_media_auth_cache[i];
+            if (entry->occupied && entry->authorized_until >= now &&
+                entry->action == action &&
+                strcmp(entry->fingerprint, fingerprint) == 0 &&
+                strcmp(entry->stream_name, stream_name) == 0) {
+                entry->last_used = now;
+                pthread_mutex_unlock(&g_media_auth_cache_mutex);
+                return 1;
+            }
+        }
+        pthread_mutex_unlock(&g_media_auth_cache_mutex);
+    }
+
+    // Misses use the normal fail-closed path. This produces the durable allow,
+    // deny, or error decision that covers the next short media cache window.
+    if (!httpd_authorize_stream_action(req, res, action, stream_name)) return 0;
+    if (httpd_request_auth_fingerprint(req, fingerprint) != 0) return 1;
+
+    pthread_mutex_lock(&g_media_auth_cache_mutex);
+    int selected = 0;
+    time_t oldest = g_media_auth_cache[0].last_used;
+    for (int i = 0; i < MEDIA_AUTH_CACHE_CAPACITY; i++) {
+        media_auth_cache_entry_t *entry = &g_media_auth_cache[i];
+        if (!entry->occupied || entry->authorized_until < now) {
+            selected = i;
+            break;
+        }
+        if (i == 0 || entry->last_used < oldest) {
+            selected = i;
+            oldest = entry->last_used;
+        }
+    }
+    media_auth_cache_entry_t *entry = &g_media_auth_cache[selected];
+    memset(entry, 0, sizeof(*entry));
+    entry->occupied = true;
+    safe_strcpy(entry->fingerprint, fingerprint,
+                sizeof(entry->fingerprint), 0);
+    safe_strcpy(entry->stream_name, stream_name,
+                sizeof(entry->stream_name), 0);
+    entry->action = action;
+    entry->authorized_until = now + MEDIA_AUTH_CACHE_TTL_SECONDS;
+    entry->last_used = now;
+    pthread_mutex_unlock(&g_media_auth_cache_mutex);
+    return 1;
+}
+
+int httpd_authorize_stream_action_with_context(
+    const http_request_t *req, http_response_t *res,
+    authorization_action_t action, const char *stream_name, user_t *user,
+    fleet_camera_t *camera, authorization_evaluation_t *evaluation) {
+    if (!req || !res || !stream_name || !user || !camera || !evaluation) {
+        return 0;
+    }
+    memset(user, 0, sizeof(*user));
+    memset(camera, 0, sizeof(*camera));
+    memset(evaluation, 0, sizeof(*evaluation));
+    if (!httpd_check_action_access(req, user)) {
+        audit_log_authorization(req, NULL, action, NULL, NULL, "denied");
+        http_response_set_json_error(res, 401, "Unauthorized");
+        return 0;
+    }
+    int result = db_fleet_camera_find_by_name(stream_name, camera);
+    if (result > 0) {
+        const authorization_action_metadata_t *metadata =
+            authorization_action_metadata(action);
+        cJSON *details = cJSON_CreateObject();
+        if (details) {
+            cJSON_AddStringToObject(details, "event_type",
+                                    "authorization.resource_not_found");
+            cJSON_AddStringToObject(details, "stream_name", stream_name);
+        }
+        audit_log_append(req, user, metadata ? metadata->key : "unknown",
+                         "camera", NULL, "failure", details);
+        cJSON_Delete(details);
+        http_response_set_json_error(res, 404, "Camera not found");
+        return 0;
+    }
+    if (result < 0 ||
+        authorization_evaluate(user, action, camera, evaluation) != 0) {
+        audit_log_authorization(req, user, action, camera,
+                                result < 0 ? NULL : evaluation, "error");
+        log_error("Failed to evaluate authorization for stream '%s'",
+                  stream_name);
+        http_response_set_json_error(
+            res, 500, "Authorization policy evaluation failed");
+        return 0;
+    }
+    if (evaluation->decision != AUTHZ_DECISION_ALLOW) {
+        audit_log_authorization(req, user, action, camera, evaluation,
+                                "denied");
+        log_warn("Access denied: User '%s' action %d on stream '%s': %s",
+                 user->username, (int)action, stream_name,
+                 evaluation->explanation);
+        http_response_set_json_error(res, 403, "Forbidden");
+        return 0;
+    }
+    audit_log_authorization(req, user, action, camera, evaluation,
+                            "allowed");
+    return 1;
+}
+
+int httpd_authorize_camera_identity_action_with_context(
+    const http_request_t *req, http_response_t *res,
+    authorization_action_t action, const char *camera_uuid,
+    const char *legacy_stream_name, user_t *user, fleet_camera_t *camera,
+    authorization_evaluation_t *evaluation) {
+    if (camera_uuid && camera_uuid[0] != '\0') {
+        stream_config_t stream;
+        memset(&stream, 0, sizeof(stream));
+        if (get_stream_config_by_uuid(camera_uuid, &stream) != 0) {
+            http_response_set_json_error(res, 404, "Camera not found");
+            return 0;
+        }
+        return httpd_authorize_stream_action_with_context(
+            req, res, action, stream.name, user, camera, evaluation);
+    }
+    return httpd_authorize_stream_action_with_context(
+        req, res, action, legacy_stream_name, user, camera, evaluation);
+}
+
+void httpd_sanitize_attachment_filename(const char *input, char *output,
+                                        size_t output_size) {
+    if (!output || output_size == 0) return;
+    output[0] = '\0';
+    if (!input) return;
+    const char *basename = input;
+    for (const char *cursor = input; *cursor; cursor++) {
+        if (*cursor == '/' || *cursor == '\\') basename = cursor + 1;
+    }
+    size_t written = 0;
+    for (const unsigned char *cursor = (const unsigned char *)basename;
+         *cursor && written + 1 < output_size; cursor++) {
+        unsigned char character = *cursor;
+        output[written++] = (isalnum(character) || character == '.' ||
+                             character == '-' || character == '_')
+            ? (char)character : '_';
+    }
+    output[written] = '\0';
+}

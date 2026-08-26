@@ -3,8 +3,8 @@
  * Preact component for the recordings page
  */
 
-import { useState, useEffect, useRef, useContext } from 'preact/hooks';
-import { useQueryClient } from '../../query-client.js';
+import { useState, useEffect, useRef, useContext, useMemo, useCallback } from 'preact/hooks';
+import { useQuery, useQueryClient } from '../../query-client.js';
 import { showStatusMessage } from './ToastContainer.jsx';
 import { showVideoModal, DeleteConfirmationModal, ModalContext } from './UI.jsx';
 import { BatchDownloadModal } from './BatchDownloadModal.jsx';
@@ -12,6 +12,7 @@ import { AsyncButton } from './AsyncButton.jsx';
 import { ContentLoader } from './LoadingIndicator.jsx';
 import { clearThumbnailQueue } from '../../request-queue.js';
 import { useI18n } from '../../i18n.js';
+import { usePullToRefresh } from './usePullToRefresh.js';
 
 // Import components
 import { FiltersSidebar } from './recordings/FiltersSidebar.jsx';
@@ -31,6 +32,8 @@ import { validateSession } from '../../utils/auth-utils.js';
 const RECORDINGS_RETURN_URL_KEY = 'lightnvr_recordings_return_url';
 const RECORDINGS_SELECTED_IDS_KEY = 'lightnvr_selected_recording_ids';
 const RECORDINGS_RESTORE_SELECTION_KEY = 'lightnvr_restore_recording_selection';
+const MAX_INVESTIGATION_CAMERAS = 16;
+const MAX_INVESTIGATION_WINDOW_SECONDS = 31 * 24 * 60 * 60;
 
 function getRestoredSelectedRecordings() {
   try {
@@ -75,6 +78,13 @@ function clearStoredSelectedRecordings() {
 export function RecordingsView() {
   const { t } = useI18n();
   const queryClient = useQueryClient();
+  const { data: collectionData } = useQuery(
+    ['camera-collections'], '/api/camera-collections', {}, { staleTime: 30000 }
+  );
+  const collections = useMemo(
+    () => collectionData?.collections || [],
+    [collectionData]
+  );
   const [userRole, setUserRole] = useState(null);
   const [recordings, setRecordings] = useState([]);
   const [streams, setStreams] = useState([]);
@@ -171,7 +181,7 @@ export function RecordingsView() {
 
   // Fetch generate_thumbnails + thumbnails_per_recording settings
   useEffect(() => {
-    fetch('/api/settings')
+    fetch('/api/client-config')
       .then(res => res.json())
       .then(data => {
         if (data && typeof data.generate_thumbnails !== 'undefined') {
@@ -284,7 +294,7 @@ export function RecordingsView() {
   // Update active filters when filters change
   useEffect(() => {
     updateActiveFilters();
-  }, [filters]);
+  }, [filters, collections]);
 
   // Reactively sync all view state to URL via replaceState (no browser history entries).
   // This mirrors the approach used in LiveView and ensures refresh always preserves state.
@@ -308,6 +318,9 @@ export function RecordingsView() {
     const serializedStreams = urlUtils.serializeMultiValueParam(filters.streamIds);
     if (serializedStreams) url.searchParams.set('stream', serializedStreams);
     else url.searchParams.delete('stream');
+
+    if (filters.collectionUuid) url.searchParams.set('collection', filters.collectionUuid);
+    else url.searchParams.delete('collection');
 
     if (filters.recordingType === 'detection') url.searchParams.set('detection', '1');
     else if (filters.recordingType === 'no_detection') url.searchParams.set('detection', '-1');
@@ -382,6 +395,25 @@ export function RecordingsView() {
     error: recordingsError,
     refetch: refetchRecordings
   } = recordingsAPI.hooks.useRecordings(filters, pagination, sortField, sortDirection);
+
+  const refreshRecordingList = useCallback(async () => {
+    const result = await refetchRecordings();
+    if (result?.error) throw result.error;
+    return result;
+  }, [refetchRecordings]);
+
+  const pullToRefresh = usePullToRefresh(async () => {
+    try {
+      await refreshRecordingList();
+      showStatusMessage(t('recordings.refreshed'), 'success', 2000);
+    } catch (error) {
+      showStatusMessage(
+        t('recordings.refreshFailed', { message: error?.message || t('common.unknown') }),
+        'error',
+        5000
+      );
+    }
+  });
 
   // Update recordings state when data is loaded
   useEffect(() => {
@@ -536,7 +568,7 @@ export function RecordingsView() {
 
   // Update active filters
   const updateActiveFilters = () => {
-    const activeFilters = urlUtils.getActiveFiltersDisplay(filters);
+    const activeFilters = urlUtils.getActiveFiltersDisplay(filters, collections);
     setHasActiveFilters(activeFilters.length > 0);
     setActiveFiltersDisplay(activeFilters);
   };
@@ -577,6 +609,9 @@ export function RecordingsView() {
           ...prev,
           streamIds: value ? urlUtils.removeMultiValue(prev.streamIds, value) : []
         }));
+        break;
+      case 'collectionUuid':
+        setFilters(prev => ({ ...prev, collectionUuid: '' }));
         break;
       case 'recordingType':
         setFilters(prev => ({
@@ -707,6 +742,63 @@ export function RecordingsView() {
     sessionStorage.setItem(RECORDINGS_SELECTED_IDS_KEY, JSON.stringify(selectedIds));
     sessionStorage.setItem(RECORDINGS_RESTORE_SELECTION_KEY, 'true');
     window.location.href = `timeline.html?ids=${selectedIds.join(',')}`;
+  };
+
+  const investigateSelected = async () => {
+    const selectedIds = Object.entries(selectedRecordings)
+      .filter(([_, selected]) => selected)
+      .map(([id]) => id);
+    if (selectedIds.length === 0) {
+      showStatusMessage(t('investigation.selectRecordingError'), 'warning');
+      return;
+    }
+
+    try {
+      const visibleById = new Map(recordings.map((recording) =>
+        [String(recording.id), recording]));
+      const selected = await Promise.all(selectedIds.map((id) =>
+        visibleById.get(String(id)) || recordingsAPI.getRecording(id)));
+      const unidentified = selected.filter((recording) => !recording.camera_uuid);
+      if (unidentified.length > 0) {
+        showStatusMessage(t('investigation.missingCameraIdentity', {
+          count: unidentified.length,
+        }), 'warning');
+        return;
+      }
+
+      const cameraUuids = [...new Set(selected.map((recording) => recording.camera_uuid))];
+      if (cameraUuids.length > MAX_INVESTIGATION_CAMERAS) {
+        showStatusMessage(t('investigation.cameraLimit', {
+          count: MAX_INVESTIGATION_CAMERAS,
+        }), 'warning');
+        return;
+      }
+
+      const start = Math.min(...selected.map((recording) =>
+        Number(recording.start_time_unix)));
+      const end = Math.max(...selected.map((recording) =>
+        Number(recording.end_time_unix)));
+      if (!Number.isFinite(start) || !Number.isFinite(end) || end <= start) {
+        showStatusMessage(t('investigation.recordingTimeError'), 'warning');
+        return;
+      }
+      const paddedStart = Math.max(1, Math.floor(start) - 30);
+      const paddedEnd = Math.ceil(end) + 30;
+      if (paddedEnd - paddedStart > MAX_INVESTIGATION_WINDOW_SECONDS) {
+        showStatusMessage(t('investigation.windowLimit'), 'warning');
+        return;
+      }
+
+      const params = new URLSearchParams({
+        cameras: cameraUuids.join(','),
+        start: String(paddedStart),
+        end: String(paddedEnd),
+        cursor: String(Math.floor(start)),
+      });
+      window.location.href = `investigation.html?${params.toString()}`;
+    } catch (requestError) {
+      showStatusMessage(requestError.message, 'error');
+    }
   };
 
   // Open download modal
@@ -885,7 +977,7 @@ export function RecordingsView() {
           <AsyncButton
             id="refresh-recordings-btn"
             className="btn-secondary text-sm inline-flex items-center gap-1.5 min-h-11"
-            onClick={() => refetchRecordings()}
+            onClick={refreshRecordingList}
             title={t('recordings.refreshTitle')}
             aria-label={t('recordings.refreshTitle')}
             idleLabel={(
@@ -910,13 +1002,22 @@ export function RecordingsView() {
           />
           {/* Contextual action — only shown when recordings are selected */}
           {getSelectedCount() > 0 && (
-            <button
-              onClick={viewSelectedInTimeline}
-              class="btn-primary text-sm"
-              title={t('recordings.viewSelectedCountInTimeline', { count: getSelectedCount() })}
-            >
-              ▶ {t('nav.timeline')} ({getSelectedCount()})
-            </button>
+            <>
+              <button
+                onClick={viewSelectedInTimeline}
+                class="btn-secondary text-sm"
+                title={t('recordings.viewSelectedCountInTimeline', { count: getSelectedCount() })}
+              >
+                ▶ {t('nav.timeline')} ({getSelectedCount()})
+              </button>
+              <button
+                onClick={investigateSelected}
+                class="btn-primary text-sm"
+                title={t('investigation.investigateSelectedCount', { count: getSelectedCount() })}
+              >
+                {t('nav.investigation')} ({getSelectedCount()})
+              </button>
+            </>
           )}
         </div>
       </div>
@@ -959,10 +1060,32 @@ export function RecordingsView() {
           >
             {t('nav.timeline')}
           </a>
+          <a
+            href="investigation.html"
+            class="rounded-t-lg px-4 py-2 text-sm font-medium transition-colors text-muted-foreground hover:text-foreground"
+          >
+            {t('nav.investigation')}
+          </a>
         </div>
       </div>
 
-      <div class="recordings-layout flex flex-col md:flex-row gap-4 w-full">
+      <div
+        class="recordings-layout relative flex flex-col md:flex-row gap-4 w-full"
+        {...pullToRefresh.bind}
+      >
+        {(pullToRefresh.distance > 0 || pullToRefresh.refreshing) && (
+          <div
+            className={`mobile-pull-refresh ${pullToRefresh.ready ? 'ready' : ''}`}
+            style={{ '--pull-distance': `${pullToRefresh.distance}px` }}
+            role="status"
+          >
+            {pullToRefresh.refreshing
+              ? t('recordings.refreshing')
+              : pullToRefresh.ready
+                ? t('recordings.releaseToRefresh')
+                : t('recordings.pullToRefresh')}
+          </div>
+        )}
         {!collapsed && (
           <FiltersSidebar
             toggleCollapsed={toggleCollapsed}
@@ -971,6 +1094,7 @@ export function RecordingsView() {
             pagination={pagination}
             setPagination={setPagination}
             streams={streams}
+            collections={collections}
             applyFilters={applyFilters}
             resetFilters={resetFilters}
             handleDateRangeChange={handleDateRangeChange}

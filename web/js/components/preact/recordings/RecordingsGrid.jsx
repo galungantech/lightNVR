@@ -6,7 +6,11 @@
 
 import { useState, useEffect, useRef, useCallback } from 'preact/hooks';
 import { formatUtils } from './formatUtils.js';
-import { queueThumbnailLoad, Priority } from '../../../request-queue.js';
+import {
+  invalidateThumbnailLoad,
+  queueThumbnailLoad,
+  Priority,
+} from '../../../request-queue.js';
 import { TagIcon, TagsOverlay, BulkTagsOverlay } from './TagsOverlay.jsx';
 import { useI18n } from '../../../i18n.js';
 
@@ -131,12 +135,17 @@ function RecordingCard({
   // retry once rather than permanently showing "Failed to load".
   const handleImageError = useCallback(() => {
     imgErrorCountRef.current++;
+    const url = `/api/recordings/thumbnail/${recording.id}/${currentFrame}`;
+    invalidateThumbnailLoad(url);
     if (imgErrorCountRef.current <= 1) {
-      loadThumbnail(); // retry once
+      setLoadState('loading');
+      queueThumbnailLoad(url, Priority.HIGH)
+        .then(() => setLoadState('loaded'))
+        .catch(() => setLoadState('error'));
     } else {
       setLoadState('error');
     }
-  }, [loadThumbnail]);
+  }, [currentFrame, recording.id]);
 
   // Preload the middle frame (index 1) on mount with HIGH priority since it's visible
   useEffect(() => {
@@ -276,13 +285,16 @@ function RecordingCard({
         {/* Selection checkbox — only visible in selection mode */}
         {canDelete && selectionMode && (
           <div class="absolute top-2 left-2" onClick={(e) => e.stopPropagation()}>
-            <input
-              type="checkbox"
-              checked={isSelected}
-              onChange={() => toggleRecordingSelection(recording.id)}
-              class="w-4 h-4 rounded focus:ring-2 cursor-pointer"
-              style={{ accentColor: 'hsl(var(--primary))' }}
-            />
+            <label class="inline-flex cursor-pointer items-center justify-center">
+              <input
+                type="checkbox"
+                checked={isSelected}
+                onChange={() => toggleRecordingSelection(recording.id)}
+                class="w-4 h-4 rounded focus:ring-2 cursor-pointer"
+                style={{ accentColor: 'hsl(var(--primary))' }}
+                aria-label={t('recordings.selectRecording')}
+              />
+            </label>
           </div>
         )}
 
@@ -492,7 +504,7 @@ export function RecordingsGrid({
           <>
             {selectionMode ? (
               <>
-                <div class="flex items-center gap-2 mr-2">
+                <label class="flex cursor-pointer items-center gap-2 mr-2">
                   <input
                     type="checkbox"
                     checked={selectAll}
@@ -505,7 +517,7 @@ export function RecordingsGrid({
                       ? t('recordings.recordingsSelectedCount', { count: getSelectedCount() })
                       : t('recordings.selectAll')}
                   </span>
-                </div>
+                </label>
                 <button
                   class="btn-danger text-xs px-2 py-1 disabled:opacity-50 disabled:cursor-not-allowed"
                   disabled={getSelectedCount() === 0}
@@ -611,4 +623,3 @@ export function RecordingsGrid({
     </div>
   );
 }
-

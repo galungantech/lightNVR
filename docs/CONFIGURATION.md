@@ -121,6 +121,25 @@ discovery_interval = 300
 discovery_network = auto
 ```
 
+### Multiple Recording Storage Targets
+
+The `[storage]` path remains the compatibility/default recording root. After the
+database initializes, lightNVR registers the effective MP4 recording root as a
+stable default target and attaches existing recording metadata by relative key;
+it does not move footage.
+
+Additional local or administrator-mounted NFS/SMB roots are managed under
+**Settings → Storage → Recording storage targets** or through
+`/api/storage-targets`. Each target has its own stable UUID, enabled state,
+performance class, reserved headroom, watermarks, cached capacity, and health.
+Enabled roots must already be mounted and writable. lightNVR does not mount
+remote shares or store share credentials.
+
+In the foundation phase, the default target continues receiving all new
+recordings. Registering another target prepares it for the next phase's camera
+placement and spillover policies; it does not redirect cameras or migrate files
+by itself.
+
 The INI format offers several advantages:
 - Simple and widely used format
 - Easy to read and edit
@@ -216,9 +235,22 @@ mp4_retention_days = 30
 ```ini
 [database]
 path = /var/lib/lightnvr/data/database/lightnvr.db
+startup_check = quick
+backup_retention_count = 6
 ```
 
 - `path`: Path to the SQLite database file
+- `startup_check`: Consistency check run against an existing database at boot
+  (default: `quick`). `quick` runs `PRAGMA quick_check`, which validates page
+  structure. `full` runs `PRAGMA integrity_check`, which additionally
+  cross-checks every index against its table — its cost scales with total index
+  size, so on a large database it can take minutes, and it runs before the HTTP
+  listener is bound, so that time appears to clients as a gateway error. `off`
+  skips the check. Corruption seen in practice (truncated writes, torn pages)
+  is caught by `quick`; use `full` from maintenance rather than at boot.
+- `backup_retention_count`: Number of timestamped backups to retain (default: 6).
+  Each backup is a full copy of the database, so this multiplies disk usage by
+  the database size.
 
 ### Web Server Settings
 
@@ -247,8 +279,15 @@ web_thread_pool_size = 8
 
 > ⚠️ **Default credentials are `admin` / `admin`.** Combined with the default
 > `bind_ip = 0.0.0.0`, anyone who can reach port 8080 can reach your cameras and
-> recordings until you change the password. Either set `password` before the very first
-> start, or log in and change it under **Settings → Users** immediately.
+> recordings if an attacker completes first login before you do. Either set `password`
+> before the very first start, or log in with `admin` / `admin` and complete the mandatory
+> password-change screen. Until the change succeeds, that password-authenticated session
+> can only verify its state and change its own password; MFA is evaluated after the new
+> password is set and the user signs in again.
+>
+> The requirement is added only when a new administrator is created with the fallback
+> password. Existing users are not flagged on upgrade, and API-key authentication and demo
+> mode are unaffected.
 >
 > There is no password-reset flag. If you lose the admin password, stop LightNVR, delete
 > the account row, and restart — it is recreated by the same first-run rules:
@@ -264,7 +303,10 @@ web_thread_pool_size = 8
 max_streams = 32
 ```
 
-- `max_streams`: Maximum number of streams to support (default: 32)
+- `max_streams`: Runtime stream capacity for one LightNVR instance (default: 32,
+  maximum: 1024). Changing it requires a restart. Higher values reserve more
+  memory; the number of cameras a host can actively record, relay, or analyze
+  still depends on its CPU, memory, storage, network, and enabled workloads.
 
 **Note:** Stream configurations are stored in the SQLite database and managed via the API or web UI. They are no longer configured in the INI file.
 

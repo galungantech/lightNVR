@@ -8,12 +8,32 @@
 #define MAX_PATH_LENGTH 512
 // Maximum length for stream names
 #define MAX_STREAM_NAME 256
+// Canonical UUID string plus null terminator
+#define CAMERA_UUID_STRING_SIZE 37
 // Maximum length for URLs
 #define MAX_URL_LENGTH 512
 // Compile-time ceiling for per-stream static arrays (pointer arrays, watchdog trackers, etc.).
-// The actual operational limit is g_config.max_streams (default 32, configurable up to this value).
-#define MAX_STREAMS 256
+// The actual operational limit is g_config.max_streams (default 32 or this
+// ceiling, whichever is lower; configurable up to this value).
+#ifndef LIGHTNVR_MAX_STREAMS
+#define LIGHTNVR_MAX_STREAMS 1024
+#endif
+#define MAX_STREAMS LIGHTNVR_MAX_STREAMS
+#define DEFAULT_MAX_STREAMS ((MAX_STREAMS < 32) ? MAX_STREAMS : 32)
 #define WEB_TRUSTED_PROXY_CIDRS_MAX 1024
+
+// Consistency check run against an existing database at startup.
+//
+// FULL is `PRAGMA integrity_check`, which cross-verifies every index against
+// its table. That cost scales with total index size, not row count, so on a
+// database carrying many secondary indexes it can take minutes -- minutes with
+// no HTTP listener bound, which reads to a proxy as a gateway error. QUICK is
+// `PRAGMA quick_check`: same page-level structural validation, without the
+// index cross-check, and the corruption modes actually seen in the field
+// (truncated writes, torn pages) show up in both.
+#define DB_STARTUP_CHECK_OFF   0
+#define DB_STARTUP_CHECK_QUICK 1
+#define DB_STARTUP_CHECK_FULL  2
 
 // Stream protocol enum
 typedef enum {
@@ -21,8 +41,15 @@ typedef enum {
     STREAM_PROTOCOL_UDP = 1
 } stream_protocol_t;
 
+#define PLAYBACK_TRANSPORT_MAX 24
+
+/** Return true when value is one of the persisted playback transport values. */
+bool playback_transport_is_valid(const char *value);
+
 // Stream configuration structure
 typedef struct {
+    char camera_uuid[CAMERA_UUID_STRING_SIZE]; // Immutable fleet identity
+    char location_uuid[CAMERA_UUID_STRING_SIZE]; // Primary physical location
     char name[MAX_STREAM_NAME];
     char url[MAX_URL_LENGTH];
     bool enabled;
@@ -127,6 +154,7 @@ typedef struct {
     // accuracy on the main H.264/H.265 RTSP stream.
     char detection_url[MAX_URL_LENGTH];
     char publish_url[MAX_URL_LENGTH];        // RTMP/RTMPS restream (publish) destination, e.g. YouTube Live ingest URL
+    char playback_transport[PLAYBACK_TRANSPORT_MAX]; // auto, *_only, or an ordered fallback pair
 } stream_config_t;
 
 // Size of recording schedule text buffer: 168 values + 167 commas + null terminator
@@ -193,6 +221,7 @@ typedef struct {
     int default_pre_detection_buffer;      // Default seconds to keep before detection (0-60)
     int default_post_detection_buffer;     // Default seconds to keep after detection (0-300)
     char default_buffer_strategy[32];      // Default buffer strategy: auto, go2rtc, hls_segment, memory_packet, mmap_hybrid
+    char default_playback_transport[PLAYBACK_TRANSPORT_MAX]; // Default for newly-created streams
     int detection_grace_period;            // Seconds after last detection before entering post-buffer (default: 2)
 
     // Database settings
@@ -200,6 +229,7 @@ typedef struct {
     int db_backup_interval_minutes;        // Periodic backup cadence in minutes (0 = disabled)
     int db_backup_retention_count;         // Number of timestamped backups to retain (0 = latest .bak only)
     char db_post_backup_script[MAX_PATH_LENGTH]; // Optional executable path run after a verified backup
+    int db_startup_check;                  // Boot consistency check: see DB_STARTUP_CHECK_*
     
     // Web server settings
     int web_thread_pool_size; // libuv UV_THREADPOOL_SIZE (default: 2x CPU cores, requires restart)
@@ -240,7 +270,7 @@ typedef struct {
     char onvif_discovery_network[64]; // Network to scan for ONVIF devices (e.g., "192.168.1.0/24")
     
     // Stream settings
-    int max_streams;            // Runtime operational limit (default 32, max MAX_STREAMS, requires restart)
+    int max_streams;            // Runtime operational limit (default DEFAULT_MAX_STREAMS, max MAX_STREAMS, requires restart)
     stream_config_t *streams;   // Dynamically allocated array of max_streams entries
     
     // Memory optimization
@@ -373,10 +403,11 @@ int load_stream_configs(config_t *config);
 /**
  * Save stream configurations to database
  * 
- * @param config Pointer to config structure containing stream configurations to save
+ * @param config Pointer to config structure containing stream configurations to
+ *               save. Database-owned fields may be hydrated in place.
  * @return Number of stream configurations saved, or -1 on error
  */
-int save_stream_configs(const config_t *config);
+int save_stream_configs(config_t *config);
 
 /**
  * Set a custom configuration file path
@@ -402,5 +433,25 @@ const char* get_loaded_config_path(void);
 
 // Global configuration variable
 extern config_t g_config;
+
+/**
+ * @brief Number of per-stream slots this instance can actually use.
+ *
+ * The static per-stream arrays are sized at the MAX_STREAMS compile-time
+ * ceiling, but only the first g_config.max_streams entries are ever indexed.
+ * Use this to bound whole-array clears: touching a page of BSS makes it
+ * resident even when the value written is zero, so clearing all MAX_STREAMS
+ * entries would fault in the entire array on an instance configured for far
+ * fewer streams.
+ *
+ * Falls back to the full ceiling when the configuration has not been loaded
+ * yet or holds an out-of-range value, so callers keep the conservative
+ * clear-everything behaviour rather than silently skipping a reset.
+ */
+static inline int configured_stream_slots(void) {
+    int slots = g_config.max_streams;
+    if (slots <= 0 || slots > MAX_STREAMS) return MAX_STREAMS;
+    return slots;
+}
 
 #endif /* LIGHTNVR_CONFIG_H */

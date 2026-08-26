@@ -30,7 +30,10 @@ active_recording_t active_recordings[MAX_STREAMS];
  * Initialize the active recordings array
  */
 void init_recordings(void) {
-    memset(active_recordings, 0, sizeof(active_recordings));
+    // Clear only the configured slots: writing zeros over the full ceiling
+    // would fault in the whole array on an instance running far fewer streams.
+    memset(active_recordings, 0,
+           (size_t)configured_stream_slots() * sizeof(active_recordings[0]));
 }
 
 /**
@@ -111,6 +114,8 @@ uint64_t start_recording(const char *stream_name, const char *output_path) {
     metadata.disk_pressure_eligible = true;
 
     safe_strcpy(metadata.stream_name, stream_name, sizeof(metadata.stream_name), 0);
+    safe_strcpy(metadata.camera_uuid, config.camera_uuid,
+                sizeof(metadata.camera_uuid), 0);
 
     // Format paths for the recording - MAKE SURE THIS POINTS TO REAL FILES
     char mp4_path[MAX_PATH_LENGTH];

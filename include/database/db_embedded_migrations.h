@@ -678,6 +678,816 @@ static const char migration_0046_up[] =
 static const char migration_0046_down[] =
     "SELECT 1;";
 
+static const char migration_0047_up[] =
+    "CREATE INDEX IF NOT EXISTS idx_recordings_start_time "
+    "ON recordings(start_time);\n"
+    "CREATE INDEX IF NOT EXISTS idx_recordings_complete_stream_start "
+    "ON recordings(is_complete, stream_name, start_time);\n"
+    "CREATE INDEX IF NOT EXISTS idx_detections_stream_timestamp "
+    "ON detections(stream_name, timestamp);\n"
+    "CREATE INDEX IF NOT EXISTS idx_detections_recording_id "
+    "ON detections(recording_id);\n"
+    "CREATE INDEX IF NOT EXISTS idx_recordings_history_start "
+    "ON recordings(start_time DESC) "
+    "WHERE is_complete = 1 AND end_time IS NOT NULL;\n"
+    "CREATE INDEX IF NOT EXISTS idx_detections_unlinked_stream_time_label "
+    "ON detections(stream_name, timestamp, label) "
+    "WHERE recording_id IS NULL AND source != 'external_motion';";
+
+static const char migration_0047_down[] =
+    "DROP INDEX IF EXISTS idx_detections_unlinked_stream_time_label;\n"
+    "DROP INDEX IF EXISTS idx_recordings_history_start;";
+
+static const char migration_0048_up[] =
+    "ALTER TABLE streams ADD COLUMN camera_uuid TEXT NOT NULL DEFAULT '';\n"
+    "\n"
+    "UPDATE streams\n"
+    "SET camera_uuid = lower(\n"
+    "    hex(randomblob(4)) || '-' ||\n"
+    "    hex(randomblob(2)) || '-4' ||\n"
+    "    substr(hex(randomblob(2)), 2) || '-' ||\n"
+    "    substr('89ab', (abs(random()) % 4) + 1, 1) ||\n"
+    "    substr(hex(randomblob(2)), 2) || '-' ||\n"
+    "    hex(randomblob(6))\n"
+    ")\n"
+    "WHERE camera_uuid = '';\n"
+    "\n"
+    "CREATE UNIQUE INDEX IF NOT EXISTS idx_streams_camera_uuid\n"
+    "ON streams(camera_uuid);";
+
+static const char migration_0048_down[] =
+    "DROP INDEX IF EXISTS idx_streams_camera_uuid;\n"
+    "SELECT 1;";
+
+static const char migration_0049_up[] =
+    "CREATE TABLE camera_locations (\n"
+    "    id INTEGER PRIMARY KEY AUTOINCREMENT,\n"
+    "    uuid TEXT NOT NULL UNIQUE,\n"
+    "    parent_uuid TEXT REFERENCES camera_locations(uuid) ON DELETE RESTRICT,\n"
+    "    name TEXT NOT NULL,\n"
+    "    type TEXT NOT NULL DEFAULT 'area',\n"
+    "    sort_order INTEGER NOT NULL DEFAULT 0,\n"
+    "    metadata_json TEXT NOT NULL DEFAULT '{}',\n"
+    "    is_system INTEGER NOT NULL DEFAULT 0,\n"
+    "    created_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now')),\n"
+    "    updated_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now'))\n"
+    ");\n"
+    "\n"
+    "CREATE UNIQUE INDEX idx_camera_locations_sibling_name\n"
+    "ON camera_locations(ifnull(parent_uuid, ''), name COLLATE NOCASE);\n"
+    "\n"
+    "CREATE INDEX idx_camera_locations_parent\n"
+    "ON camera_locations(parent_uuid, sort_order, name COLLATE NOCASE);\n"
+    "\n"
+    "INSERT INTO camera_locations (uuid, parent_uuid, name, type, is_system)\n"
+    "VALUES (\n"
+    "    lower(\n"
+    "        hex(randomblob(4)) || '-' ||\n"
+    "        hex(randomblob(2)) || '-4' ||\n"
+    "        substr(hex(randomblob(2)), 2) || '-' ||\n"
+    "        substr('89ab', (abs(random()) % 4) + 1, 1) ||\n"
+    "        substr(hex(randomblob(2)), 2) || '-' ||\n"
+    "        hex(randomblob(6))\n"
+    "    ),\n"
+    "    NULL,\n"
+    "    'Unassigned',\n"
+    "    'system',\n"
+    "    1\n"
+    ");\n"
+    "\n"
+    "ALTER TABLE streams ADD COLUMN location_uuid TEXT DEFAULT NULL\n"
+    "REFERENCES camera_locations(uuid) ON DELETE RESTRICT;\n"
+    "\n"
+    "UPDATE streams\n"
+    "SET location_uuid = (SELECT uuid FROM camera_locations WHERE is_system = 1 LIMIT 1)\n"
+    "WHERE location_uuid IS NULL;\n"
+    "\n"
+    "CREATE INDEX idx_streams_location_uuid\n"
+    "ON streams(location_uuid);";
+
+static const char migration_0049_down[] =
+    "DROP INDEX IF EXISTS idx_streams_location_uuid;\n"
+    "UPDATE streams SET location_uuid = NULL;\n"
+    "DROP INDEX IF EXISTS idx_camera_locations_parent;\n"
+    "DROP INDEX IF EXISTS idx_camera_locations_sibling_name;\n"
+    "DROP TABLE IF EXISTS camera_locations;\n"
+    "SELECT 1;";
+
+static const char migration_0050_up[] =
+    "CREATE TABLE camera_tags (\n"
+    "    id INTEGER PRIMARY KEY AUTOINCREMENT,\n"
+    "    uuid TEXT NOT NULL UNIQUE,\n"
+    "    label TEXT NOT NULL,\n"
+    "    color TEXT NOT NULL DEFAULT '',\n"
+    "    description TEXT NOT NULL DEFAULT '',\n"
+    "    created_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now')),\n"
+    "    updated_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now'))\n"
+    ");\n"
+    "\n"
+    "CREATE UNIQUE INDEX idx_camera_tags_label\n"
+    "ON camera_tags(label COLLATE NOCASE);\n"
+    "\n"
+    "CREATE TABLE camera_tag_assignments (\n"
+    "    camera_uuid TEXT NOT NULL REFERENCES streams(camera_uuid) ON DELETE CASCADE,\n"
+    "    tag_uuid TEXT NOT NULL REFERENCES camera_tags(uuid) ON DELETE CASCADE,\n"
+    "    created_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now')),\n"
+    "    PRIMARY KEY (camera_uuid, tag_uuid)\n"
+    ");\n"
+    "\n"
+    "CREATE INDEX idx_camera_tag_assignments_tag\n"
+    "ON camera_tag_assignments(tag_uuid, camera_uuid);";
+
+static const char migration_0050_down[] =
+    "DROP INDEX IF EXISTS idx_camera_tag_assignments_tag;\n"
+    "DROP TABLE IF EXISTS camera_tag_assignments;\n"
+    "DROP INDEX IF EXISTS idx_camera_tags_label;\n"
+    "DROP TABLE IF EXISTS camera_tags;\n"
+    "SELECT 1;";
+
+static const char migration_0051_up[] =
+    "CREATE TABLE camera_collections (\n"
+    "    id INTEGER PRIMARY KEY AUTOINCREMENT,\n"
+    "    uuid TEXT NOT NULL UNIQUE,\n"
+    "    name TEXT NOT NULL,\n"
+    "    description TEXT NOT NULL DEFAULT '',\n"
+    "    collection_type TEXT NOT NULL CHECK (collection_type IN ('static', 'smart')),\n"
+    "    selector_json TEXT NOT NULL DEFAULT '',\n"
+    "    is_shared INTEGER NOT NULL DEFAULT 1,\n"
+    "    owner_user_id INTEGER REFERENCES users(id) ON DELETE SET NULL,\n"
+    "    created_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now')),\n"
+    "    updated_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now'))\n"
+    ");\n"
+    "\n"
+    "CREATE UNIQUE INDEX idx_camera_collections_name\n"
+    "ON camera_collections(name COLLATE NOCASE);\n"
+    "\n"
+    "CREATE INDEX idx_camera_collections_owner\n"
+    "ON camera_collections(owner_user_id, is_shared);\n"
+    "\n"
+    "CREATE TABLE camera_collection_members (\n"
+    "    collection_uuid TEXT NOT NULL REFERENCES camera_collections(uuid) ON DELETE CASCADE,\n"
+    "    camera_uuid TEXT NOT NULL REFERENCES streams(camera_uuid) ON DELETE CASCADE,\n"
+    "    created_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now')),\n"
+    "    PRIMARY KEY (collection_uuid, camera_uuid)\n"
+    ");\n"
+    "\n"
+    "CREATE INDEX idx_camera_collection_members_camera\n"
+    "ON camera_collection_members(camera_uuid, collection_uuid);";
+
+static const char migration_0051_down[] =
+    "DROP INDEX IF EXISTS idx_camera_collection_members_camera;\n"
+    "DROP TABLE IF EXISTS camera_collection_members;\n"
+    "DROP INDEX IF EXISTS idx_camera_collections_owner;\n"
+    "DROP INDEX IF EXISTS idx_camera_collections_name;\n"
+    "DROP TABLE IF EXISTS camera_collections;\n"
+    "SELECT 1;";
+
+static const char migration_0052_up[] =
+    "ALTER TABLE users ADD COLUMN authorization_mode TEXT NOT NULL DEFAULT 'legacy' "
+    "CHECK (authorization_mode IN ('legacy', 'policy'));\n"
+    "CREATE TABLE authz_actions ("
+    "action_key TEXT PRIMARY KEY, category TEXT NOT NULL, description TEXT NOT NULL, "
+    "camera_scoped INTEGER NOT NULL DEFAULT 0, destructive INTEGER NOT NULL DEFAULT 0, "
+    "sort_order INTEGER NOT NULL DEFAULT 0);\n"
+    "CREATE TABLE authz_roles ("
+    "uuid TEXT PRIMARY KEY, name TEXT NOT NULL UNIQUE COLLATE NOCASE, "
+    "description TEXT NOT NULL DEFAULT '', is_builtin INTEGER NOT NULL DEFAULT 0, "
+    "created_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now')), "
+    "updated_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now')));\n"
+    "CREATE TABLE authz_role_actions ("
+    "role_uuid TEXT NOT NULL REFERENCES authz_roles(uuid) ON DELETE CASCADE, "
+    "action_key TEXT NOT NULL REFERENCES authz_actions(action_key) ON DELETE RESTRICT, "
+    "PRIMARY KEY (role_uuid, action_key));\n"
+    "CREATE TABLE authz_grants ("
+    "uuid TEXT PRIMARY KEY, user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE, "
+    "role_uuid TEXT NOT NULL REFERENCES authz_roles(uuid) ON DELETE RESTRICT, "
+    "scope_type TEXT NOT NULL DEFAULT 'all' CHECK (scope_type IN ('all', 'selector')), "
+    "selector_json TEXT, enabled INTEGER NOT NULL DEFAULT 1, "
+    "created_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now')), "
+    "updated_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now')), "
+    "CHECK ((scope_type = 'all' AND selector_json IS NULL) OR "
+    "(scope_type = 'selector' AND selector_json IS NOT NULL)));\n"
+    "CREATE INDEX idx_authz_grants_user ON authz_grants(user_id, enabled);\n"
+    "CREATE INDEX idx_authz_grants_role ON authz_grants(role_uuid);\n"
+    "CREATE TABLE authz_policy_state ("
+    "id INTEGER PRIMARY KEY CHECK (id = 1), version INTEGER NOT NULL DEFAULT 1, "
+    "updated_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now')));\n"
+    "INSERT INTO authz_policy_state (id, version) VALUES (1, 1);\n"
+    "INSERT INTO authz_actions "
+    "(action_key, category, description, camera_scoped, destructive, sort_order) VALUES "
+    "('live.view','Live video','View a camera live stream',1,0,10),"
+    "('audio.listen','Live video','Listen to camera audio',1,0,20),"
+    "('audio.talk','Live video','Transmit audio to a camera',1,0,30),"
+    "('recordings.replay','Recordings','Replay recorded video',1,0,40),"
+    "('recordings.export','Recordings','Download or export recorded video',1,0,50),"
+    "('snapshot.create','Recordings','Create or download a camera snapshot',1,0,60),"
+    "('ptz.control','Camera operation','Move PTZ cameras and manage presets',1,0,70),"
+    "('evidence.protect','Recordings','Protect or release recordings from retention',1,1,80),"
+    "('recording.delete','Recordings','Permanently delete recordings',1,1,90),"
+    "('camera.configure','Camera administration','Add, change, or remove camera configuration',1,1,100),"
+    "('fleet.execute_job','Camera administration','Execute a bulk fleet operation',1,1,110),"
+    "('storage.configure','System administration','Change storage and retention configuration',0,1,120),"
+    "('events.configure','System administration','Change event routes and destinations',0,1,130),"
+    "('users.manage','System administration','Manage users, roles, and grants',0,1,140),"
+    "('system.admin','System administration','Change or control the lightNVR system',0,1,150);\n"
+    "INSERT INTO authz_roles (uuid,name,description,is_builtin) VALUES "
+    "('00000000-0000-4000-8000-000000000001','Administrator','All lightNVR actions over every resource',1),"
+    "('00000000-0000-4000-8000-000000000002','Operator','Day-to-day camera and recording operation',1),"
+    "('00000000-0000-4000-8000-000000000003','Viewer','Read-only live and recording access',1),"
+    "('00000000-0000-4000-8000-000000000004','API Operator','Programmatic camera and recording operation',1);\n"
+    "INSERT INTO authz_role_actions (role_uuid,action_key) "
+    "SELECT '00000000-0000-4000-8000-000000000001',action_key FROM authz_actions;\n"
+    "INSERT INTO authz_role_actions (role_uuid,action_key) VALUES "
+    "('00000000-0000-4000-8000-000000000002','live.view'),"
+    "('00000000-0000-4000-8000-000000000002','audio.listen'),"
+    "('00000000-0000-4000-8000-000000000002','audio.talk'),"
+    "('00000000-0000-4000-8000-000000000002','recordings.replay'),"
+    "('00000000-0000-4000-8000-000000000002','recordings.export'),"
+    "('00000000-0000-4000-8000-000000000002','snapshot.create'),"
+    "('00000000-0000-4000-8000-000000000002','ptz.control'),"
+    "('00000000-0000-4000-8000-000000000002','evidence.protect'),"
+    "('00000000-0000-4000-8000-000000000002','recording.delete'),"
+    "('00000000-0000-4000-8000-000000000002','camera.configure'),"
+    "('00000000-0000-4000-8000-000000000003','live.view'),"
+    "('00000000-0000-4000-8000-000000000003','audio.listen'),"
+    "('00000000-0000-4000-8000-000000000003','recordings.replay'),"
+    "('00000000-0000-4000-8000-000000000003','recordings.export'),"
+    "('00000000-0000-4000-8000-000000000003','snapshot.create'),"
+    "('00000000-0000-4000-8000-000000000004','live.view'),"
+    "('00000000-0000-4000-8000-000000000004','audio.listen'),"
+    "('00000000-0000-4000-8000-000000000004','audio.talk'),"
+    "('00000000-0000-4000-8000-000000000004','recordings.replay'),"
+    "('00000000-0000-4000-8000-000000000004','recordings.export'),"
+    "('00000000-0000-4000-8000-000000000004','snapshot.create'),"
+    "('00000000-0000-4000-8000-000000000004','ptz.control'),"
+    "('00000000-0000-4000-8000-000000000004','evidence.protect'),"
+    "('00000000-0000-4000-8000-000000000004','recording.delete'),"
+    "('00000000-0000-4000-8000-000000000004','camera.configure');";
+
+static const char migration_0052_down[] =
+    "DROP TABLE IF EXISTS authz_policy_state;\n"
+    "DROP INDEX IF EXISTS idx_authz_grants_role;\n"
+    "DROP INDEX IF EXISTS idx_authz_grants_user;\n"
+    "DROP TABLE IF EXISTS authz_grants;\n"
+    "DROP TABLE IF EXISTS authz_role_actions;\n"
+    "DROP TABLE IF EXISTS authz_roles;\n"
+    "DROP TABLE IF EXISTS authz_actions;\n"
+    "SELECT 1;";
+
+static const char migration_0053_up[] =
+    "CREATE TABLE authz_grants_new ("
+    "uuid TEXT PRIMARY KEY, "
+    "user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE, "
+    "role_uuid TEXT NOT NULL REFERENCES authz_roles(uuid) ON DELETE RESTRICT, "
+    "scope_type TEXT NOT NULL DEFAULT 'all' CHECK (scope_type IN ('all','selector','collection')), "
+    "selector_json TEXT, "
+    "collection_uuid TEXT REFERENCES camera_collections(uuid) ON DELETE RESTRICT, "
+    "enabled INTEGER NOT NULL DEFAULT 1, "
+    "created_at INTEGER NOT NULL DEFAULT (strftime('%s','now')), "
+    "updated_at INTEGER NOT NULL DEFAULT (strftime('%s','now')), "
+    "CHECK ((scope_type='all' AND selector_json IS NULL AND collection_uuid IS NULL) OR "
+    "(scope_type='selector' AND selector_json IS NOT NULL AND collection_uuid IS NULL) OR "
+    "(scope_type='collection' AND selector_json IS NULL AND collection_uuid IS NOT NULL)));\n"
+    "INSERT INTO authz_grants_new "
+    "(uuid,user_id,role_uuid,scope_type,selector_json,enabled,created_at,updated_at) "
+    "SELECT uuid,user_id,role_uuid,scope_type,selector_json,enabled,created_at,updated_at "
+    "FROM authz_grants;\n"
+    "DROP INDEX idx_authz_grants_role;\n"
+    "DROP INDEX idx_authz_grants_user;\n"
+    "DROP TABLE authz_grants;\n"
+    "ALTER TABLE authz_grants_new RENAME TO authz_grants;\n"
+    "CREATE INDEX idx_authz_grants_user ON authz_grants(user_id,enabled);\n"
+    "CREATE INDEX idx_authz_grants_role ON authz_grants(role_uuid);\n"
+    "CREATE INDEX idx_authz_grants_collection ON authz_grants(collection_uuid) "
+    "WHERE collection_uuid IS NOT NULL;";
+
+static const char migration_0053_down[] =
+    "CREATE TABLE authz_grants_old ("
+    "uuid TEXT PRIMARY KEY, "
+    "user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE, "
+    "role_uuid TEXT NOT NULL REFERENCES authz_roles(uuid) ON DELETE RESTRICT, "
+    "scope_type TEXT NOT NULL DEFAULT 'all' CHECK (scope_type IN ('all','selector')), "
+    "selector_json TEXT, enabled INTEGER NOT NULL DEFAULT 1, "
+    "created_at INTEGER NOT NULL DEFAULT (strftime('%s','now')), "
+    "updated_at INTEGER NOT NULL DEFAULT (strftime('%s','now')), "
+    "CHECK ((scope_type='all' AND selector_json IS NULL) OR "
+    "(scope_type='selector' AND selector_json IS NOT NULL)));\n"
+    "INSERT INTO authz_grants_old "
+    "(uuid,user_id,role_uuid,scope_type,selector_json,enabled,created_at,updated_at) "
+    "SELECT uuid,user_id,role_uuid,scope_type,selector_json,enabled,created_at,updated_at "
+    "FROM authz_grants WHERE scope_type!='collection';\n"
+    "DROP INDEX idx_authz_grants_collection;\n"
+    "DROP INDEX idx_authz_grants_role;\n"
+    "DROP INDEX idx_authz_grants_user;\n"
+    "DROP TABLE authz_grants;\n"
+    "ALTER TABLE authz_grants_old RENAME TO authz_grants;\n"
+    "CREATE INDEX idx_authz_grants_user ON authz_grants(user_id,enabled);\n"
+    "CREATE INDEX idx_authz_grants_role ON authz_grants(role_uuid);\n"
+    "SELECT 1;";
+
+static const char migration_0054_up[] =
+    "CREATE TABLE authz_api_tokens ("
+    "uuid TEXT PRIMARY KEY, "
+    "user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE, "
+    "created_by_user_id INTEGER REFERENCES users(id) ON DELETE SET NULL, "
+    "description TEXT NOT NULL, token_prefix TEXT NOT NULL, "
+    "token_hash TEXT NOT NULL UNIQUE, "
+    "action_mask INTEGER NOT NULL CHECK (action_mask>0), "
+    "scope_type TEXT NOT NULL CHECK (scope_type IN ('all','selector','collection')), "
+    "selector_json TEXT, "
+    "collection_uuid TEXT REFERENCES camera_collections(uuid) ON DELETE RESTRICT, "
+    "expires_at INTEGER NOT NULL, revoked_at INTEGER, last_used_at INTEGER, "
+    "created_at INTEGER NOT NULL DEFAULT (strftime('%s','now')), "
+    "CHECK ((scope_type='all' AND selector_json IS NULL AND collection_uuid IS NULL) OR "
+    "(scope_type='selector' AND selector_json IS NOT NULL AND collection_uuid IS NULL) OR "
+    "(scope_type='collection' AND selector_json IS NULL AND collection_uuid IS NOT NULL)), "
+    "CHECK (expires_at>created_at));\n"
+    "CREATE INDEX idx_authz_api_tokens_user "
+    "ON authz_api_tokens(user_id,created_at DESC);\n"
+    "CREATE INDEX idx_authz_api_tokens_active "
+    "ON authz_api_tokens(token_hash,expires_at) WHERE revoked_at IS NULL;";
+
+static const char migration_0054_down[] =
+    "DROP INDEX IF EXISTS idx_authz_api_tokens_active;\n"
+    "DROP INDEX IF EXISTS idx_authz_api_tokens_user;\n"
+    "DROP TABLE IF EXISTS authz_api_tokens;\n"
+    "SELECT 1;";
+
+static const char migration_0055_up[] =
+    "CREATE TABLE audit_events ("
+    "id INTEGER PRIMARY KEY AUTOINCREMENT, "
+    "uuid TEXT NOT NULL UNIQUE, "
+    "occurred_at INTEGER NOT NULL DEFAULT (strftime('%s','now')), "
+    "request_id TEXT NOT NULL, "
+    "principal_user_id INTEGER REFERENCES users(id) ON DELETE SET NULL, "
+    "principal_username TEXT NOT NULL DEFAULT '', "
+    "auth_method TEXT NOT NULL DEFAULT 'unknown', "
+    "api_token_uuid TEXT, action TEXT NOT NULL, target_type TEXT, "
+    "target_uuid TEXT, "
+    "outcome TEXT NOT NULL CHECK (outcome IN "
+    "('allowed','denied','success','failure','error')), "
+    "remote_address TEXT, details_json TEXT NOT NULL DEFAULT '{}');\n"
+    "CREATE INDEX idx_audit_events_occurred "
+    "ON audit_events(occurred_at DESC,id DESC);\n"
+    "CREATE INDEX idx_audit_events_principal "
+    "ON audit_events(principal_user_id,occurred_at DESC);\n"
+    "CREATE INDEX idx_audit_events_action_outcome "
+    "ON audit_events(action,outcome,occurred_at DESC);\n"
+    "CREATE INDEX idx_audit_events_target "
+    "ON audit_events(target_uuid,occurred_at DESC) "
+    "WHERE target_uuid IS NOT NULL;\n"
+    "INSERT OR IGNORE INTO system_settings(key,value) "
+    "VALUES ('audit_retention_days','365');";
+
+static const char migration_0055_down[] =
+    "DELETE FROM system_settings WHERE key='audit_retention_days';\n"
+    "DROP INDEX IF EXISTS idx_audit_events_target;\n"
+    "DROP INDEX IF EXISTS idx_audit_events_action_outcome;\n"
+    "DROP INDEX IF EXISTS idx_audit_events_principal;\n"
+    "DROP INDEX IF EXISTS idx_audit_events_occurred;\n"
+    "DROP TABLE IF EXISTS audit_events;\n"
+    "SELECT 1;";
+
+static const char migration_0056_up[] =
+    "ALTER TABLE authz_actions "
+    "ADD COLUMN bit_index INTEGER NOT NULL DEFAULT -1;\n"
+    "UPDATE authz_actions SET bit_index = CASE action_key "
+    "WHEN 'live.view' THEN 0 "
+    "WHEN 'audio.listen' THEN 1 "
+    "WHEN 'audio.talk' THEN 2 "
+    "WHEN 'recordings.replay' THEN 3 "
+    "WHEN 'recordings.export' THEN 4 "
+    "WHEN 'snapshot.create' THEN 5 "
+    "WHEN 'ptz.control' THEN 6 "
+    "WHEN 'evidence.protect' THEN 7 "
+    "WHEN 'recording.delete' THEN 8 "
+    "WHEN 'camera.configure' THEN 9 "
+    "WHEN 'fleet.execute_job' THEN 10 "
+    "WHEN 'storage.configure' THEN 11 "
+    "WHEN 'events.configure' THEN 12 "
+    "WHEN 'users.manage' THEN 13 "
+    "WHEN 'system.admin' THEN 14 "
+    "ELSE -1 END;\n"
+    "CREATE UNIQUE INDEX idx_authz_actions_bit_index "
+    "ON authz_actions(bit_index);\n"
+    "CREATE TRIGGER trg_streams_camera_uuid_insert "
+    "BEFORE INSERT ON streams "
+    "FOR EACH ROW WHEN NEW.camera_uuid IS NULL OR NEW.camera_uuid = '' "
+    "BEGIN "
+    "SELECT RAISE(ABORT, 'streams.camera_uuid must be a generated UUID'); "
+    "END;\n"
+    "CREATE TRIGGER trg_streams_camera_uuid_update "
+    "BEFORE UPDATE OF camera_uuid ON streams "
+    "FOR EACH ROW WHEN NEW.camera_uuid IS NULL OR NEW.camera_uuid = '' "
+    "BEGIN "
+    "SELECT RAISE(ABORT, 'streams.camera_uuid must be a generated UUID'); "
+    "END;\n"
+    "INSERT OR IGNORE INTO system_settings (key, value) "
+    "VALUES ('camera_tags_backfill_completed', '0');";
+
+static const char migration_0056_down[] =
+    "DROP TRIGGER IF EXISTS trg_streams_camera_uuid_update;\n"
+    "DROP TRIGGER IF EXISTS trg_streams_camera_uuid_insert;\n"
+    "DROP INDEX IF EXISTS idx_authz_actions_bit_index;\n"
+    "DELETE FROM system_settings "
+    "WHERE key = 'camera_tags_backfill_completed';\n"
+    "SELECT 1;";
+
+static const char migration_0057_up[] =
+    "CREATE TABLE event_outbox ("
+    "id INTEGER PRIMARY KEY AUTOINCREMENT, "
+    "event_id TEXT NOT NULL, event_source TEXT NOT NULL, "
+    "event_type TEXT NOT NULL, subject TEXT NOT NULL, "
+    "destination TEXT NOT NULL, topic TEXT NOT NULL, "
+    "envelope_json TEXT NOT NULL, "
+    "envelope_bytes INTEGER NOT NULL CHECK (envelope_bytes>0), "
+    "severity INTEGER NOT NULL CHECK (severity BETWEEN 0 AND 3), "
+    "state TEXT NOT NULL DEFAULT 'pending' CHECK "
+    "(state IN ('pending','delivering','delivered','dead')), "
+    "attempt_count INTEGER NOT NULL DEFAULT 0 CHECK (attempt_count>=0), "
+    "next_attempt_at INTEGER NOT NULL, expires_at INTEGER NOT NULL, "
+    "created_at INTEGER NOT NULL DEFAULT (strftime('%s','now')), "
+    "updated_at INTEGER NOT NULL DEFAULT (strftime('%s','now')), "
+    "last_attempt_at INTEGER, lease_expires_at INTEGER, "
+    "delivered_at INTEGER, dead_at INTEGER, "
+    "last_error TEXT NOT NULL DEFAULT '', "
+    "UNIQUE(event_source,event_id,destination));\n"
+    "CREATE INDEX idx_event_outbox_due ON event_outbox("
+    "destination,state,next_attempt_at,severity DESC,id) "
+    "WHERE state='pending';\n"
+    "CREATE INDEX idx_event_outbox_lease ON event_outbox("
+    "state,lease_expires_at) WHERE state='delivering';\n"
+    "CREATE INDEX idx_event_outbox_expiry ON event_outbox(state,expires_at);\n"
+    "CREATE INDEX idx_event_outbox_terminal ON event_outbox("
+    "state,updated_at,id) WHERE state IN ('delivered','dead');";
+
+static const char migration_0057_down[] =
+    "DROP INDEX IF EXISTS idx_event_outbox_terminal;\n"
+    "DROP INDEX IF EXISTS idx_event_outbox_expiry;\n"
+    "DROP INDEX IF EXISTS idx_event_outbox_lease;\n"
+    "DROP INDEX IF EXISTS idx_event_outbox_due;\n"
+    "DROP TABLE IF EXISTS event_outbox;\n"
+    "SELECT 1;";
+
+static const char migration_0058_up[] =
+    "CREATE TABLE event_routes ("
+    "id INTEGER PRIMARY KEY AUTOINCREMENT, uuid TEXT NOT NULL UNIQUE, "
+    "name TEXT NOT NULL, description TEXT NOT NULL DEFAULT '', "
+    "enabled INTEGER NOT NULL DEFAULT 1 CHECK (enabled IN (0,1)), "
+    "destination_key TEXT NOT NULL DEFAULT 'mqtt:default', "
+    "scope_type TEXT NOT NULL DEFAULT 'all' CHECK "
+    "(scope_type IN ('all','selector')), selector_json TEXT, "
+    "predicate_json TEXT NOT NULL DEFAULT '{\"version\":1}', "
+    "schedule_json TEXT NOT NULL DEFAULT "
+    "'{\"version\":1,\"timezone\":\"UTC\",\"windows\":[]}', "
+    "debounce_seconds INTEGER NOT NULL DEFAULT 0 CHECK "
+    "(debounce_seconds BETWEEN 0 AND 86400), "
+    "cooldown_seconds INTEGER NOT NULL DEFAULT 0 CHECK "
+    "(cooldown_seconds BETWEEN 0 AND 604800), "
+    "grouping_window_seconds INTEGER NOT NULL DEFAULT 0 CHECK "
+    "(grouping_window_seconds BETWEEN 0 AND 3600), "
+    "max_events_per_minute INTEGER NOT NULL DEFAULT 0 CHECK "
+    "(max_events_per_minute BETWEEN 0 AND 60000), "
+    "revision INTEGER NOT NULL DEFAULT 1 CHECK (revision>=1), "
+    "created_at INTEGER NOT NULL DEFAULT (strftime('%s','now')), "
+    "updated_at INTEGER NOT NULL DEFAULT (strftime('%s','now')), "
+    "CHECK ((scope_type='all' AND selector_json IS NULL) OR "
+    "(scope_type='selector' AND selector_json IS NOT NULL)));\n"
+    "CREATE UNIQUE INDEX idx_event_routes_name "
+    "ON event_routes(name COLLATE NOCASE);\n"
+    "CREATE INDEX idx_event_routes_delivery "
+    "ON event_routes(enabled,destination_key,uuid);\n"
+    "CREATE TABLE event_route_types ("
+    "route_uuid TEXT NOT NULL REFERENCES event_routes(uuid) ON DELETE CASCADE, "
+    "event_type TEXT NOT NULL, PRIMARY KEY(route_uuid,event_type));\n"
+    "CREATE INDEX idx_event_route_types_type "
+    "ON event_route_types(event_type,route_uuid);";
+
+static const char migration_0058_down[] =
+    "DROP INDEX IF EXISTS idx_event_route_types_type;\n"
+    "DROP TABLE IF EXISTS event_route_types;\n"
+    "DROP INDEX IF EXISTS idx_event_routes_delivery;\n"
+    "DROP INDEX IF EXISTS idx_event_routes_name;\n"
+    "DROP TABLE IF EXISTS event_routes;\n"
+    "SELECT 1;";
+
+static const char migration_0059_up[] =
+    "CREATE TABLE event_route_suppression_state ("
+    "route_uuid TEXT NOT NULL REFERENCES event_routes(uuid) ON DELETE CASCADE, "
+    "event_type TEXT NOT NULL, subject TEXT NOT NULL, "
+    "last_observed_at INTEGER NOT NULL DEFAULT 0 CHECK(last_observed_at>=0), "
+    "last_allowed_at INTEGER NOT NULL DEFAULT 0 CHECK(last_allowed_at>=0), "
+    "rate_window_started_at INTEGER NOT NULL DEFAULT 0 "
+    "CHECK(rate_window_started_at>=0), "
+    "rate_window_count INTEGER NOT NULL DEFAULT 0 CHECK(rate_window_count>=0), "
+    "group_started_at INTEGER NOT NULL DEFAULT 0 CHECK(group_started_at>=0), "
+    "suppressed_count INTEGER NOT NULL DEFAULT 0 CHECK(suppressed_count>=0), "
+    "last_allowed_event_id TEXT NOT NULL DEFAULT '', "
+    "last_reason TEXT NOT NULL DEFAULT 'allowed' CHECK(last_reason IN "
+    "('allowed','debounce','cooldown','grouping','rate')), "
+    "updated_at INTEGER NOT NULL DEFAULT(strftime('%s','now')), "
+    "PRIMARY KEY(route_uuid,event_type,subject));\n"
+    "CREATE INDEX idx_event_route_suppression_updated "
+    "ON event_route_suppression_state(updated_at,route_uuid);";
+
+static const char migration_0059_down[] =
+    "DROP INDEX IF EXISTS idx_event_route_suppression_updated;\n"
+    "DROP TABLE IF EXISTS event_route_suppression_state;\n"
+    "SELECT 1;";
+
+static const char migration_0060_up[] =
+    "CREATE TABLE event_destinations ("
+    "uuid TEXT PRIMARY KEY, name TEXT NOT NULL, "
+    "description TEXT NOT NULL DEFAULT '', "
+    "enabled INTEGER NOT NULL DEFAULT 1 CHECK(enabled IN (0,1)), "
+    "destination_type TEXT NOT NULL DEFAULT 'mqtt' "
+    "CHECK(destination_type='mqtt'), broker_host TEXT NOT NULL, "
+    "broker_port INTEGER NOT NULL CHECK(broker_port BETWEEN 1 AND 65535), "
+    "client_id TEXT NOT NULL, topic_template TEXT NOT NULL, "
+    "username TEXT NOT NULL DEFAULT '', password TEXT NOT NULL DEFAULT '', "
+    "tls_mode TEXT NOT NULL DEFAULT 'system' CHECK(tls_mode IN "
+    "('disabled','system','custom_ca','mutual')), "
+    "ca_file TEXT NOT NULL DEFAULT '', cert_file TEXT NOT NULL DEFAULT '', "
+    "key_file TEXT NOT NULL DEFAULT '', "
+    "keepalive_seconds INTEGER NOT NULL DEFAULT 60 "
+    "CHECK(keepalive_seconds BETWEEN 5 AND 3600), "
+    "qos INTEGER NOT NULL DEFAULT 1 CHECK(qos BETWEEN 0 AND 2), "
+    "revision INTEGER NOT NULL DEFAULT 1 CHECK(revision>=1), "
+    "created_at INTEGER NOT NULL DEFAULT(strftime('%s','now')), "
+    "updated_at INTEGER NOT NULL DEFAULT(strftime('%s','now')));\n"
+    "CREATE UNIQUE INDEX idx_event_destinations_name "
+    "ON event_destinations(name COLLATE NOCASE);\n"
+    "CREATE UNIQUE INDEX idx_event_destinations_client "
+    "ON event_destinations(broker_host COLLATE NOCASE,broker_port,client_id);\n"
+    "CREATE INDEX idx_event_destinations_enabled "
+    "ON event_destinations(enabled,destination_type,uuid);";
+
+static const char migration_0060_down[] =
+    "DROP INDEX IF EXISTS idx_event_destinations_enabled;\n"
+    "DROP INDEX IF EXISTS idx_event_destinations_client;\n"
+    "DROP INDEX IF EXISTS idx_event_destinations_name;\n"
+    "DROP TABLE IF EXISTS event_destinations;\n"
+    "SELECT 1;";
+
+static const char migration_0061_up[] =
+    "ALTER TABLE recordings ADD COLUMN camera_uuid TEXT;\n"
+    "ALTER TABLE detections ADD COLUMN camera_uuid TEXT;\n"
+    "UPDATE recordings SET camera_uuid = ("
+    "SELECT streams.camera_uuid FROM streams "
+    "WHERE streams.name = recordings.stream_name) "
+    "WHERE camera_uuid IS NULL AND EXISTS ("
+    "SELECT 1 FROM streams WHERE streams.name = recordings.stream_name);\n"
+    "UPDATE detections SET camera_uuid = COALESCE(("
+    "SELECT recordings.camera_uuid FROM recordings "
+    "WHERE recordings.id = detections.recording_id), ("
+    "SELECT streams.camera_uuid FROM streams "
+    "WHERE streams.name = detections.stream_name)) "
+    "WHERE camera_uuid IS NULL;\n"
+    "CREATE INDEX idx_recordings_camera_time "
+    "ON recordings(camera_uuid, start_time, end_time) "
+    "WHERE camera_uuid IS NOT NULL;\n"
+    "CREATE INDEX idx_detections_camera_time_id "
+    "ON detections(camera_uuid, timestamp, id) "
+    "WHERE camera_uuid IS NOT NULL;";
+
+static const char migration_0061_down[] =
+    "DROP INDEX IF EXISTS idx_detections_camera_time_id;\n"
+    "DROP INDEX IF EXISTS idx_recordings_camera_time;\n"
+    "SELECT 1;";
+
+static const char migration_0062_up[] =
+    "CREATE INDEX idx_detections_camera_label_time_id "
+    "ON detections(camera_uuid, label, timestamp DESC, id DESC) "
+    "WHERE camera_uuid IS NOT NULL;\n"
+    "CREATE INDEX idx_detections_camera_zone_time_id "
+    "ON detections(camera_uuid, zone_id, timestamp DESC, id DESC) "
+    "WHERE camera_uuid IS NOT NULL AND zone_id != '';\n"
+    "CREATE INDEX idx_detections_camera_source_time_id "
+    "ON detections(camera_uuid, source, timestamp DESC, id DESC) "
+    "WHERE camera_uuid IS NOT NULL;";
+
+static const char migration_0062_down[] =
+    "DROP INDEX IF EXISTS idx_detections_camera_source_time_id;\n"
+    "DROP INDEX IF EXISTS idx_detections_camera_zone_time_id;\n"
+    "DROP INDEX IF EXISTS idx_detections_camera_label_time_id;";
+
+static const char migration_0063_up[] =
+    "ALTER TABLE users "
+    "ADD COLUMN must_change_password INTEGER NOT NULL DEFAULT 0 "
+    "CHECK (must_change_password IN (0, 1));";
+
+static const char migration_0063_down[] =
+    "SELECT 1;";
+
+static const char migration_0064_up[] =
+    "CREATE TABLE investigation_bookmarks ("
+    "uuid TEXT PRIMARY KEY,"
+    "owner_user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,"
+    "title TEXT NOT NULL,note TEXT NOT NULL DEFAULT '',"
+    "start_time INTEGER NOT NULL,end_time INTEGER NOT NULL,"
+    "cursor_time INTEGER NOT NULL,primary_camera_uuid TEXT NOT NULL,"
+    "filters_json TEXT NOT NULL DEFAULT '{}',"
+    "representative_result_json TEXT,revision INTEGER NOT NULL DEFAULT 1,"
+    "created_at INTEGER NOT NULL DEFAULT (strftime('%s','now')) ,"
+    "updated_at INTEGER NOT NULL DEFAULT (strftime('%s','now')) ,"
+    "CHECK (end_time > start_time),"
+    "CHECK (cursor_time >= start_time AND cursor_time <= end_time));"
+    "CREATE INDEX idx_investigation_bookmarks_owner_updated "
+    "ON investigation_bookmarks(owner_user_id,updated_at DESC,uuid);"
+    "CREATE TABLE investigation_bookmark_cameras ("
+    "bookmark_uuid TEXT NOT NULL REFERENCES investigation_bookmarks(uuid) "
+    "ON DELETE CASCADE,camera_uuid TEXT NOT NULL,sort_order INTEGER NOT NULL,"
+    "PRIMARY KEY (bookmark_uuid,camera_uuid),"
+    "UNIQUE (bookmark_uuid,sort_order));"
+    "CREATE INDEX idx_investigation_bookmark_cameras_camera "
+    "ON investigation_bookmark_cameras(camera_uuid,bookmark_uuid);";
+
+static const char migration_0064_down[] =
+    "DROP INDEX IF EXISTS idx_investigation_bookmark_cameras_camera;"
+    "DROP TABLE IF EXISTS investigation_bookmark_cameras;"
+    "DROP INDEX IF EXISTS idx_investigation_bookmarks_owner_updated;"
+    "DROP TABLE IF EXISTS investigation_bookmarks;"
+    "SELECT 1;";
+
+static const char migration_0065_up[] =
+    "CREATE TABLE IF NOT EXISTS storage_targets("
+    "uuid TEXT PRIMARY KEY,name TEXT NOT NULL COLLATE NOCASE,"
+    "target_type TEXT NOT NULL DEFAULT 'filesystem' CHECK(target_type IN('filesystem')),"
+    "root_path TEXT NOT NULL,enabled INTEGER NOT NULL DEFAULT 1 CHECK(enabled IN(0,1)),"
+    "is_default INTEGER NOT NULL DEFAULT 0 CHECK(is_default IN(0,1)),"
+    "storage_class TEXT NOT NULL DEFAULT 'hot' CHECK(storage_class IN('hot','warm','cold')),"
+    "reserve_bytes INTEGER NOT NULL DEFAULT 0 CHECK(reserve_bytes>=0),"
+    "high_watermark_pct REAL NOT NULL DEFAULT 90.0 CHECK(high_watermark_pct>0 AND high_watermark_pct<100),"
+    "low_watermark_pct REAL NOT NULL DEFAULT 80.0 CHECK(low_watermark_pct>=0 AND low_watermark_pct<high_watermark_pct),"
+    "health_status TEXT NOT NULL DEFAULT 'unknown' CHECK(health_status IN('unknown','healthy','degraded','unavailable','disabled')),"
+    "capacity_bytes INTEGER NOT NULL DEFAULT 0,available_bytes INTEGER NOT NULL DEFAULT 0,"
+    "filesystem_device INTEGER NOT NULL DEFAULT 0,last_probe_at INTEGER,last_success_at INTEGER,"
+    "last_error TEXT NOT NULL DEFAULT '',"
+    "recording_count INTEGER NOT NULL DEFAULT 0 CHECK(recording_count>=0),"
+    "recording_bytes INTEGER NOT NULL DEFAULT 0 CHECK(recording_bytes>=0),"
+    "revision INTEGER NOT NULL DEFAULT 1,"
+    "created_at INTEGER NOT NULL DEFAULT(strftime('%s','now')),"
+    "updated_at INTEGER NOT NULL DEFAULT(strftime('%s','now')));"
+    "CREATE UNIQUE INDEX IF NOT EXISTS idx_storage_targets_name ON storage_targets(name COLLATE NOCASE);"
+    "CREATE UNIQUE INDEX IF NOT EXISTS idx_storage_targets_root_path ON storage_targets(root_path);"
+    "CREATE UNIQUE INDEX IF NOT EXISTS idx_storage_targets_one_default ON storage_targets(is_default) WHERE is_default=1;"
+    "CREATE INDEX IF NOT EXISTS idx_storage_targets_enabled ON storage_targets(enabled,name COLLATE NOCASE);"
+    "ALTER TABLE recordings ADD COLUMN storage_target_uuid TEXT REFERENCES storage_targets(uuid) ON DELETE SET NULL;"
+    "ALTER TABLE recordings ADD COLUMN object_key TEXT;"
+    "ALTER TABLE recordings ADD COLUMN placement_reason TEXT;"
+    "ALTER TABLE recordings ADD COLUMN storage_policy_version INTEGER;"
+    "CREATE INDEX IF NOT EXISTS idx_recordings_storage_target_time ON recordings(storage_target_uuid,start_time DESC);"
+    "CREATE TRIGGER IF NOT EXISTS trg_recordings_storage_target_insert AFTER INSERT ON recordings "
+    "FOR EACH ROW WHEN NEW.storage_target_uuid IS NOT NULL BEGIN "
+    "UPDATE storage_targets SET recording_count=recording_count+1,"
+    "recording_bytes=recording_bytes+MAX(COALESCE(NEW.size_bytes,0),0) WHERE uuid=NEW.storage_target_uuid;END;"
+    "CREATE TRIGGER IF NOT EXISTS trg_recordings_storage_target_delete AFTER DELETE ON recordings "
+    "FOR EACH ROW WHEN OLD.storage_target_uuid IS NOT NULL BEGIN "
+    "UPDATE storage_targets SET recording_count=MAX(recording_count-1,0),"
+    "recording_bytes=MAX(recording_bytes-MAX(COALESCE(OLD.size_bytes,0),0),0) WHERE uuid=OLD.storage_target_uuid;END;"
+    "CREATE TRIGGER IF NOT EXISTS trg_recordings_storage_target_update "
+    "AFTER UPDATE OF storage_target_uuid,size_bytes ON recordings FOR EACH ROW BEGIN "
+    "UPDATE storage_targets SET recording_count=MAX(recording_count-1,0),"
+    "recording_bytes=MAX(recording_bytes-MAX(COALESCE(OLD.size_bytes,0),0),0) "
+    "WHERE OLD.storage_target_uuid IS NOT NULL AND uuid=OLD.storage_target_uuid;"
+    "UPDATE storage_targets SET recording_count=recording_count+1,"
+    "recording_bytes=recording_bytes+MAX(COALESCE(NEW.size_bytes,0),0) "
+    "WHERE NEW.storage_target_uuid IS NOT NULL AND uuid=NEW.storage_target_uuid;END;";
+
+static const char migration_0065_down[] =
+    "DROP TRIGGER IF EXISTS trg_recordings_storage_target_update;"
+    "DROP TRIGGER IF EXISTS trg_recordings_storage_target_delete;"
+    "DROP TRIGGER IF EXISTS trg_recordings_storage_target_insert;"
+    "DROP INDEX IF EXISTS idx_recordings_storage_target_time;"
+    "DROP INDEX IF EXISTS idx_storage_targets_enabled;"
+    "DROP INDEX IF EXISTS idx_storage_targets_one_default;"
+    "DROP INDEX IF EXISTS idx_storage_targets_root_path;"
+    "DROP INDEX IF EXISTS idx_storage_targets_name;"
+    "DROP TABLE IF EXISTS storage_targets;";
+
+static const char migration_0066_up[] =
+    "ALTER TABLE storage_targets ADD COLUMN mount_required INTEGER NOT NULL DEFAULT 0 CHECK(mount_required IN(0,1));"
+    "ALTER TABLE storage_targets ADD COLUMN mount_guard_path TEXT NOT NULL DEFAULT '';"
+    "CREATE TABLE IF NOT EXISTS storage_policies("
+    "uuid TEXT PRIMARY KEY,name TEXT NOT NULL COLLATE NOCASE,"
+    "enabled INTEGER NOT NULL DEFAULT 1 CHECK(enabled IN(0,1)),"
+    "priority INTEGER NOT NULL DEFAULT 100,selector_json TEXT NOT NULL,"
+    "primary_target_uuid TEXT NOT NULL REFERENCES storage_targets(uuid) ON DELETE RESTRICT,"
+    "fallback_mode TEXT NOT NULL DEFAULT 'default' CHECK(fallback_mode IN('default','target','pause','fail')),"
+    "fallback_target_uuid TEXT REFERENCES storage_targets(uuid) ON DELETE RESTRICT,"
+    "revision INTEGER NOT NULL DEFAULT 1,"
+    "created_at INTEGER NOT NULL DEFAULT(strftime('%s','now')),"
+    "updated_at INTEGER NOT NULL DEFAULT(strftime('%s','now')),"
+    "CHECK((fallback_mode='target' AND fallback_target_uuid IS NOT NULL) OR"
+    "(fallback_mode!='target' AND fallback_target_uuid IS NULL)),"
+    "CHECK(fallback_target_uuid IS NULL OR fallback_target_uuid!=primary_target_uuid));"
+    "CREATE UNIQUE INDEX IF NOT EXISTS idx_storage_policies_name ON storage_policies(name COLLATE NOCASE);"
+    "CREATE INDEX IF NOT EXISTS idx_storage_policies_evaluation ON storage_policies(enabled,priority DESC,name COLLATE NOCASE,uuid);";
+
+static const char migration_0066_down[] =
+    "DROP INDEX IF EXISTS idx_storage_policies_evaluation;"
+    "DROP INDEX IF EXISTS idx_storage_policies_name;"
+    "DROP TABLE IF EXISTS storage_policies;";
+
+static const char migration_0067_up[] =
+    "CREATE TABLE fleet_saved_views("
+    "uuid TEXT PRIMARY KEY,owner_user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,"
+    "name TEXT NOT NULL COLLATE NOCASE,is_shared INTEGER NOT NULL DEFAULT 0 CHECK(is_shared IN(0,1)),"
+    "selector_json TEXT NOT NULL,search_text TEXT NOT NULL DEFAULT '',collection_uuid TEXT,"
+    "columns_json TEXT NOT NULL DEFAULT '[]',"
+    "sort_by TEXT NOT NULL DEFAULT 'name' CHECK(sort_by IN('name','camera_uuid','location','health','enabled','recording_mode','address')),"
+    "sort_order TEXT NOT NULL DEFAULT 'asc' CHECK(sort_order IN('asc','desc')),"
+    "revision INTEGER NOT NULL DEFAULT 1,"
+    "created_at INTEGER NOT NULL DEFAULT(strftime('%s','now')),"
+    "updated_at INTEGER NOT NULL DEFAULT(strftime('%s','now')));"
+    "CREATE UNIQUE INDEX idx_fleet_saved_views_owner_name "
+    "ON fleet_saved_views(COALESCE(owner_user_id,0),name COLLATE NOCASE);"
+    "CREATE INDEX idx_fleet_saved_views_visible "
+    "ON fleet_saved_views(is_shared,owner_user_id,name COLLATE NOCASE,uuid);";
+
+static const char migration_0067_down[] =
+    "DROP INDEX IF EXISTS idx_fleet_saved_views_visible;"
+    "DROP INDEX IF EXISTS idx_fleet_saved_views_owner_name;"
+    "DROP TABLE IF EXISTS fleet_saved_views;";
+
+static const char migration_0068_up[] =
+    "CREATE TABLE storage_migration_jobs("
+    "uuid TEXT PRIMARY KEY,recording_id INTEGER NOT NULL REFERENCES recordings(id) ON DELETE CASCADE,"
+    "owner_user_id INTEGER REFERENCES users(id) ON DELETE SET NULL,"
+    "operation TEXT NOT NULL DEFAULT 'move' CHECK(operation IN('move')),"
+    "source_target_uuid TEXT NOT NULL REFERENCES storage_targets(uuid) ON DELETE RESTRICT,"
+    "source_object_key TEXT NOT NULL,"
+    "destination_target_uuid TEXT NOT NULL REFERENCES storage_targets(uuid) ON DELETE RESTRICT,"
+    "destination_object_key TEXT NOT NULL,"
+    "state TEXT NOT NULL DEFAULT 'queued' CHECK(state IN('queued','copying','verifying','committing','cleanup_pending','retry_wait','completed','failed','cancelled')),"
+    "checksum_mode TEXT NOT NULL DEFAULT 'sha256' CHECK(checksum_mode IN('sha256')),"
+    "checksum TEXT NOT NULL DEFAULT '',bytes_total INTEGER NOT NULL DEFAULT 0 CHECK(bytes_total>=0),"
+    "bytes_copied INTEGER NOT NULL DEFAULT 0 CHECK(bytes_copied>=0),"
+    "attempt_count INTEGER NOT NULL DEFAULT 0 CHECK(attempt_count>=0),"
+    "max_attempts INTEGER NOT NULL DEFAULT 5 CHECK(max_attempts BETWEEN 1 AND 20),"
+    "next_attempt_at INTEGER NOT NULL DEFAULT 0,last_error TEXT NOT NULL DEFAULT '',"
+    "revision INTEGER NOT NULL DEFAULT 1,created_at INTEGER NOT NULL DEFAULT(strftime('%s','now')),"
+    "updated_at INTEGER NOT NULL DEFAULT(strftime('%s','now')),started_at INTEGER,completed_at INTEGER,"
+    "CHECK(source_target_uuid<>destination_target_uuid));"
+    "CREATE UNIQUE INDEX idx_storage_migration_one_active_recording ON storage_migration_jobs(recording_id) WHERE state NOT IN('completed','failed','cancelled');"
+    "CREATE INDEX idx_storage_migration_due ON storage_migration_jobs(state,next_attempt_at,created_at);"
+    "CREATE INDEX idx_storage_migration_destination ON storage_migration_jobs(destination_target_uuid,state);";
+
+static const char migration_0068_down[] =
+    "DROP INDEX IF EXISTS idx_storage_migration_destination;"
+    "DROP INDEX IF EXISTS idx_storage_migration_due;"
+    "DROP INDEX IF EXISTS idx_storage_migration_one_active_recording;"
+    "DROP TABLE IF EXISTS storage_migration_jobs;";
+
+static const char migration_0069_up[] =
+    "ALTER TABLE streams ADD COLUMN playback_transport TEXT NOT NULL DEFAULT 'auto' "
+    "CHECK(playback_transport IN('auto','webrtc_only','mse_only','hls_only','webrtc_then_mse','mse_then_hls'));";
+
+static const char migration_0069_down[] =
+    "-- SQLite cannot drop a column while retaining compatibility with older builds.";
+
+static const char migration_0070_up[] =
+    "CREATE TABLE onvif_discovery_inventory("
+    "uuid TEXT PRIMARY KEY,endpoint TEXT NOT NULL,device_service TEXT NOT NULL,"
+    "media_service TEXT NOT NULL DEFAULT '',ptz_service TEXT NOT NULL DEFAULT '',"
+    "imaging_service TEXT NOT NULL DEFAULT '',manufacturer TEXT NOT NULL DEFAULT '',"
+    "model TEXT NOT NULL DEFAULT '',firmware_version TEXT NOT NULL DEFAULT '',"
+    "serial_number TEXT NOT NULL DEFAULT '',hardware_id TEXT NOT NULL DEFAULT '',"
+    "ip_address TEXT NOT NULL DEFAULT '',mac_address TEXT NOT NULL DEFAULT '' COLLATE NOCASE,"
+    "first_seen_at INTEGER NOT NULL,last_seen_at INTEGER NOT NULL,"
+    "last_scan_network TEXT NOT NULL DEFAULT 'auto',"
+    "online INTEGER NOT NULL DEFAULT 1 CHECK(online IN(0,1)),"
+    "claim_state TEXT NOT NULL DEFAULT 'unclaimed' CHECK(claim_state IN('unclaimed','claimed','ignored')),"
+    "claimed_camera_uuid TEXT REFERENCES streams(camera_uuid) ON DELETE SET NULL,"
+    "duplicate_suspected INTEGER NOT NULL DEFAULT 0 CHECK(duplicate_suspected IN(0,1)),"
+    "revision INTEGER NOT NULL DEFAULT 1 CHECK(revision>=1),"
+    "updated_at INTEGER NOT NULL DEFAULT(strftime('%s','now')));"
+    "CREATE INDEX idx_onvif_inventory_seen ON onvif_discovery_inventory(last_seen_at DESC,uuid);"
+    "CREATE INDEX idx_onvif_inventory_serial ON onvif_discovery_inventory(serial_number) WHERE serial_number!='';"
+    "CREATE INDEX idx_onvif_inventory_mac ON onvif_discovery_inventory(mac_address) WHERE mac_address!='';"
+    "CREATE INDEX idx_onvif_inventory_endpoint ON onvif_discovery_inventory(endpoint);"
+    "CREATE INDEX idx_onvif_inventory_claim ON onvif_discovery_inventory(claim_state,online,last_seen_at DESC);"
+    "CREATE TABLE onvif_discovery_addresses("
+    "inventory_uuid TEXT NOT NULL REFERENCES onvif_discovery_inventory(uuid) ON DELETE CASCADE,"
+    "address_type TEXT NOT NULL CHECK(address_type IN('endpoint','service','ip')),"
+    "address TEXT NOT NULL,first_seen_at INTEGER NOT NULL,last_seen_at INTEGER NOT NULL,"
+    "PRIMARY KEY(inventory_uuid,address_type,address));"
+    "CREATE INDEX idx_onvif_discovery_addresses_address ON onvif_discovery_addresses(address,inventory_uuid);"
+    "CREATE TRIGGER trg_onvif_inventory_unclaim_deleted_stream BEFORE DELETE ON streams FOR EACH ROW BEGIN "
+    "UPDATE onvif_discovery_inventory SET claim_state='unclaimed',claimed_camera_uuid=NULL,"
+    "revision=revision+1,updated_at=strftime('%s','now') WHERE claimed_camera_uuid=OLD.camera_uuid;END;";
+
+static const char migration_0070_down[] =
+    "DROP TRIGGER IF EXISTS trg_onvif_inventory_unclaim_deleted_stream;"
+    "DROP INDEX IF EXISTS idx_onvif_discovery_addresses_address;"
+    "DROP TABLE IF EXISTS onvif_discovery_addresses;"
+    "DROP INDEX IF EXISTS idx_onvif_inventory_claim;"
+    "DROP INDEX IF EXISTS idx_onvif_inventory_endpoint;"
+    "DROP INDEX IF EXISTS idx_onvif_inventory_mac;"
+    "DROP INDEX IF EXISTS idx_onvif_inventory_serial;"
+    "DROP INDEX IF EXISTS idx_onvif_inventory_seen;"
+    "DROP TABLE IF EXISTS onvif_discovery_inventory;";
+
 static const migration_t embedded_migrations_data[] = {
     {
         .version = "0001",
@@ -1001,8 +1811,176 @@ static const migration_t embedded_migrations_data[] = {
         .sql_down = migration_0046_down,
         .is_embedded = true
     },
+    {
+        .version = "0047",
+        .description = "optimize_recording_history",
+        .sql_up = migration_0047_up,
+        .sql_down = migration_0047_down,
+        .is_embedded = true
+    },
+    {
+        .version = "0048",
+        .description = "add_camera_uuid",
+        .sql_up = migration_0048_up,
+        .sql_down = migration_0048_down,
+        .is_embedded = true
+    },
+    {
+        .version = "0049",
+        .description = "add_camera_locations",
+        .sql_up = migration_0049_up,
+        .sql_down = migration_0049_down,
+        .is_embedded = true
+    },
+    {
+        .version = "0050",
+        .description = "add_normalized_camera_tags",
+        .sql_up = migration_0050_up,
+        .sql_down = migration_0050_down,
+        .is_embedded = true
+    },
+    {
+        .version = "0051",
+        .description = "add_camera_collections",
+        .sql_up = migration_0051_up,
+        .sql_down = migration_0051_down,
+        .is_embedded = true
+    },
+    {
+        .version = "0052",
+        .description = "add_authorization_policy",
+        .sql_up = migration_0052_up,
+        .sql_down = migration_0052_down,
+        .is_embedded = true
+    },
+    {
+        .version = "0053",
+        .description = "add_collection_authorization_scope",
+        .sql_up = migration_0053_up,
+        .sql_down = migration_0053_down,
+        .is_embedded = true
+    },
+    {
+        .version = "0054",
+        .description = "add_scoped_api_tokens",
+        .sql_up = migration_0054_up,
+        .sql_down = migration_0054_down,
+        .is_embedded = true
+    },
+    {
+        .version = "0055",
+        .description = "add_audit_events",
+        .sql_up = migration_0055_up,
+        .sql_down = migration_0055_down,
+        .is_embedded = true
+    },
+    {
+        .version = "0056",
+        .description = "harden_authorization_metadata",
+        .sql_up = migration_0056_up,
+        .sql_down = migration_0056_down,
+        .is_embedded = true
+    },
+    {
+        .version = "0057",
+        .description = "add_event_outbox",
+        .sql_up = migration_0057_up,
+        .sql_down = migration_0057_down,
+        .is_embedded = true
+    },
+    {
+        .version = "0058",
+        .description = "add_event_routes",
+        .sql_up = migration_0058_up,
+        .sql_down = migration_0058_down,
+        .is_embedded = true
+    },
+    {
+        .version = "0059",
+        .description = "add_event_route_suppression",
+        .sql_up = migration_0059_up,
+        .sql_down = migration_0059_down,
+        .is_embedded = true
+    },
+    {
+        .version = "0060",
+        .description = "add_event_destinations",
+        .sql_up = migration_0060_up,
+        .sql_down = migration_0060_down,
+        .is_embedded = true
+    },
+    {
+        .version = "0061",
+        .description = "add_capture_camera_identity",
+        .sql_up = migration_0061_up,
+        .sql_down = migration_0061_down,
+        .is_embedded = true
+    },
+    {
+        .version = "0062",
+        .description = "add_investigation_search_indexes",
+        .sql_up = migration_0062_up,
+        .sql_down = migration_0062_down,
+        .is_embedded = true
+    },
+    {
+        .version = "0063",
+        .description = "add_must_change_password",
+        .sql_up = migration_0063_up,
+        .sql_down = migration_0063_down,
+        .is_embedded = true
+    },
+    {
+        .version = "0064",
+        .description = "add_investigation_bookmarks",
+        .sql_up = migration_0064_up,
+        .sql_down = migration_0064_down,
+        .is_embedded = true
+    },
+    {
+        .version = "0065",
+        .description = "add_storage_targets",
+        .sql_up = migration_0065_up,
+        .sql_down = migration_0065_down,
+        .is_embedded = true
+    },
+    {
+        .version = "0066",
+        .description = "add_storage_placement_policies",
+        .sql_up = migration_0066_up,
+        .sql_down = migration_0066_down,
+        .is_embedded = true
+    },
+    {
+        .version = "0067",
+        .description = "add_fleet_saved_views",
+        .sql_up = migration_0067_up,
+        .sql_down = migration_0067_down,
+        .is_embedded = true
+    },
+    {
+        .version = "0068",
+        .description = "add_storage_migration_jobs",
+        .sql_up = migration_0068_up,
+        .sql_down = migration_0068_down,
+        .is_embedded = true
+    },
+    {
+        .version = "0069",
+        .description = "add_stream_playback_transport",
+        .sql_up = migration_0069_up,
+        .sql_down = migration_0069_down,
+        .is_embedded = true
+    },
+    {
+        .version = "0070",
+        .description = "add_onvif_discovery_inventory",
+        .sql_up = migration_0070_up,
+        .sql_down = migration_0070_down,
+        .is_embedded = true
+    },
 };
 
-#define EMBEDDED_MIGRATIONS_COUNT 46
+#define EMBEDDED_MIGRATIONS_COUNT 70
 
 #endif /* DB_EMBEDDED_MIGRATIONS_H */

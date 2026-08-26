@@ -42,7 +42,7 @@
 #include "web/request_response.h"
 #include "web/httpd_utils.h"
 
-#include "core/mqtt_client.h"
+#include "core/event_producers.h"
 #include "database/db_auth.h"
 #include "database/db_detections.h"
 #include "database/db_recording_tags.h"
@@ -110,7 +110,7 @@ static uint64_t pulse_gen_increment(const char *stream_name) {
         g_pulse_gen[i].generation = 1;
         return 1;
     }
-    /* Table full (shouldn't happen with MAX_STREAMS=256 streams).
+    /* Table full (shouldn't happen with at most MAX_STREAMS streams).
      * Return 0 — the reserved "generation tracking disabled" sentinel.
      * The pulse worker treats generation==0 as "always fire the stop",
      * which is safer than leaving the stream permanently in motion-active. */
@@ -317,26 +317,6 @@ int motion_trigger_parse_tags(const cJSON *body, char tags[][MAX_TAG_LENGTH],
 void handle_post_motion_trigger(const http_request_t *req, http_response_t *res) {
     log_info("POST /api/motion/trigger");
 
-    /* ---- Auth ------------------------------------------------------------ */
-    /* The setup-wizard endpoints are deliberately unauthenticated; everything
-     * else in this codebase either respects g_config.web_auth_enabled or is
-     * admin-only. External motion trigger is a write operation from
-     * (potentially) the public network, so require auth unconditionally when
-     * it is globally enabled, and reject read-only viewers. */
-    user_t user;
-    memset(&user, 0, sizeof(user));
-    if (g_config.web_auth_enabled) {
-        if (!httpd_get_authenticated_user(req, &user)) {
-            http_response_set_json_error(res, 401, "Unauthorized");
-            return;
-        }
-        if (user.role == USER_ROLE_VIEWER) {
-            http_response_set_json_error(res, 403,
-                "Viewer role cannot trigger motion events");
-            return;
-        }
-    }
-
     /* ---- Body parsing ---------------------------------------------------- */
     cJSON *body = httpd_parse_json_body(req);
     if (!body) {
@@ -422,6 +402,9 @@ void handle_post_motion_trigger(const http_request_t *req, http_response_t *res)
     safe_strcpy(stream_name, j_stream->valuestring, sizeof(stream_name), 0);
     cJSON_Delete(body);
 
+    if (!httpd_authorize_stream_action(req, res, AUTHZ_CAMERA_CONFIGURE,
+                                       stream_name)) return;
+
     /* ---- Validate target stream ----------------------------------------- */
     stream_handle_t handle = get_stream_by_name(stream_name);
     if (!handle) {
@@ -505,7 +488,13 @@ void handle_post_motion_trigger(const http_request_t *req, http_response_t *res)
                 log_warn("Failed to store external detections for stream '%s'", stream_name);
             }
             if (caller_supplied_objects) {
-                mqtt_publish_detection(stream_name, &detections, now);
+                char event_error[256] = {0};
+                if (event_producer_publish_detection(
+                        cfg.camera_uuid, stream_name, &detections, now,
+                        event_error, sizeof(event_error)) != 0) {
+                    log_debug("Detection event enqueue failed for stream '%s': %s",
+                              stream_name, event_error);
+                }
             }
         }
     } else {

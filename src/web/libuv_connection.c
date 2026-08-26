@@ -18,6 +18,8 @@
 #include "web/libuv_connection.h"
 #include "web/go2rtc_proxy_thread.h"
 #include "web/api_handlers_health.h"
+#include "web/httpd_utils.h"
+#include "web/audit_log.h"
 #define LOG_COMPONENT "HTTP"
 #include "core/logger.h"
 #include "utils/strings.h"
@@ -362,6 +364,15 @@ static int on_header_value(llhttp_t *parser, const char *at, size_t length) {
                 sizeof(conn->request.user_agent), 0);
     } else if (strcasecmp(conn->current_header_field, "Connection") == 0) {
         conn->keep_alive = (strcasecmp(conn->request.headers[idx].value, "close") != 0);
+    } else if (strcasecmp(conn->current_header_field, "X-Request-ID") == 0) {
+        /* The audit trail correlates on this value, so only adopt a caller's
+         * ID when it reached us through a declared trusted proxy. Anything
+         * else keeps the server-generated ID and cannot forge or collide with
+         * another principal's requests. */
+        if (httpd_peer_is_trusted_proxy(&conn->request)) {
+            (void)http_request_set_request_id(
+                &conn->request, conn->request.headers[idx].value);
+        }
     }
 
     return 0;
@@ -481,6 +492,7 @@ typedef struct {
     libuv_connection_t *conn;           // Connection being handled
     request_handler_t handler;          // Handler function to call
     write_complete_action_t action;     // Post-response action (keep-alive/close)
+    audit_sensitive_operation_context_t audit_context;
 } handler_work_t;
 
 /**
@@ -491,7 +503,12 @@ typedef struct {
  */
 static void handler_work_cb(uv_work_t *req) {
     handler_work_t *hw = (handler_work_t *)req->data;
+    audit_log_sensitive_operation_begin(&hw->conn->request,
+                                        &hw->audit_context);
     hw->handler(&hw->conn->request, &hw->conn->response);
+    audit_log_sensitive_operation_end(&hw->conn->request,
+                                      &hw->conn->response,
+                                      &hw->audit_context);
 }
 
 /**
@@ -508,6 +525,11 @@ static void handler_after_work_cb(uv_work_t *req, int status) {
     safe_free(hw);
 
     conn->handler_on_worker = false;
+
+    if (conn->request.request_id[0] != '\0') {
+        http_response_add_header(&conn->response, "X-Request-ID",
+                                 conn->request.request_id);
+    }
 
     // If cancelled (e.g., server shutting down), close connection
     if (status == UV_ECANCELED) {
@@ -640,8 +662,9 @@ static int on_message_complete(llhttp_t *parser) {
     // Set user_data to point to connection (needed for file serving and proxy)
     conn->request.user_data = conn;
 
-    // Go2rtc proxy paths use dedicated detached threads to avoid starving the
-    // shared libuv thread pool with 30-second blocking curl calls.
+    // Go2rtc proxy paths use dedicated detached threads so both authorization
+    // (which may access SQLite) and the blocking curl call stay off the event
+    // loop and the shared libuv worker pool.
     if (go2rtc_proxy_path_matches(conn->request.path)) {
         uv_read_stop((uv_stream_t *)&conn->handle);
         if (go2rtc_proxy_thread_submit(conn, action) == 0) {
@@ -732,4 +755,3 @@ static int on_message_complete(llhttp_t *parser) {
 }
 
 #endif /* HTTP_BACKEND_LIBUV */
-

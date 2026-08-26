@@ -1,6 +1,7 @@
 # PRD — Recordings & Timeline UX
 
-**Status**: Draft
+**Status**: Implementation complete — P0–P3 are present. Manual acceptance,
+large/busy-day behavior, and beta outcome metrics remain to reconcile
 **Created**: 2026-04-22
 **Owner**: TBD
 **Driving signal**: [#331 (CDx4f3kCAf3Y)](https://github.com/opensensor/lightNVR/issues/331), the Recordings/Timeline items from [#399 (AndyIsHereBoi)](https://github.com/opensensor/lightNVR/issues/399).
@@ -89,10 +90,26 @@ Every list-mutating action goes through the `<AsyncButton>` / `useAsyncAction` p
 
 | Phase | Scope | Estimate |
 |---|---|---|
-| P0 — Scrub continuity | TimelineCursor + TimelinePlayer; pure-frontend | 2 days |
-| P1 — Set-diff sync | TimelinePage data layer; closes #331 | 1–2 days |
-| P2 — Refresh + async feedback | Wire the AsyncButton primitive; assumes PRD 01 P0 has shipped | 1 day |
-| P3 — Mobile gestures | Pinch/fling/snap on the ruler | 3–4 days |
+| P0 — Scrub continuity | Implemented: playback-state preservation, commit-on-release seeking, and cursor-attached thumbnail preview | 2 days |
+| P1 — Set-diff sync | Implemented: 10 s authoritative polling, id/range identity fallback, and 100 ms removal fade | 1–2 days |
+| P2 — Refresh + async feedback | Implemented: AsyncButton refresh/filter wiring, batch progress surfaces, and mobile list pull-to-refresh | 1 day |
+| P3 — Mobile gestures | Implemented: pinch/fling/pan/snap on the ruler | 3–4 days |
+
+Implementation note (2026-08-24): P3 owns touch input explicitly rather than
+depending on synthesized mouse events. It includes anchored pinch zoom,
+scale-aware ruler ticks down to the one-minute view, two-finger pan,
+reduced-motion-aware one-finger inertial fling, a 36×36 px
+cursor hit target, and deterministic 500 ms recording-edge snapping. Desktop
+wheel, mouse, and keyboard paths remain independent.
+
+Implementation note (2026-08-25): reconciliation closed three specification
+gaps that were still open despite the earlier phase labels. Cursor and ruler
+drags now show the nearest of the recording's available thumbnail frames
+without seeking the player on every move. Timeline polling now meets the ≤10 s acceptance
+window, uses the documented range fallback when an id is absent, and fades
+removed bars before applying the authoritative result. Recordings list
+pull-to-refresh reuses the same resisted touch primitive as Live View while
+preserving the active query filters.
 
 ## 6. Acceptance criteria
 
@@ -106,7 +123,7 @@ Every list-mutating action goes through the `<AsyncButton>` / `useAsyncAction` p
 | Risk | Mitigation |
 |---|---|
 | Diffing runs every poll on a busy day → CPU spike | Cap diff candidates to the visible time window; index by id |
-| Pinch-zoom collides with browser pinch-zoom on iOS | Use `touch-action: none` on the ruler track; reserve `pinch-zoom` only when both fingers land on the track |
+| Pinch-zoom collides with browser pinch-zoom on iOS | Use `touch-action: pan-y` on the ruler track so vertical page scrolling remains native while horizontal and two-finger timeline gestures stay owned by the application |
 | Scrub-keep-playing causes excessive seeks while dragging | Throttle network seeks to commit only on pointerup; show local preview-frame during drag |
 
 ## 8. Related issues

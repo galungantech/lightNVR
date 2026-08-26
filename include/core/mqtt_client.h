@@ -4,6 +4,7 @@
 #include <stdbool.h>
 #include <time.h>
 #include "core/config.h"
+#include "core/event_envelope.h"
 #include "video/detection_result.h"
 
 #ifdef ENABLE_MQTT
@@ -46,6 +47,12 @@ bool mqtt_is_connected(void);
 int mqtt_publish_detection(const char *stream_name, const detection_result_t *result, time_t timestamp);
 
 /**
+ * Publish a normalized versioned event envelope.
+ * Topic: {topic_prefix}/v1/events/{type}/{subject-id}
+ */
+int mqtt_publish_event(const event_envelope_t *event);
+
+/**
  * Publish a raw message to a custom topic
  *
  * @param topic Full topic path (topic_prefix is NOT automatically prepended)
@@ -54,6 +61,15 @@ int mqtt_publish_detection(const char *stream_name, const detection_result_t *re
  * @return 0 on success, -1 on failure
  */
 int mqtt_publish_raw(const char *topic, const char *payload, bool retain);
+
+/**
+ * Publish and wait for libmosquitto's QoS-specific completion callback.
+ * QoS 1/2 therefore waits for PUBACK/PUBCOMP; QoS 0 waits until the message is
+ * handed to the local operating system. Intended for the durable outbox worker,
+ * never for capture or event-bus threads.
+ */
+int mqtt_publish_raw_confirmed(const char *topic, const char *payload,
+                               bool retain, int timeout_ms);
 
 /**
  * Publish binary data to a topic (e.g., JPEG snapshots)
@@ -129,8 +145,16 @@ static inline bool mqtt_is_connected(void) { return false; }
 static inline int mqtt_publish_detection(const char *stream_name, const detection_result_t *result, time_t timestamp) {
     (void)stream_name; (void)result; (void)timestamp; return 0;
 }
+static inline int mqtt_publish_event(const event_envelope_t *event) {
+    (void)event; return 0;
+}
 static inline int mqtt_publish_raw(const char *topic, const char *payload, bool retain) {
     (void)topic; (void)payload; (void)retain; return 0;
+}
+static inline int mqtt_publish_raw_confirmed(const char *topic,
+                                             const char *payload,
+                                             bool retain, int timeout_ms) {
+    (void)topic; (void)payload; (void)retain; (void)timeout_ms; return 0;
 }
 static inline int mqtt_publish_binary(const char *topic, const void *data, size_t len, bool retain) {
     (void)topic; (void)data; (void)len; (void)retain; return 0;
@@ -148,4 +172,3 @@ static inline int mqtt_reinit(const config_t *config) { (void)config; return 0; 
 #endif /* ENABLE_MQTT */
 
 #endif /* LIGHTNVR_MQTT_CLIENT_H */
-

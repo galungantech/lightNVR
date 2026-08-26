@@ -15,6 +15,7 @@ import { showStatusMessage } from '../ToastContainer.jsx';
 import { LoadingIndicator } from '../LoadingIndicator.jsx';
 import { useQuery } from '../../../query-client.js';
 import { useI18n } from '../../../i18n.js';
+import { isReduceMotionActive } from '../../../utils/reduceMotion.js';
 import {
   currentDateInputValue,
   formatDateForInput,
@@ -23,6 +24,8 @@ import {
   nowMilliseconds
 } from '../../../utils/date-utils.js';
 import {
+  advanceTimelineFling,
+  calculateTimelineFlingVelocity,
   countSegmentsForDate,
   findFirstVisibleSegmentIndex,
   findContainingSegmentIndex,
@@ -34,6 +37,7 @@ import {
   getTimelineDayLengthHours,
   localClockTimeToTimestamp,
   panTimelineRange,
+  reconcileTimelineSegments,
   resolveActiveSegmentIndex,
   timelineOffsetToTimestamp,
   timestampToTimelineOffset,
@@ -245,9 +249,12 @@ export function TimelinePage() {
   const [keyboardNavigationMode, setKeyboardNavigationMode] = useState(
     urlParams.nav === 'fine' ? 'fine' : 'broad'
   );
+  const [timelineContainer, setTimelineContainer] = useState(null);
 
   // Refs
-  const timelineContainerRef = useRef(null);
+  const timelineContainerRef = useCallback((node) => {
+    setTimelineContainer(current => current === node ? current : node);
+  }, []);
   const initialLoadRef = useRef(false);
   const flushIntervalRef = useRef(null);
   const initialTimeRef = useRef(urlParams.time);  // Store initial time param for auto-seek
@@ -475,7 +482,7 @@ export function TimelinePage() {
   }, [jumpToAdjacentSegment, keyboardNavigationMode, seekCurrentVideo, videoElementRef]);
 
   useEffect(() => {
-    const container = timelineContainerRef.current;
+    const container = timelineContainer;
     if (!container) {
       return undefined;
     }
@@ -525,22 +532,83 @@ export function TimelinePage() {
     return () => {
       container.removeEventListener('wheel', handleWheel);
     };
-  }, [segments.length]);
+  }, [timelineContainer]);
 
-  // Touch pinch-to-zoom and two-finger pan for mobile/tablet (issue #453).
-  // Single-finger touches are left alone so they still drive segment seeking
-  // (the browser synthesises mouse events consumed by TimelineSegments). Only
-  // two-finger gestures are intercepted, which also stops the browser from
-  // pinch-zooming the whole page over the timeline.
+  // Mobile timeline gestures: pinch zoom, two-finger pan, and a one-finger
+  // inertial horizontal fling. A tap is left untouched so TimelineSegments can
+  // still seek through its existing compatibility-mouse path. Once a touch has
+  // moved horizontally beyond the intent threshold, we own it and suppress the
+  // synthetic click so a fling never moves the playback cursor as a side effect.
   useEffect(() => {
-    const container = timelineContainerRef.current;
+    const container = timelineContainer;
     if (!container) {
       return undefined;
     }
 
+    const PAN_INTENT_THRESHOLD_PX = 6;
+    const MIN_FLING_VELOCITY_PX_PER_MS = 0.04;
+    const STOP_FLING_VELOCITY_PX_PER_MS = 0.015;
+
     let pinchActive = false;
     let lastDistance = 0;
     let lastMidX = 0;
+    let singlePan = null;
+    let ignoreSingleTouchUntilRelease = false;
+    let flingFrame = null;
+
+    const cancelFling = () => {
+      if (flingFrame !== null) {
+        window.cancelAnimationFrame(flingFrame);
+        flingFrame = null;
+      }
+    };
+
+    const startFling = (velocityHoursPerMillisecond, velocityPixelsPerMillisecond) => {
+      if (
+        isReduceMotionActive() ||
+        Math.abs(velocityPixelsPerMillisecond) < MIN_FLING_VELOCITY_PX_PER_MS
+      ) {
+        return;
+      }
+
+      let velocity = velocityHoursPerMillisecond;
+      let previousFrameTime = performance.now();
+
+      const animate = (frameTime) => {
+        const elapsed = Math.max(frameTime - previousFrameTime, 0);
+        previousFrameTime = frameTime;
+
+        const startHour = timelineState.timelineStartHour ?? 0;
+        const endHour = timelineState.timelineEndHour ?? getTimelineDayLengthHours(timelineState.selectedDate);
+        const dayLength = getTimelineDayLengthHours(timelineState.selectedDate);
+        const next = advanceTimelineFling(
+          startHour,
+          endHour,
+          velocity,
+          elapsed,
+          dayLength
+        );
+        velocity = next.velocityHoursPerMillisecond;
+
+        timelineState.setState({
+          timelineStartHour: next.startHour,
+          timelineEndHour: next.endHour
+        });
+
+        const rect = container.getBoundingClientRect();
+        const range = next.endHour - next.startHour;
+        const currentPixelVelocity = rect.width > 0 && range > 0
+          ? Math.abs((velocity * rect.width) / range)
+          : 0;
+        if (velocity !== 0 && currentPixelVelocity >= STOP_FLING_VELOCITY_PX_PER_MS) {
+          flingFrame = window.requestAnimationFrame(animate);
+        } else {
+          flingFrame = null;
+        }
+      };
+
+      flingFrame = window.requestAnimationFrame(animate);
+    };
 
     const distanceAndMid = (touches) => {
       const dx = touches[0].clientX - touches[1].clientX;
@@ -552,19 +620,107 @@ export function TimelinePage() {
     };
 
     const handleTouchStart = (event) => {
+      cancelFling();
+
       if (event.touches.length === 2) {
         const { distance, midX } = distanceAndMid(event.touches);
         pinchActive = true;
+        singlePan = null;
+        ignoreSingleTouchUntilRelease = true;
         lastDistance = distance;
         lastMidX = midX;
         event.preventDefault();
+        return;
+      }
+
+      const target = event.target instanceof Element ? event.target : null;
+      if (
+        event.touches.length === 1 &&
+        !ignoreSingleTouchUntilRelease &&
+        !target?.closest('.timeline-cursor')
+      ) {
+        const touch = event.touches[0];
+        const now = performance.now();
+        singlePan = {
+          identifier: touch.identifier,
+          startX: touch.clientX,
+          startY: touch.clientY,
+          lastX: touch.clientX,
+          samples: [{ position: touch.clientX, time: now }],
+          moved: false
+        };
       }
     };
 
     const handleTouchMove = (event) => {
-      if (!pinchActive || event.touches.length !== 2) {
+      if (pinchActive && event.touches.length === 2) {
+        event.preventDefault();
+
+        const startHour = timelineState.timelineStartHour ?? 0;
+        const endHour = timelineState.timelineEndHour ?? getTimelineDayLengthHours(timelineState.selectedDate);
+        const currentRange = endHour - startHour;
+        const rect = container.getBoundingClientRect();
+        if (currentRange <= 0 || rect.width <= 0) {
+          return;
+        }
+
+        const { distance, midX } = distanceAndMid(event.touches);
+        const dayLength = getTimelineDayLengthHours(timelineState.selectedDate);
+
+        // Zoom: fingers apart (distance grows) -> zoom in (range shrinks).
+        let nextStart = startHour;
+        let nextEnd = endHour;
+        if (lastDistance > 0 && Math.abs(distance - lastDistance) > 1) {
+          const zoomFactor = lastDistance / distance;
+          const pointerRatio = Math.min(Math.max((midX - rect.left) / rect.width, 0), 1);
+          const anchorHour = startHour + (pointerRatio * currentRange);
+          const zoomed = zoomTimelineRange(nextStart, nextEnd, zoomFactor, anchorHour, dayLength);
+          nextStart = zoomed.startHour;
+          nextEnd = zoomed.endHour;
+        }
+
+        // Pan: follow the midpoint's horizontal movement between fingers.
+        const midDelta = midX - lastMidX;
+        if (Math.abs(midDelta) > 0.5) {
+          const range = nextEnd - nextStart;
+          const deltaHours = -(midDelta / rect.width) * range;
+          const panned = panTimelineRange(nextStart, nextEnd, deltaHours, dayLength);
+          nextStart = panned.startHour;
+          nextEnd = panned.endHour;
+        }
+
+        lastDistance = distance;
+        lastMidX = midX;
+        timelineState.setState({
+          timelineStartHour: nextStart,
+          timelineEndHour: nextEnd
+        });
         return;
       }
+
+      if (!singlePan || event.touches.length !== 1) {
+        return;
+      }
+
+      const touch = Array.from(event.touches).find(
+        candidate => candidate.identifier === singlePan.identifier
+      );
+      if (!touch) {
+        return;
+      }
+
+      const totalDeltaX = touch.clientX - singlePan.startX;
+      if (!singlePan.moved) {
+        const totalDeltaY = touch.clientY - singlePan.startY;
+        if (
+          Math.abs(totalDeltaX) < PAN_INTENT_THRESHOLD_PX ||
+          Math.abs(totalDeltaX) <= Math.abs(totalDeltaY)
+        ) {
+          return;
+        }
+      }
+
+      singlePan.moved = true;
       event.preventDefault();
 
       const startHour = timelineState.timelineStartHour ?? 0;
@@ -575,56 +731,88 @@ export function TimelinePage() {
         return;
       }
 
-      const { distance, midX } = distanceAndMid(event.touches);
+      const now = performance.now();
+      const deltaX = touch.clientX - singlePan.lastX;
+      singlePan.samples.push({ position: touch.clientX, time: now });
+      // Retain one point before the velocity window so the helper can
+      // interpolate its exact boundary without accumulating a long gesture.
+      while (singlePan.samples.length > 2 && singlePan.samples[1].time < now - 120) {
+        singlePan.samples.shift();
+      }
+
       const dayLength = getTimelineDayLengthHours(timelineState.selectedDate);
-
-      // Zoom: fingers apart (distance grows) → zoom in (range shrinks).
-      let nextStart = startHour;
-      let nextEnd = endHour;
-      if (lastDistance > 0 && Math.abs(distance - lastDistance) > 1) {
-        const zoomFactor = lastDistance / distance;
-        const pointerRatio = Math.min(Math.max((midX - rect.left) / rect.width, 0), 1);
-        const anchorHour = startHour + (pointerRatio * currentRange);
-        const zoomed = zoomTimelineRange(nextStart, nextEnd, zoomFactor, anchorHour, dayLength);
-        nextStart = zoomed.startHour;
-        nextEnd = zoomed.endHour;
-      }
-
-      // Pan: follow the midpoint's horizontal movement between fingers.
-      const midDelta = midX - lastMidX;
-      if (Math.abs(midDelta) > 0.5) {
-        const range = nextEnd - nextStart;
-        const deltaHours = -(midDelta / rect.width) * range;
-        const panned = panTimelineRange(nextStart, nextEnd, deltaHours, dayLength);
-        nextStart = panned.startHour;
-        nextEnd = panned.endHour;
-      }
-
-      lastDistance = distance;
-      lastMidX = midX;
+      const deltaHours = -(deltaX / rect.width) * currentRange;
+      const next = panTimelineRange(startHour, endHour, deltaHours, dayLength);
+      singlePan.lastX = touch.clientX;
       timelineState.setState({
-        timelineStartHour: nextStart,
-        timelineEndHour: nextEnd
+        timelineStartHour: next.startHour,
+        timelineEndHour: next.endHour
       });
     };
 
-    const endPinch = (event) => {
-      if (event.touches.length < 2) {
+    const handleTouchEnd = (event) => {
+      if (pinchActive) {
         pinchActive = false;
+        singlePan = null;
+        if (event.touches.length === 0) {
+          ignoreSingleTouchUntilRelease = false;
+        }
+        return;
       }
+
+      if (event.touches.length === 0) {
+        ignoreSingleTouchUntilRelease = false;
+      }
+
+      if (!singlePan) {
+        return;
+      }
+
+      const endedTouch = Array.from(event.changedTouches).find(
+        touch => touch.identifier === singlePan.identifier
+      );
+      if (!endedTouch) {
+        return;
+      }
+
+      if (singlePan.moved) {
+        event.preventDefault();
+        const now = performance.now();
+        const velocityPixelsPerMillisecond = calculateTimelineFlingVelocity(
+          singlePan.samples,
+          now,
+          endedTouch.clientX
+        );
+        const rect = container.getBoundingClientRect();
+        const range = (timelineState.timelineEndHour ?? 24) -
+          (timelineState.timelineStartHour ?? 0);
+        const velocityHoursPerMillisecond = rect.width > 0
+          ? -(velocityPixelsPerMillisecond / rect.width) * range
+          : 0;
+        startFling(velocityHoursPerMillisecond, velocityPixelsPerMillisecond);
+      }
+      singlePan = null;
+    };
+
+    const handleTouchCancel = () => {
+      pinchActive = false;
+      singlePan = null;
+      ignoreSingleTouchUntilRelease = false;
+      cancelFling();
     };
 
     container.addEventListener('touchstart', handleTouchStart, { passive: false });
     container.addEventListener('touchmove', handleTouchMove, { passive: false });
-    container.addEventListener('touchend', endPinch);
-    container.addEventListener('touchcancel', endPinch);
+    container.addEventListener('touchend', handleTouchEnd, { passive: false });
+    container.addEventListener('touchcancel', handleTouchCancel);
     return () => {
+      cancelFling();
       container.removeEventListener('touchstart', handleTouchStart);
       container.removeEventListener('touchmove', handleTouchMove);
-      container.removeEventListener('touchend', endPinch);
-      container.removeEventListener('touchcancel', endPinch);
+      container.removeEventListener('touchend', handleTouchEnd);
+      container.removeEventListener('touchcancel', handleTouchCancel);
     };
-  }, [segments.length]);
+  }, [timelineContainer]);
 
   const idsAvailableDates = useMemo(() => (
     idsMode ? getAvailableDatesForSegments(idsTimelineSegments) : []
@@ -1038,7 +1226,9 @@ export function TimelinePage() {
   useEffect(() => {
     if (idsMode || !selectedStream || !timelineUrl) return;
 
-    const POLL_INTERVAL_MS = 30000;
+    const POLL_INTERVAL_MS = 10000;
+    let fadeTimeoutId = null;
+    let cancelled = false;
 
     const pollForNewRecordings = async () => {
       try {
@@ -1048,18 +1238,35 @@ export function TimelinePage() {
         const polledSegments = data.segments || [];
         setDetectionIntervals(data.detection_intervals || []);
 
-        const currentSegs = timelineState.timelineSegments || [];
-        const currentIds = new Set(currentSegs.map(s => String(s.id)));
-        const polledIds = new Set(polledSegments.map(s => String(s.id)));
-        const addedSegs = polledSegments.filter(s => !currentIds.has(String(s.id)));
-        const removedSegs = currentSegs.filter(s => !polledIds.has(String(s.id)));
+        const currentSegs = (timelineState.timelineSegments || [])
+          .filter((segment) => !segment._removing);
+        const {
+          added: addedSegs,
+          removed: removedSegs,
+          authoritative,
+        } = reconcileTimelineSegments(currentSegs, polledSegments);
 
         if (addedSegs.length === 0 && removedSegs.length === 0) return;
 
         // Use polled segments as the authoritative list
-        const updated = [...polledSegments].sort((a, b) => a.start_timestamp - b.start_timestamp);
-        setSegments(updated);
-        timelineState.setState({ timelineSegments: updated });
+        const updated = authoritative.sort((a, b) => a.start_timestamp - b.start_timestamp);
+        if (removedSegs.length > 0) {
+          const fading = [
+            ...updated,
+            ...removedSegs.map((segment) => ({ ...segment, _removing: true })),
+          ].sort((a, b) => a.start_timestamp - b.start_timestamp);
+          setSegments(fading);
+          timelineState.setState({ timelineSegments: fading });
+          clearTimeout(fadeTimeoutId);
+          fadeTimeoutId = setTimeout(() => {
+            if (cancelled) return;
+            setSegments(updated);
+            timelineState.setState({ timelineSegments: updated });
+          }, 100);
+        } else {
+          setSegments(updated);
+          timelineState.setState({ timelineSegments: updated });
+        }
 
         if (addedSegs.length > 0) {
           showStatusMessage(
@@ -1081,7 +1288,11 @@ export function TimelinePage() {
     };
 
     const intervalId = setInterval(pollForNewRecordings, POLL_INTERVAL_MS);
-    return () => clearInterval(intervalId);
+    return () => {
+      cancelled = true;
+      clearInterval(intervalId);
+      clearTimeout(fadeTimeoutId);
+    };
   }, [idsMode, selectedStream, timelineUrl]);
 
   useEffect(() => {
@@ -1221,6 +1432,7 @@ export function TimelinePage() {
           data-keyboard-nav-preserve
           className="relative w-full h-24 bg-secondary border border-input rounded-lg mb-2 overflow-hidden"
           ref={timelineContainerRef}
+          style={{ touchAction: 'pan-y' }}
         >
           <TimelineRuler />
           <TimelineSegments segments={segments} detectionIntervals={detectionIntervals} />
@@ -1258,6 +1470,17 @@ export function TimelinePage() {
 
   // Get return URL for "Refine Selections" link
   const returnUrl = idsMode ? (sessionStorage.getItem(RECORDINGS_RETURN_URL_KEY) || 'recordings.html') : null;
+  const investigationParams = new URLSearchParams();
+  if (selectedStream) investigationParams.set('stream', selectedStream);
+  const investigationBounds = getLocalDayBounds(selectedDate);
+  if (investigationBounds) {
+    investigationParams.set('start', String(investigationBounds.startTimestamp));
+    investigationParams.set('end', String(investigationBounds.endTimestamp));
+  }
+  if (Number.isFinite(timelineState.currentTime)) {
+    investigationParams.set('cursor', String(Math.floor(timelineState.currentTime)));
+  }
+  const investigationHref = `investigation.html?${investigationParams.toString()}`;
 
   return (
     <div className="timeline-page">
@@ -1294,7 +1517,7 @@ export function TimelinePage() {
           </a>
           <a
             href="timeline.html"
-            className="px-3 py-1 rounded-r-md text-sm"
+            className="px-3 py-1 text-sm"
             style={{
               backgroundColor: idsMode ? 'hsl(var(--secondary))' : 'hsl(var(--primary))',
               color: idsMode ? 'hsl(var(--secondary-foreground))' : 'hsl(var(--primary-foreground))'
@@ -1303,6 +1526,18 @@ export function TimelinePage() {
             onMouseOut={(e) => { if (idsMode) e.currentTarget.style.backgroundColor = 'hsl(var(--secondary))'; }}
           >
             {t('nav.timeline')}
+          </a>
+          <a
+            href={investigationHref}
+            className="px-3 py-1 rounded-r-md text-sm"
+            style={{
+              backgroundColor: 'hsl(var(--secondary))',
+              color: 'hsl(var(--secondary-foreground))'
+            }}
+            onMouseOver={(e) => e.currentTarget.style.backgroundColor = 'hsl(var(--secondary) / 0.8)'}
+            onMouseOut={(e) => e.currentTarget.style.backgroundColor = 'hsl(var(--secondary))'}
+          >
+            {t('nav.investigation')}
           </a>
         </div>
       </div>

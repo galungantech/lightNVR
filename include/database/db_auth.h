@@ -10,8 +10,10 @@
 #include <stdint.h>
 #include <stddef.h>
 
-#define USER_ALLOWED_TAGS_MAX 256
 #define USER_ALLOWED_LOGIN_CIDRS_MAX 1024
+#define USER_AUTHORIZATION_MODE_MAX 16
+#define USER_API_TOKEN_UUID_MAX 37
+#define USER_AUTH_METHOD_MAX 24
 
 /**
  * @brief User roles
@@ -37,11 +39,14 @@ typedef struct {
     int64_t last_login;      /**< Last login timestamp */
     bool is_active;          /**< Whether the user is active */
     bool password_change_locked; /**< Whether password changes are locked (for demo accounts) */
+    bool must_change_password; /**< Whether password auth is restricted pending a password change */
     bool totp_enabled;       /**< Whether TOTP MFA is enabled */
-    char allowed_tags[USER_ALLOWED_TAGS_MAX];  /**< Comma-separated tag whitelist for RBAC (empty = no restriction) */
-    bool has_tag_restriction; /**< Whether allowed_tags is set (true) or NULL/unrestricted (false) */
     char allowed_login_cidrs[USER_ALLOWED_LOGIN_CIDRS_MAX]; /**< Newline-separated CIDR whitelist for login/auth IPs */
     bool has_login_cidr_restriction; /**< Whether allowed_login_cidrs is set (true) or NULL/unrestricted (false) */
+    char authorization_mode[USER_AUTHORIZATION_MODE_MAX]; /**< legacy compatibility or default-deny policy evaluation */
+    bool authenticated_via_scoped_token; /**< Request used a scoped, hashed API token */
+    char api_token_uuid[USER_API_TOKEN_UUID_MAX]; /**< Scoped token constraint for this request */
+    char authentication_method[USER_AUTH_METHOD_MAX]; /**< session/basic/legacy_api_key/scoped_token */
 } user_t;
 
 /**
@@ -331,15 +336,6 @@ int db_auth_set_totp_secret(int64_t user_id, const char *secret);
 int db_auth_enable_totp(int64_t user_id, bool enabled);
 
 /**
- * @brief Set the allowed_tags restriction for a user
- *
- * @param user_id User ID
- * @param allowed_tags Comma-separated tag list, or NULL to remove restriction
- * @return 0 on success, non-zero on failure
- */
-int db_auth_set_allowed_tags(int64_t user_id, const char *allowed_tags);
-
-/**
  * @brief Validate a per-user allowed_login_cidrs list.
  *
  * Accepts IPv4/IPv6 CIDR entries or single IP literals separated by commas and/or
@@ -371,18 +367,5 @@ int db_auth_set_allowed_login_cidrs(int64_t user_id, const char *allowed_login_c
  * @return true if authentication is permitted from client_ip
  */
 bool db_auth_ip_allowed_for_user(const user_t *user, const char *client_ip);
-
-/**
- * @brief Check whether a stream's tags satisfy a user's allowed_tags restriction
- *
- * Returns true when:
- *   - The user has no tag restriction (has_tag_restriction == false), OR
- *   - The stream has at least one tag that appears in the user's allowed_tags list
- *
- * @param user Pointer to the authenticated user
- * @param stream_tags Comma-separated tags from the stream (may be empty)
- * @return true if access is permitted, false otherwise
- */
-bool db_auth_stream_allowed_for_user(const user_t *user, const char *stream_tags);
 
 #endif /* LIGHTNVR_DB_AUTH_H */

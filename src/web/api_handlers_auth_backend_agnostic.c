@@ -17,6 +17,7 @@
 #include "web/request_response.h"
 #include "web/httpd_utils.h"
 #include "web/api_handlers_totp.h"
+#include "web/audit_log.h"
 #define LOG_COMPONENT "AuthAPI"
 #include "core/logger.h"
 #include "core/config.h"
@@ -252,6 +253,8 @@ void handle_auth_login(const http_request_t *req, http_response_t *res) {
 
             if (!is_form) {
                 log_error("Failed to parse login data from request body");
+                audit_log_login(req, NULL, "", "password", "failure",
+                                "invalid_request");
                 http_response_set_json_error(res, 400, "Invalid login data");
                 return;
             }
@@ -264,6 +267,8 @@ void handle_auth_login(const http_request_t *req, http_response_t *res) {
                 !password_json || !cJSON_IsString(password_json)) {
                 log_error("Missing or invalid username/password in login request");
                 cJSON_Delete(login);
+                audit_log_login(req, NULL, "", "password", "failure",
+                                "invalid_request");
                 http_response_set_json_error(res, 400, "Missing or invalid username/password");
                 return;
             }
@@ -289,6 +294,8 @@ void handle_auth_login(const http_request_t *req, http_response_t *res) {
     // Check rate limiting before processing credentials
     if (check_rate_limit(username)) {
         log_warn("Login rate-limited for user: %s", username);
+        audit_log_login(req, NULL, username, "password", "denied",
+                        "rate_limited");
 
         if (is_form) {
             http_response_add_header(res, "Location", "/login.html?error=rate_limited");
@@ -309,6 +316,8 @@ void handle_auth_login(const http_request_t *req, http_response_t *res) {
         // Login failed - record attempt for rate limiting
         record_failed_attempt(username);
         log_warn("Login failed for user: %s", username);
+        audit_log_login(req, NULL, username, "password", "denied",
+                        "invalid_credentials");
 
         if (is_form) {
             // For form submissions, send redirect to login page with error
@@ -329,6 +338,9 @@ void handle_auth_login(const http_request_t *req, http_response_t *res) {
     user_t authenticated_user;
     if (db_auth_get_user_by_id(user_id, &authenticated_user) != 0) {
         log_error("Failed to load authenticated user record for %s", username);
+        user_t unavailable_user = {.id = user_id};
+        audit_log_login(req, &unavailable_user, username, "password", "error",
+                        "user_load_failed");
         http_response_set_json_error(res, 500, "Failed to load user");
         return;
     }
@@ -337,6 +349,8 @@ void handle_auth_login(const http_request_t *req, http_response_t *res) {
         record_failed_attempt(username);
         log_warn("Login blocked by allowed_login_cidrs for user '%s' from IP %s",
                  username, effective_client_ip[0] != '\0' ? effective_client_ip : "(unknown)");
+        audit_log_login(req, &authenticated_user, username, "password",
+                        "denied", "source_address_not_allowed");
 
         if (is_form) {
             http_response_add_header(res, "Location", "/login.html?error=1");
@@ -349,7 +363,14 @@ void handle_auth_login(const http_request_t *req, http_response_t *res) {
         return;
     }
 
+    bool must_change_password =
+        authenticated_user.must_change_password && !g_config.demo_mode;
+
     // Check if user has TOTP enabled (only for API/JSON requests)
+    // A pending password change must never weaken MFA: an account carrying
+    // both still completes its TOTP challenge first, and only then gets the
+    // restricted session that can reach nothing but its own password endpoint.
+    // The bootstrap admin has no TOTP, so it falls straight through.
     if (!is_form) {
         char totp_secret[64] = {0};
         bool totp_enabled = false;
@@ -367,6 +388,9 @@ void handle_auth_login(const http_request_t *req, http_response_t *res) {
                         // Don't reveal that password was correct
                         record_failed_attempt(username);
                         log_warn("Force MFA: no TOTP code provided for user: %s", username);
+                        audit_log_login(req, &authenticated_user, username,
+                                        "password_totp", "denied",
+                                        "mfa_required");
                         http_response_set_json_error(res, 401, "Invalid credentials");
                         return;
                     }
@@ -377,6 +401,9 @@ void handle_auth_login(const http_request_t *req, http_response_t *res) {
                     if (totp_verify(totp_secret, totp_code) != 0) {
                         record_failed_attempt(username);
                         log_warn("Force MFA: invalid TOTP code for user: %s", username);
+                        audit_log_login(req, &authenticated_user, username,
+                                        "password_totp", "denied",
+                                        "invalid_mfa_code");
                         http_response_set_json_error(res, 401, "Invalid credentials");
                         return;
                     }
@@ -389,6 +416,9 @@ void handle_auth_login(const http_request_t *req, http_response_t *res) {
                     if (totp_verify(totp_secret, totp_code) != 0) {
                         record_failed_attempt(username);
                         log_warn("Invalid inline TOTP code for user: %s", username);
+                        audit_log_login(req, &authenticated_user, username,
+                                        "password_totp", "denied",
+                                        "invalid_mfa_code");
                         http_response_set_json_error(res, 401, "Invalid credentials");
                         return;
                     }
@@ -403,6 +433,9 @@ void handle_auth_login(const http_request_t *req, http_response_t *res) {
                 rc = db_auth_create_session(user_id, effective_client_ip, req->user_agent, 300, totp_token, sizeof(totp_token));
                 if (rc != 0) {
                     log_error("Failed to create pending MFA session for user: %s", username);
+                    audit_log_login(req, &authenticated_user, username,
+                                    "password", "error",
+                                    "mfa_challenge_create_failed");
                     http_response_set_json_error(res, 500, "Failed to create MFA session");
                     return;
                 }
@@ -418,6 +451,9 @@ void handle_auth_login(const http_request_t *req, http_response_t *res) {
                 cJSON_Delete(response);
 
                 log_info("TOTP verification required for user: %s", username);
+                audit_log_login(req, &authenticated_user, username,
+                                "password", "allowed",
+                                "mfa_challenge_issued");
                 return;
                 }
             }
@@ -438,6 +474,8 @@ void handle_auth_login(const http_request_t *req, http_response_t *res) {
 
     if (rc != 0) {
         log_error("Failed to create session for user: %s", username);
+        audit_log_login(req, &authenticated_user, username, "password",
+                        "error", "session_create_failed");
         http_response_set_json_error(res, 500, "Failed to create session");
         return;
     }
@@ -466,6 +504,8 @@ void handle_auth_login(const http_request_t *req, http_response_t *res) {
         cJSON *response = cJSON_CreateObject();
         cJSON_AddBoolToObject(response, "success", true);
         cJSON_AddStringToObject(response, "redirect", "/index.html");
+        cJSON_AddBoolToObject(response, "must_change_password",
+                              must_change_password);
 
         char *json_str = cJSON_PrintUnformatted(response);
         http_response_set_json(res, 200, json_str);
@@ -474,6 +514,11 @@ void handle_auth_login(const http_request_t *req, http_response_t *res) {
     }
 
     log_info("Session created successfully for user: %s", username);
+    const char *authentication_method = trusted_device_used
+        ? "password_trusted_device"
+        : (totp_verified ? "password_totp" : "password");
+    audit_log_login(req, &authenticated_user, username,
+                    authentication_method, "success", "session_created");
 }
 
 /**
@@ -530,6 +575,7 @@ void handle_auth_verify(const http_request_t *req, http_response_t *res) {
         cJSON_AddBoolToObject(response, "authenticated", true);
         cJSON_AddStringToObject(response, "username", "admin");
         cJSON_AddStringToObject(response, "role", "admin");
+        cJSON_AddBoolToObject(response, "must_change_password", false);
         cJSON_AddBoolToObject(response, "auth_enabled", false);
         cJSON_AddNumberToObject(response, "auth_timeout_hours", g_config.auth_timeout_hours);
         cJSON_AddNumberToObject(response, "auth_absolute_timeout_hours", g_config.auth_absolute_timeout_hours);
@@ -556,6 +602,8 @@ void handle_auth_verify(const http_request_t *req, http_response_t *res) {
         cJSON_AddNumberToObject(response, "role_id", user.role);
         cJSON_AddBoolToObject(response, "is_active", user.is_active);
         cJSON_AddBoolToObject(response, "password_change_locked", user.password_change_locked);
+        cJSON_AddBoolToObject(response, "must_change_password",
+                              user.must_change_password && !g_config.demo_mode);
         cJSON_AddBoolToObject(response, "auth_enabled", true);
         cJSON_AddNumberToObject(response, "auth_timeout_hours", g_config.auth_timeout_hours);
         cJSON_AddNumberToObject(response, "auth_absolute_timeout_hours", g_config.auth_absolute_timeout_hours);
@@ -577,6 +625,7 @@ void handle_auth_verify(const http_request_t *req, http_response_t *res) {
         cJSON_AddBoolToObject(response, "demo_mode", true);
         cJSON_AddStringToObject(response, "username", "demo");
         cJSON_AddStringToObject(response, "role", "viewer");
+        cJSON_AddBoolToObject(response, "must_change_password", false);
 
         char *json_str = cJSON_PrintUnformatted(response);
         http_response_set_json(res, 200, json_str);
@@ -770,4 +819,3 @@ void handle_auth_trusted_devices_delete(const http_request_t *req, http_response
 
     http_response_set_json(res, 200, "{\"success\":true}");
 }
-

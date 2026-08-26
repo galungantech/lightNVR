@@ -301,14 +301,20 @@ Powerful object detection using modern ONNX and TFLite models with zone-aware fi
 > `0.0.0.0` by default.** Until you change the password, anyone who can reach port 8080 can
 > reach your cameras and recordings. Change it before you expose the port to anything.
 
-Log in at `http://your-device-ip:8080` with `admin` / `admin`, then go to **Settings →
-Users** and set a real password.
+Log in at `http://your-device-ip:8080` with `admin` / `admin`. LightNVR immediately
+opens a blocking password-change screen; the initial session cannot use the rest of the
+UI or protected password-authenticated APIs. After replacing the password, sign in again
+with the new credential. MFA, when enabled, is evaluated on that next sign-in.
 
 You can also pre-set the password *before* the first start, which avoids the default ever
 being valid: set `password` in the `[web]` section of `lightnvr.ini` and start LightNVR.
 The first run creates the admin account with that password instead. The setting is only
 read when the account is created — after that, users live in the database and are managed
 from the **Users** page.
+
+Upgrades do not mark existing accounts for a forced password change. The gate is set only
+when LightNVR creates a new administrator with the fallback `admin` password. API-key
+authentication and demo mode are not restricted by this first-login UI flow.
 
 Forgot the password? There is no reset flag. Stop LightNVR, delete the account row, and
 restart — it will be recreated from the same rules as a first run:
@@ -564,8 +570,14 @@ For organizations that need to integrate lightNVR into proprietary products or c
 
 ## Star History
 
-## Star History
-[![Star History Chart](https://api.star-history.com/image?repos=opensensor/lightNVR&type=date&legend=top-left)](https://www.star-history.com/?repos=opensensor%2FlightNVR&type=date&legend=top-left)
+<!-- The encrypted Star History token expires on 2027-08-23; regenerate the embed before then. -->
+<a href="https://www.star-history.com/?repos=opensensor%2FlightNVR&type=date&legend=top-left">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/chart?repos=opensensor/lightNVR&type=date&theme=dark&legend=top-left&sealed_token=8cR6LaUNd9-xW7lZFkzSohfLk3BMjr87YymKaK5bAXN-mx3XwRg7a3jP2FjwAWm21bgmUXtR5nXl_jqIg0WpHoVZODURxPGW2MG791kgYSq3zrnvnQ0RchxXLvQY6GIS8qI1Vw-20IuDmwaH5WX1KpOgk_vXqx46gFmVqIo__6ii5pYjFCIIz8SmcC_S" />
+    <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/chart?repos=opensensor/lightNVR&type=date&legend=top-left&sealed_token=8cR6LaUNd9-xW7lZFkzSohfLk3BMjr87YymKaK5bAXN-mx3XwRg7a3jP2FjwAWm21bgmUXtR5nXl_jqIg0WpHoVZODURxPGW2MG791kgYSq3zrnvnQ0RchxXLvQY6GIS8qI1Vw-20IuDmwaH5WX1KpOgk_vXqx46gFmVqIo__6ii5pYjFCIIz8SmcC_S" />
+    <img alt="Star History Chart" src="https://api.star-history.com/chart?repos=opensensor/lightNVR&type=date&legend=top-left&sealed_token=8cR6LaUNd9-xW7lZFkzSohfLk3BMjr87YymKaK5bAXN-mx3XwRg7a3jP2FjwAWm21bgmUXtR5nXl_jqIg0WpHoVZODURxPGW2MG791kgYSq3zrnvnQ0RchxXLvQY6GIS8qI1Vw-20IuDmwaH5WX1KpOgk_vXqx46gFmVqIo__6ii5pYjFCIIz8SmcC_S" />
+  </picture>
+</a>
 
 ## Acknowledgments
 

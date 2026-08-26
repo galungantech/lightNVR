@@ -18,7 +18,7 @@
 #define LOG_COMPONENT "DetectionAPI"
 #include "core/logger.h"
 #include "core/config.h"
-#include "core/mqtt_client.h"
+#include "core/event_producers.h"
 #include "video/detection.h"
 #include "video/detection_result.h"
 #include "video/stream_manager.h"
@@ -67,14 +67,15 @@ void store_detection_result(const char *stream_name, const detection_result_t *r
         return;
     }
 
-    // Publish to MQTT if enabled (use filtered result)
+    // Enqueue the normalized event; MQTT compatibility runs on the bus worker.
     if (filtered_result.count > 0) {
-        int mqtt_ret = mqtt_publish_detection(stream_name, &filtered_result, timestamp);
-        // cppcheck-suppress knownConditionTrueFalse
-        if (mqtt_ret != 0) {
-            log_debug("MQTT publish skipped or failed for stream '%s'", stream_name);
+        char event_error[256] = {0};
+        if (event_producer_publish_detection_for_stream(
+                stream_name, &filtered_result, timestamp,
+                event_error, sizeof(event_error)) != 0) {
+            log_debug("Detection event enqueue failed for stream '%s': %s",
+                      stream_name, event_error);
         }
-        mqtt_set_motion_state(stream_name, result);
     }
 
     // Log the stored detections
@@ -98,7 +99,7 @@ void debug_dump_detection_results(void) {
     log_debug("DEBUG: Current detection results (from database):");
 
     // Get all stream names (heap-allocated)
-    int ms = g_config.max_streams > 0 ? g_config.max_streams : 32;
+    int ms = configured_stream_slots();
     stream_config_t *streams = calloc(ms, sizeof(stream_config_t));
     if (!streams) return;
     int stream_count = get_all_stream_configs(streams, ms);
@@ -144,29 +145,13 @@ void debug_dump_detection_results(void) {
 /**
  * Handle GET /api/snapshots/{stream}/{file}.jpg
  *
- * Serves detection event snapshots saved by mqtt_publish_detection() under
- * {storage_path}/snapshots/.  The MQTT detection payload references these
- * files via its snapshot_url field (issue #449).
+ * Serves detection event snapshots saved by the MQTT compatibility adapter
+ * under {storage_path}/snapshots/. The legacy payload references these files
+ * via its snapshot_url field (issue #449).
  */
 void handle_get_detection_snapshot(const http_request_t *req, http_response_t *res) {
     if (!req || !res) {
         return;
-    }
-
-    // Check authentication if enabled (same policy as recording thumbnails)
-    if (g_config.web_auth_enabled) {
-        user_t user;
-        if (g_config.demo_mode) {
-            if (!httpd_check_viewer_access(req, &user)) {
-                http_response_set_json_error(res, 401, "Unauthorized");
-                return;
-            }
-        } else {
-            if (!httpd_get_authenticated_user(req, &user)) {
-                http_response_set_json_error(res, 401, "Unauthorized");
-                return;
-            }
-        }
     }
 
     // Extract "{stream}/{file}.jpg"
@@ -185,6 +170,9 @@ void handle_get_detection_snapshot(const http_request_t *req, http_response_t *r
     *slash = '\0';
     const char *stream_part = param_buf;
     const char *file_part = slash + 1;
+
+    if (!httpd_authorize_stream_action(req, res, AUTHZ_SNAPSHOT_CREATE,
+                                       stream_part)) return;
 
     // Both components must be plain filenames: no traversal, no separators,
     // only characters sanitize_stream_name / the snapshot writer produce.

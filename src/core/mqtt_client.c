@@ -28,9 +28,20 @@
 // MQTT client state
 static struct mosquitto *mosq = NULL;
 static const config_t *mqtt_config = NULL;
+static bool mqtt_library_initialized = false;
 static bool connected = false;
 static volatile bool shutting_down = false;  // Flag to prevent callbacks from acquiring mutex during shutdown
 static pthread_mutex_t mqtt_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+// One confirmed publish is outstanding at a time from the durable delivery
+// worker. Other legacy publishes still receive callbacks but do not match the
+// tracked message ID.
+static pthread_mutex_t publish_ack_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t publish_ack_wake = PTHREAD_COND_INITIALIZER;
+static bool publish_ack_waiting = false;
+static bool publish_ack_received = false;
+static bool publish_ack_failed = false;
+static int publish_ack_mid = -1;
 
 // HA discovery state
 static volatile bool ha_services_running = false;
@@ -63,6 +74,7 @@ static pthread_mutex_t motion_mutex = PTHREAD_MUTEX_INITIALIZER;
 static void on_connect(struct mosquitto *mosq, void *userdata, int rc);
 static void on_disconnect(struct mosquitto *mosq, void *userdata, int rc);
 static void on_message(struct mosquitto *mosq, void *userdata, const struct mosquitto_message *msg);
+static void on_publish(struct mosquitto *mosq, void *userdata, int mid);
 static void on_log(struct mosquitto *mosq, void *userdata, int level, const char *str);
 
 /**
@@ -74,34 +86,41 @@ int mqtt_init(const config_t *config) {
         return -1;
     }
     
+    pthread_mutex_lock(&mqtt_mutex);
+
+    // Managed destinations share libmosquitto's process-wide runtime even
+    // when the legacy/default broker is disabled.
+    int rc = MOSQ_ERR_SUCCESS;
+    if (!mqtt_library_initialized) {
+        rc = mosquitto_lib_init();
+        if (rc != MOSQ_ERR_SUCCESS) {
+            log_error("MQTT: Failed to initialize mosquitto library: %s",
+                      mosquitto_strerror(rc));
+            pthread_mutex_unlock(&mqtt_mutex);
+            return -1;
+        }
+        mqtt_library_initialized = true;
+    }
+
+    // Store config reference
+    mqtt_config = config;
+
     if (!config->mqtt_enabled) {
-        log_info("MQTT: Disabled in configuration");
+        pthread_mutex_unlock(&mqtt_mutex);
+        log_info("MQTT: Default broker disabled; managed destinations remain available");
         return 0;
     }
-    
+
     if (config->mqtt_broker_host[0] == '\0') {
         log_error("MQTT: Broker host not configured");
-        return -1;
-    }
-    
-    pthread_mutex_lock(&mqtt_mutex);
-    
-    // Initialize mosquitto library
-    int rc = mosquitto_lib_init();
-    if (rc != MOSQ_ERR_SUCCESS) {
-        log_error("MQTT: Failed to initialize mosquitto library: %s", mosquitto_strerror(rc));
         pthread_mutex_unlock(&mqtt_mutex);
         return -1;
     }
-    
-    // Store config reference
-    mqtt_config = config;
     
     // Create mosquitto client instance
     mosq = mosquitto_new(config->mqtt_client_id, true, NULL);
     if (!mosq) {
         log_error("MQTT: Failed to create mosquitto client");
-        mosquitto_lib_cleanup();
         pthread_mutex_unlock(&mqtt_mutex);
         return -1;
     }
@@ -110,6 +129,7 @@ int mqtt_init(const config_t *config) {
     mosquitto_connect_callback_set(mosq, on_connect);
     mosquitto_disconnect_callback_set(mosq, on_disconnect);
     mosquitto_message_callback_set(mosq, on_message);
+    mosquitto_publish_callback_set(mosq, on_publish);
     mosquitto_log_callback_set(mosq, on_log);
     
     // Set username/password if configured
@@ -120,7 +140,6 @@ int mqtt_init(const config_t *config) {
             log_error("MQTT: Failed to set credentials: %s", mosquitto_strerror(rc));
             mosquitto_destroy(mosq);
             mosq = NULL;
-            mosquitto_lib_cleanup();
             pthread_mutex_unlock(&mqtt_mutex);
             return -1;
         }
@@ -128,12 +147,11 @@ int mqtt_init(const config_t *config) {
     
     // Enable TLS if configured
     if (config->mqtt_tls_enabled) {
-        rc = mosquitto_tls_set(mosq, NULL, NULL, NULL, NULL, NULL);
+        rc = mosquitto_int_option(mosq, MOSQ_OPT_TLS_USE_OS_CERTS, 1);
         if (rc != MOSQ_ERR_SUCCESS) {
             log_error("MQTT: Failed to enable TLS: %s", mosquitto_strerror(rc));
             mosquitto_destroy(mosq);
             mosq = NULL;
-            mosquitto_lib_cleanup();
             pthread_mutex_unlock(&mqtt_mutex);
             return -1;
         }
@@ -268,6 +286,12 @@ static void on_disconnect(struct mosquitto *m, void *userdata, int rc) {
     if (shutting_down) {
         // Still update the flag without mutex during shutdown - it's a simple write
         connected = false;
+        pthread_mutex_lock(&publish_ack_mutex);
+        if (publish_ack_waiting) {
+            publish_ack_failed = true;
+            pthread_cond_broadcast(&publish_ack_wake);
+        }
+        pthread_mutex_unlock(&publish_ack_mutex);
         if (rc == 0) {
             log_info("MQTT: Disconnected from broker (shutdown)");
         }
@@ -284,11 +308,29 @@ static void on_disconnect(struct mosquitto *m, void *userdata, int rc) {
     connected = false;
     pthread_mutex_unlock(&mqtt_mutex);
 
+    pthread_mutex_lock(&publish_ack_mutex);
+    if (publish_ack_waiting) {
+        publish_ack_failed = true;
+        pthread_cond_broadcast(&publish_ack_wake);
+    }
+    pthread_mutex_unlock(&publish_ack_mutex);
+
     if (rc == 0) {
         log_info("MQTT: Disconnected from broker");
     } else {
         log_warn("MQTT: Unexpected disconnection (rc=%d), will attempt reconnect", rc);
     }
+}
+
+static void on_publish(struct mosquitto *m, void *userdata, int mid) {
+    (void)m;
+    (void)userdata;
+    pthread_mutex_lock(&publish_ack_mutex);
+    if (publish_ack_waiting && publish_ack_mid == mid) {
+        publish_ack_received = true;
+        pthread_cond_broadcast(&publish_ack_wake);
+    }
+    pthread_mutex_unlock(&publish_ack_mutex);
 }
 
 // Message callback — handles HA birth messages for re-discovery
@@ -600,6 +642,106 @@ int mqtt_publish_raw(const char *topic, const char *payload, bool retain) {
     }
 
     return 0;
+}
+
+int mqtt_publish_raw_confirmed(const char *topic, const char *payload,
+                               bool retain, int timeout_ms) {
+    if (!topic || !payload || timeout_ms <= 0) return -1;
+    size_t payload_length = strlen(payload);
+    if (payload_length > INT_MAX) return -1;
+    if (!mqtt_is_connected()) return -1;
+
+    pthread_mutex_lock(&publish_ack_mutex);
+    if (publish_ack_waiting) {
+        pthread_mutex_unlock(&publish_ack_mutex);
+        return -1;
+    }
+    publish_ack_waiting = true;
+    publish_ack_received = false;
+    publish_ack_failed = false;
+    publish_ack_mid = -1;
+
+    pthread_mutex_lock(&mqtt_mutex);
+    if (!mosq || !mqtt_config || !mqtt_config->mqtt_enabled ||
+        !connected || shutting_down) {
+        pthread_mutex_unlock(&mqtt_mutex);
+        publish_ack_waiting = false;
+        pthread_mutex_unlock(&publish_ack_mutex);
+        return -1;
+    }
+    int mid = -1;
+    int rc = mosquitto_publish(
+        mosq, &mid, topic, (int)payload_length, payload,
+        mqtt_config->mqtt_qos, retain);
+    publish_ack_mid = mid;
+    pthread_mutex_unlock(&mqtt_mutex);
+    if (rc != MOSQ_ERR_SUCCESS) {
+        log_error("MQTT: Failed to queue confirmed publish to %s: %s",
+                  topic, mosquitto_strerror(rc));
+        publish_ack_waiting = false;
+        publish_ack_mid = -1;
+        pthread_mutex_unlock(&publish_ack_mutex);
+        return -1;
+    }
+
+    struct timespec deadline;
+    clock_gettime(CLOCK_REALTIME, &deadline);
+    deadline.tv_sec += timeout_ms / 1000;
+    deadline.tv_nsec += (long)(timeout_ms % 1000) * 1000000L;
+    if (deadline.tv_nsec >= 1000000000L) {
+        deadline.tv_sec++;
+        deadline.tv_nsec -= 1000000000L;
+    }
+    while (!publish_ack_received && !publish_ack_failed) {
+        rc = pthread_cond_timedwait(
+            &publish_ack_wake, &publish_ack_mutex, &deadline);
+        if (rc == ETIMEDOUT) break;
+        if (rc != 0) {
+            publish_ack_failed = true;
+            break;
+        }
+    }
+    bool acknowledged = publish_ack_received && !publish_ack_failed;
+    publish_ack_waiting = false;
+    publish_ack_received = false;
+    publish_ack_failed = false;
+    publish_ack_mid = -1;
+    pthread_mutex_unlock(&publish_ack_mutex);
+    if (!acknowledged) {
+        log_warn("MQTT: Confirmed publish to %s was not acknowledged", topic);
+        return -1;
+    }
+    return 0;
+}
+
+int mqtt_publish_event(const event_envelope_t *event) {
+    if (!mosq || !mqtt_config || !mqtt_config->mqtt_enabled) {
+        return 0;
+    }
+    if (!event) return -1;
+
+    const char *subject_id = strrchr(event->subject, '/');
+    subject_id = subject_id ? subject_id + 1 : event->subject;
+    if (!subject_id[0]) return -1;
+
+    char topic[MAX_TOPIC_LENGTH];
+    int topic_length = snprintf(
+        topic, sizeof(topic), "%s/v1/events/%s/%s",
+        mqtt_config->mqtt_topic_prefix, event->type, subject_id);
+    if (topic_length < 0 || (size_t)topic_length >= sizeof(topic)) {
+        log_error("MQTT: Normalized event topic exceeds maximum length");
+        return -1;
+    }
+
+    char error[256] = {0};
+    char *payload = event_envelope_serialize(event, error, sizeof(error));
+    if (!payload) {
+        log_error("MQTT: Failed to serialize event envelope: %s", error);
+        return -1;
+    }
+    int result = mqtt_publish_raw(topic, payload, false);
+    free(payload);
+    return result;
 }
 
 /**
@@ -1438,9 +1580,15 @@ void mqtt_cleanup(void) {
 
     if (!mosq) {
         log_info("MQTT: No client to clean up");
-        // Still need to cleanup the library if it was initialized
-        log_info("MQTT: Calling mosquitto_lib_cleanup with 2 second timeout...");
-        mqtt_run_with_timeout(NULL, MQTT_OP_LIB_CLEANUP, 2, "mosquitto_lib_cleanup");
+        mqtt_config = NULL;
+        if (mqtt_library_initialized) {
+            log_info("MQTT: Calling mosquitto_lib_cleanup with 2 second timeout...");
+            if (mqtt_run_with_timeout(
+                    NULL, MQTT_OP_LIB_CLEANUP, 2,
+                    "mosquitto_lib_cleanup")) {
+                mqtt_library_initialized = false;
+            }
+        }
         log_info("MQTT: Cleaned up");
         return;
     }
@@ -1487,8 +1635,14 @@ void mqtt_cleanup(void) {
         return;
     }
 
-    log_info("MQTT: Calling mosquitto_lib_cleanup with 2 second timeout...");
-    mqtt_run_with_timeout(NULL, MQTT_OP_LIB_CLEANUP, 2, "mosquitto_lib_cleanup");
+    if (mqtt_library_initialized) {
+        log_info("MQTT: Calling mosquitto_lib_cleanup with 2 second timeout...");
+        if (mqtt_run_with_timeout(
+                NULL, MQTT_OP_LIB_CLEANUP, 2,
+                "mosquitto_lib_cleanup")) {
+            mqtt_library_initialized = false;
+        }
+    }
     log_info("MQTT: Cleaned up");
 }
 
@@ -1515,19 +1669,19 @@ int mqtt_reinit(const config_t *config) {
     shutting_down = false;
     __sync_synchronize();
 
-    // Step 3: If MQTT is now disabled, we're done
-    if (!config->mqtt_enabled) {
-        log_info("MQTT reinit: MQTT is disabled, cleanup complete");
-        return 0;
-    }
-
-    // Step 4: Re-initialize with the updated config
+    // Step 3: Re-initialize the shared MQTT runtime. Managed destinations use
+    // it even when the default broker is disabled.
     if (mqtt_init(config) != 0) {
         log_error("MQTT reinit: Failed to initialize MQTT client");
         return -1;
     }
 
-    // Step 5: Connect to broker
+    if (!config->mqtt_enabled) {
+        log_info("MQTT reinit: Default broker disabled; shared runtime ready");
+        return 0;
+    }
+
+    // Step 4: Connect to the default broker
     if (mqtt_connect() != 0) {
         log_warn("MQTT reinit: Failed to connect to MQTT broker, will retry automatically");
         // Not a fatal error — mosquitto loop thread will retry

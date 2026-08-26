@@ -7,12 +7,18 @@
 #include <time.h>
 
 #include "core/config.h"
+#include "database/db_storage_targets.h"
 
 // Recording metadata structure
 typedef struct {
     uint64_t id;
     char stream_name[64];
+    char camera_uuid[CAMERA_UUID_STRING_SIZE];
     char file_path[MAX_PATH_LENGTH];
+    char storage_target_uuid[LIGHTNVR_UUID_STRING_SIZE];
+    char object_key[STORAGE_TARGET_OBJECT_KEY_MAX];
+    char placement_reason[64];
+    int64_t storage_policy_version;
     time_t start_time;
     time_t end_time;
     uint64_t size_bytes;
@@ -231,6 +237,8 @@ int get_recordings_for_retention(const char *stream_name,
  * @return Count of protected recordings, or -1 on error
  */
 int get_protected_recordings_count(const char *stream_name);
+int get_protected_recordings_count_for_streams(
+    const char *const *stream_names, int stream_count);
 
 /**
  * Get recordings for quota enforcement.
@@ -291,6 +299,39 @@ int get_recordings_for_tiered_retention(const char *stream_name,
  */
 int get_recordings_for_pressure_cleanup(recording_metadata_t *recordings,
                                         int max_count);
+
+/**
+ * Get pressure-cleanup candidates belonging to one storage target.
+ * Ordering and protection rules are identical to the global compatibility
+ * query, but candidates from every other target are excluded.
+ *
+ * @param storage_target_uuid Target whose recordings may be returned
+ * @param recordings Array to fill with recording metadata
+ * @param max_count Maximum number of recordings to return
+ * @return Number of recordings found, or -1 on error
+ */
+int get_recordings_for_pressure_cleanup_target(
+    const char *storage_target_uuid, recording_metadata_t *recordings,
+    int max_count);
+
+/**
+ * Get pressure-cleanup candidates for the default storage target.
+ *
+ * Identical to get_recordings_for_pressure_cleanup_target() except that rows
+ * with no target attribution are also returned. Those are recordings written
+ * before storage targets existed, or whose path the bootstrap backfill could
+ * not classify; without this the legacy disk-pressure paths can never reclaim
+ * them. Only the default target may ask for them, since an unattributed row
+ * carries no evidence that any other target holds it.
+ *
+ * @param storage_target_uuid Default target whose recordings may be returned
+ * @param recordings Array to fill with recording metadata
+ * @param max_count Maximum number of recordings to return
+ * @return Number of recordings found, or -1 on error
+ */
+int get_recordings_for_pressure_cleanup_default_target(
+    const char *storage_target_uuid, recording_metadata_t *recordings,
+    int max_count);
 
 /**
  * Get recordings still marked incomplete (is_complete = 0) and older than

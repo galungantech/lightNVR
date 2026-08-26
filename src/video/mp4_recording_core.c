@@ -50,6 +50,43 @@ mp4_recording_ctx_t *recording_contexts[MAX_STREAMS];
 // Must NOT be held across blocking operations such as pthread_join_with_timeout().
 static pthread_mutex_t recording_contexts_mutex = PTHREAD_MUTEX_INITIALIZER;
 
+// Slots claimed by a starter that has not published its context yet. Held
+// separately from recording_contexts[] on purpose: the mutex is dropped during
+// directory creation and path setup, and every other reader of that array does
+// `if (recording_contexts[i]) recording_contexts[i]->...`, so parking a
+// sentinel pointer there would be dereferenced. Guarded by the mutex above.
+static bool recording_slot_reserved[MAX_STREAMS];
+
+/**
+ * @brief Claim a free recording slot. Caller must hold recording_contexts_mutex.
+ *
+ * @return Reserved slot index, or -1 when every slot is taken. A reserved slot
+ *         must later be handed to publish_recording_slot(), on success and on
+ *         every failure path, or it leaks for the lifetime of the process.
+ */
+static int reserve_recording_slot_locked(void) {
+    for (int i = 0; i < g_config.max_streams; i++) {
+        if (!recording_contexts[i] && !recording_slot_reserved[i]) {
+            recording_slot_reserved[i] = true;
+            return i;
+        }
+    }
+    return -1;
+}
+
+/**
+ * @brief Publish a finished context into its reserved slot, or drop the claim.
+ *
+ * @param ctx Context to publish, or NULL to release the slot unused.
+ */
+static void publish_recording_slot(int slot, mp4_recording_ctx_t *ctx) {
+    if (slot < 0) return;
+    pthread_mutex_lock(&recording_contexts_mutex);
+    if (ctx) recording_contexts[slot] = ctx;
+    recording_slot_reserved[slot] = false;
+    pthread_mutex_unlock(&recording_contexts_mutex);
+}
+
 // Flag to indicate if shutdown is in progress
 volatile sig_atomic_t shutdown_in_progress = 0;
 
@@ -210,6 +247,9 @@ static void *mp4_recording_thread(void *arg) {
         ctx->running = 0;
         return NULL;
     }
+    ctx->mp4_writer->placement = ctx->placement;
+    safe_strcpy(ctx->mp4_writer->camera_uuid, ctx->config.camera_uuid,
+                sizeof(ctx->mp4_writer->camera_uuid), 0);
 
     // Configure audio recording based on stream config BEFORE anything else uses the writer
     mp4_writer_set_audio(ctx->mp4_writer, ctx->config.record_audio ? 1 : 0);
@@ -509,63 +549,62 @@ void cleanup_mp4_recording_backend(void) {
     // Set shutdown flag to signal all threads to exit
     shutdown_in_progress = 1;
 
-    // Create a local array to store contexts we need to clean up
-    // This prevents race conditions by ensuring we handle each context safely
-    typedef struct {
-        mp4_recording_ctx_t *ctx;
-        pthread_t thread;
-        char stream_name[MAX_STREAM_NAME];
-        int index;
-    } cleanup_item_t;
+    int capacity = g_config.max_streams;
+    if (capacity < 1 || capacity > MAX_STREAMS) {
+        capacity = MAX_STREAMS;
+    }
 
-    cleanup_item_t items_to_cleanup[MAX_STREAMS];
-    int cleanup_count = 0;
-
-    // Collect all active contexts under the mutex, signal them to stop, and
-    // null their slots.  Joins are performed outside the lock (they can block
-    // up to 15 s each).
+    // Signal every context first so their threads can wind down in parallel.
+    // Extract each context separately below, keeping the MAX_STREAMS-sized
+    // cleanup worklist off the stack while still joining outside the mutex.
     pthread_mutex_lock(&recording_contexts_mutex);
-    for (int i = 0; i < g_config.max_streams; i++) {
+    for (int i = 0; i < capacity; i++) {
         if (recording_contexts[i]) {
             recording_contexts[i]->running = 0;
-
-            items_to_cleanup[cleanup_count].ctx = recording_contexts[i];
-            items_to_cleanup[cleanup_count].thread = recording_contexts[i]->thread;
-            safe_strcpy(items_to_cleanup[cleanup_count].stream_name,
-                    recording_contexts[i]->config.name, MAX_STREAM_NAME, 0);
-            items_to_cleanup[cleanup_count].index = i;
-
-            // Null the slot now so new recordings (if any race) see it as free
-            recording_contexts[i] = NULL;
-
-            cleanup_count++;
         }
     }
     pthread_mutex_unlock(&recording_contexts_mutex);
 
-    // Join threads outside the mutex — each can block up to 15 s (outer thread
-    // needs 10 s for the inner RTSP thread plus margin).
-    for (int i = 0; i < cleanup_count; i++) {
-        log_info("Waiting for MP4 recording thread for %s to exit",
-                items_to_cleanup[i].stream_name);
+    for (int i = 0; i < capacity; i++) {
+        mp4_recording_ctx_t *ctx = NULL;
+        pthread_t thread;
+        char stream_name[MAX_STREAM_NAME];
 
-        int join_result = pthread_join_with_timeout(items_to_cleanup[i].thread, NULL, 15);
+        pthread_mutex_lock(&recording_contexts_mutex);
+        if (recording_contexts[i]) {
+            ctx = recording_contexts[i];
+            thread = ctx->thread;
+            safe_strcpy(stream_name, ctx->config.name, sizeof(stream_name), 0);
+            recording_contexts[i] = NULL;
+        }
+        pthread_mutex_unlock(&recording_contexts_mutex);
+
+        if (!ctx) {
+            continue;
+        }
+
+        // Join outside the mutex — each can block up to 15 s (outer thread
+        // needs 10 s for the inner RTSP thread plus margin).
+        log_info("Waiting for MP4 recording thread for %s to exit",
+                stream_name);
+
+        int join_result = pthread_join_with_timeout(thread, NULL, 15);
         if (join_result != 0) {
             log_warn("Could not join MP4 recording thread for %s within timeout: %s",
-                    items_to_cleanup[i].stream_name, strerror(join_result));
+                    stream_name, strerror(join_result));
 
             // Do NOT free the context — the detached thread still references it.
             // Accept the small memory leak; the OS reclaims on process exit.
-            pthread_detach(items_to_cleanup[i].thread);
+            pthread_detach(thread);
             log_warn("Detached MP4 recording thread for %s, skipping context free to avoid use-after-free",
-                    items_to_cleanup[i].stream_name);
+                    stream_name);
         } else {
             log_info("Successfully joined MP4 recording thread for %s",
-                    items_to_cleanup[i].stream_name);
+                    stream_name);
             // Thread has exited — safe to free the context.
             // The slot was already nulled above under the lock.
-            free(items_to_cleanup[i].ctx);
-            log_info("Freed MP4 recording context for %s", items_to_cleanup[i].stream_name);
+            free(ctx);
+            log_info("Freed MP4 recording context for %s", stream_name);
         }
     }
 
@@ -639,25 +678,25 @@ int start_mp4_recording(const char *stream_name) {
 
     // Find empty slot (under lock)
     pthread_mutex_lock(&recording_contexts_mutex);
-    int slot = -1;
-    for (int i = 0; i < g_config.max_streams; i++) {
-        if (!recording_contexts[i]) {
-            slot = i;
-            break;
-        }
-    }
+    int slot = reserve_recording_slot_locked();
 
     if (slot == -1) {
         pthread_mutex_unlock(&recording_contexts_mutex);
         log_error("No slot available for new MP4 recording");
         return -1;
     }
-    // Slot reserved — release the mutex before file I/O and context setup
+    // Slot reserved — release the mutex before file I/O and context setup.
+    // The reservation keeps a concurrent starter from claiming the same slot
+    // while it is still NULL in recording_contexts[].
     pthread_mutex_unlock(&recording_contexts_mutex);
 
     // Create context
     mp4_recording_ctx_t *ctx = malloc(sizeof(mp4_recording_ctx_t));
     if (!ctx) {
+        // Hand the reservation back: leaking it would retire the slot for the
+        // life of the process, so repeated allocation failures would leave the
+        // NVR unable to record even after memory recovers.
+        publish_recording_slot(slot, NULL);
         log_error("Memory allocation failed for MP4 recording context");
         return -1;
     }
@@ -672,68 +711,16 @@ int start_mp4_recording(const char *stream_name) {
     // Create output paths
     const config_t *global_config = get_streaming_config();
 
-    // Create timestamp for MP4 filename
-    char timestamp_str[32];
+    // Recording start time; prepare_mp4_recording_path() derives the filename
+    // and any month/day directories from it.
     time_t now = time(NULL);
-    struct tm tm_buf;
-    const struct tm *tm_info = localtime_r(&now, &tm_buf);
-    strftime(timestamp_str, sizeof(timestamp_str), "%Y%m%d_%H%M%S", tm_info);
 
-    // Sanitize the stream name so that names with spaces work correctly.
-    char encoded_name[MAX_STREAM_NAME];
-    sanitize_stream_name(stream_name, encoded_name, MAX_STREAM_NAME);
-
-    // Create MP4 directory path
-    char mp4_dir[MAX_PATH_LENGTH];
-    if (global_config->record_mp4_directly && global_config->mp4_storage_path[0] != '\0') {
-        // Use configured MP4 storage path if available
-        snprintf(mp4_dir, MAX_PATH_LENGTH, "%s/%s",
-                global_config->mp4_storage_path, encoded_name);
-    } else {
-        // Use mp4 directory parallel to hls, NOT inside it
-        snprintf(mp4_dir, MAX_PATH_LENGTH, "%s/mp4/%s",
-                global_config->storage_path, encoded_name);
-    }
-
-    // Create MP4 directory if it doesn't exist
-    int ret = mkdir_recursive(mp4_dir);
-    if (ret != 0) {
-        log_error("Failed to create MP4 directory: %s (return code: %d)", mp4_dir, ret);
-
-        // Try to create the parent directory first
-        char parent_dir[MAX_PATH_LENGTH];
-        if (global_config->record_mp4_directly && global_config->mp4_storage_path[0] != '\0') {
-            safe_strcpy(parent_dir, global_config->mp4_storage_path, MAX_PATH_LENGTH, 0);
-        } else {
-            snprintf(parent_dir, MAX_PATH_LENGTH, "%s/mp4", global_config->storage_path);
-        }
-
-        ret = mkdir_recursive(parent_dir);
-        if (ret != 0) {
-            log_error("Failed to create parent MP4 directory: %s (return code: %d)", parent_dir, ret);
-            free(ctx);
-            return -1;
-        }
-
-        // Try again to create the stream-specific directory
-        ret = mkdir_recursive(mp4_dir);
-        if (ret != 0) {
-            log_error("Still failed to create MP4 directory: %s (return code: %d)", mp4_dir, ret);
-            free(ctx);
-            return -1;
-        }
-    }
-
-    // Set appropriate permissions for MP4 directory (owner rwx, group/others rx)
-    if (chmod_path(mp4_dir, 0755) != 0) {
-        log_warn("Failed to set permissions on MP4 directory: %s", mp4_dir);
-    }
-
-    // Build the configured flat/month/day path. Existing flat recordings stay
-    // valid because playback uses the full path stored in the database.
-    if (prepare_mp4_recording_path(global_config, stream_name, now,
-                                   ctx->output_path, sizeof(ctx->output_path)) != 0) {
-        log_error("Failed to prepare MP4 output path for %s", stream_name);
+    if (prepare_placed_mp4_recording_path(
+            global_config, stream_name, now, ctx->output_path,
+            sizeof(ctx->output_path), &ctx->placement) != 0) {
+        log_error("Storage placement blocked MP4 output for %s (reason: %s)",
+                  stream_name, ctx->placement.reason);
+        publish_recording_slot(slot, NULL);
         free(ctx);
         return -1;
     }
@@ -741,12 +728,14 @@ int start_mp4_recording(const char *stream_name) {
     // Start recording thread and store context under the mutex
     pthread_mutex_lock(&recording_contexts_mutex);
     if (pthread_create(&ctx->thread, NULL, mp4_recording_thread, ctx) != 0) {
+        recording_slot_reserved[slot] = false;
         pthread_mutex_unlock(&recording_contexts_mutex);
         free(ctx);
         log_error("Failed to create MP4 recording thread for %s", stream_name);
         return -1;
     }
     recording_contexts[slot] = ctx;
+    recording_slot_reserved[slot] = false;
     pthread_mutex_unlock(&recording_contexts_mutex);
 
     log_info("Started MP4 recording for %s in slot %d", stream_name, slot);
@@ -812,25 +801,25 @@ int start_mp4_recording_with_url(const char *stream_name, const char *url) {
 
     // Find empty slot (under lock)
     pthread_mutex_lock(&recording_contexts_mutex);
-    int slot = -1;
-    for (int i = 0; i < g_config.max_streams; i++) {
-        if (!recording_contexts[i]) {
-            slot = i;
-            break;
-        }
-    }
+    int slot = reserve_recording_slot_locked();
 
     if (slot == -1) {
         pthread_mutex_unlock(&recording_contexts_mutex);
         log_error("No slot available for new MP4 recording");
         return -1;
     }
-    // Slot reserved — release the mutex before file I/O and context setup
+    // Slot reserved — release the mutex before file I/O and context setup.
+    // The reservation keeps a concurrent starter from claiming the same slot
+    // while it is still NULL in recording_contexts[].
     pthread_mutex_unlock(&recording_contexts_mutex);
 
     // Create context
     mp4_recording_ctx_t *ctx = malloc(sizeof(mp4_recording_ctx_t));
     if (!ctx) {
+        // Hand the reservation back: leaking it would retire the slot for the
+        // life of the process, so repeated allocation failures would leave the
+        // NVR unable to record even after memory recovers.
+        publish_recording_slot(slot, NULL);
         log_error("Memory allocation failed for MP4 recording context");
         return -1;
     }
@@ -849,66 +838,16 @@ int start_mp4_recording_with_url(const char *stream_name, const char *url) {
     // Create output paths
     const config_t *global_config = get_streaming_config();
 
-    // Create timestamp for MP4 filename
-    char timestamp_str[32];
+    // Recording start time; prepare_mp4_recording_path() derives the filename
+    // and any month/day directories from it.
     time_t now = time(NULL);
-    struct tm tm_buf;
-    const struct tm *tm_info = localtime_r(&now, &tm_buf);
-    strftime(timestamp_str, sizeof(timestamp_str), "%Y%m%d_%H%M%S", tm_info);
 
-    // Sanitize the stream name so that names with spaces work correctly.
-    char encoded_name[MAX_STREAM_NAME];
-    sanitize_stream_name(stream_name, encoded_name, MAX_STREAM_NAME);
-
-    // Create MP4 directory path
-    char mp4_dir[MAX_PATH_LENGTH];
-    if (global_config->record_mp4_directly && global_config->mp4_storage_path[0] != '\0') {
-        // Use configured MP4 storage path if available
-        snprintf(mp4_dir, MAX_PATH_LENGTH, "%s/%s",
-                global_config->mp4_storage_path, encoded_name);
-    } else {
-        // Use mp4 directory parallel to hls, NOT inside it
-        snprintf(mp4_dir, MAX_PATH_LENGTH, "%s/mp4/%s",
-                global_config->storage_path, encoded_name);
-    }
-
-    // Create MP4 directory if it doesn't exist
-    int ret = mkdir_recursive(mp4_dir);
-    if (ret != 0) {
-        log_error("Failed to create MP4 directory: %s (return code: %d)", mp4_dir, ret);
-
-        // Try to create the parent directory first
-        char parent_dir[MAX_PATH_LENGTH];
-        if (global_config->record_mp4_directly && global_config->mp4_storage_path[0] != '\0') {
-            safe_strcpy(parent_dir, global_config->mp4_storage_path, MAX_PATH_LENGTH, 0);
-        } else {
-            snprintf(parent_dir, MAX_PATH_LENGTH, "%s/mp4", global_config->storage_path);
-        }
-
-        ret = mkdir_recursive(parent_dir);
-        if (ret != 0) {
-            log_error("Failed to create parent MP4 directory: %s (return code: %d)", parent_dir, ret);
-            free(ctx);
-            return -1;
-        }
-
-        // Try again to create the stream-specific directory
-        ret = mkdir_recursive(mp4_dir);
-        if (ret != 0) {
-            log_error("Still failed to create MP4 directory: %s (return code: %d)", mp4_dir, ret);
-            free(ctx);
-            return -1;
-        }
-    }
-
-    // Set permissions for MP4 directory (owner rwx, group/others rx)
-    if (chmod_path(mp4_dir, 0755) != 0) {
-        log_warn("Failed to set permissions on MP4 directory: %s", mp4_dir);
-    }
-
-    if (prepare_mp4_recording_path(global_config, stream_name, now,
-                                   ctx->output_path, sizeof(ctx->output_path)) != 0) {
-        log_error("Failed to prepare MP4 output path for %s", stream_name);
+    if (prepare_placed_mp4_recording_path(
+            global_config, stream_name, now, ctx->output_path,
+            sizeof(ctx->output_path), &ctx->placement) != 0) {
+        log_error("Storage placement blocked MP4 output for %s (reason: %s)",
+                  stream_name, ctx->placement.reason);
+        publish_recording_slot(slot, NULL);
         free(ctx);
         return -1;
     }
@@ -916,12 +855,14 @@ int start_mp4_recording_with_url(const char *stream_name, const char *url) {
     // Start recording thread and store context under the mutex
     pthread_mutex_lock(&recording_contexts_mutex);
     if (pthread_create(&ctx->thread, NULL, mp4_recording_thread, ctx) != 0) {
+        recording_slot_reserved[slot] = false;
         pthread_mutex_unlock(&recording_contexts_mutex);
         free(ctx);
         log_error("Failed to create MP4 recording thread for %s", stream_name);
         return -1;
     }
     recording_contexts[slot] = ctx;
+    recording_slot_reserved[slot] = false;
     pthread_mutex_unlock(&recording_contexts_mutex);
 
     log_info("Started MP4 recording for %s in slot %d", stream_name, slot);
@@ -1059,25 +1000,25 @@ int start_mp4_recording_with_trigger(const char *stream_name, const char *trigge
 
     // Find empty slot (under lock)
     pthread_mutex_lock(&recording_contexts_mutex);
-    int slot = -1;
-    for (int i = 0; i < g_config.max_streams; i++) {
-        if (!recording_contexts[i]) {
-            slot = i;
-            break;
-        }
-    }
+    int slot = reserve_recording_slot_locked();
 
     if (slot == -1) {
         pthread_mutex_unlock(&recording_contexts_mutex);
         log_error("No slot available for new MP4 recording");
         return -1;
     }
-    // Slot reserved — release the mutex before file I/O and context setup
+    // Slot reserved — release the mutex before file I/O and context setup.
+    // The reservation keeps a concurrent starter from claiming the same slot
+    // while it is still NULL in recording_contexts[].
     pthread_mutex_unlock(&recording_contexts_mutex);
 
     // Create context
     mp4_recording_ctx_t *ctx = malloc(sizeof(mp4_recording_ctx_t));
     if (!ctx) {
+        // Hand the reservation back: leaking it would retire the slot for the
+        // life of the process, so repeated allocation failures would leave the
+        // NVR unable to record even after memory recovers.
+        publish_recording_slot(slot, NULL);
         log_error("Memory allocation failed for MP4 recording context");
         return -1;
     }
@@ -1093,43 +1034,16 @@ int start_mp4_recording_with_trigger(const char *stream_name, const char *trigge
     // Create output paths
     const config_t *global_config = get_streaming_config();
 
-    // Create timestamp for MP4 filename
-    char timestamp_str[32];
+    // Recording start time; prepare_mp4_recording_path() derives the filename
+    // and any month/day directories from it.
     time_t now = time(NULL);
-    struct tm tm_buf;
-    const struct tm *tm_info = localtime_r(&now, &tm_buf);
-    strftime(timestamp_str, sizeof(timestamp_str), "%Y%m%d_%H%M%S", tm_info);
 
-    // Sanitize the stream name so that names with spaces work correctly.
-    char encoded_name[MAX_STREAM_NAME];
-    sanitize_stream_name(stream_name, encoded_name, MAX_STREAM_NAME);
-
-    // Create MP4 directory path
-    char mp4_dir[MAX_PATH_LENGTH];
-    if (global_config->record_mp4_directly && global_config->mp4_storage_path[0] != '\0') {
-        snprintf(mp4_dir, MAX_PATH_LENGTH, "%s/%s",
-                global_config->mp4_storage_path, encoded_name);
-    } else {
-        snprintf(mp4_dir, MAX_PATH_LENGTH, "%s/mp4/%s",
-                global_config->storage_path, encoded_name);
-    }
-
-    // Create MP4 directory if it doesn't exist
-    int ret = mkdir_recursive(mp4_dir);
-    if (ret != 0) {
-        log_error("Failed to create MP4 directory: %s (return code: %d)", mp4_dir, ret);
-        free(ctx);
-        return -1;
-    }
-
-    // Set permissions for MP4 directory (owner rwx, group/others rx)
-    if (chmod_path(mp4_dir, 0755) != 0) {
-        log_warn("Failed to set permissions on MP4 directory: %s", mp4_dir);
-    }
-
-    if (prepare_mp4_recording_path(global_config, stream_name, now,
-                                   ctx->output_path, sizeof(ctx->output_path)) != 0) {
-        log_error("Failed to prepare MP4 output path for %s", stream_name);
+    if (prepare_placed_mp4_recording_path(
+            global_config, stream_name, now, ctx->output_path,
+            sizeof(ctx->output_path), &ctx->placement) != 0) {
+        log_error("Storage placement blocked MP4 output for %s (reason: %s)",
+                  stream_name, ctx->placement.reason);
+        publish_recording_slot(slot, NULL);
         free(ctx);
         return -1;
     }
@@ -1137,12 +1051,14 @@ int start_mp4_recording_with_trigger(const char *stream_name, const char *trigge
     // Start recording thread and store context under the mutex
     pthread_mutex_lock(&recording_contexts_mutex);
     if (pthread_create(&ctx->thread, NULL, mp4_recording_thread, ctx) != 0) {
+        recording_slot_reserved[slot] = false;
         pthread_mutex_unlock(&recording_contexts_mutex);
         free(ctx);
         log_error("Failed to create MP4 recording thread for %s", stream_name);
         return -1;
     }
     recording_contexts[slot] = ctx;
+    recording_slot_reserved[slot] = false;
     pthread_mutex_unlock(&recording_contexts_mutex);
 
     log_info("Started MP4 recording for %s in slot %d with trigger_type: %s",
@@ -1219,25 +1135,25 @@ int start_mp4_recording_with_url_and_trigger(const char *stream_name, const char
 
     // Find empty slot (under lock)
     pthread_mutex_lock(&recording_contexts_mutex);
-    int slot = -1;
-    for (int i = 0; i < g_config.max_streams; i++) {
-        if (!recording_contexts[i]) {
-            slot = i;
-            break;
-        }
-    }
+    int slot = reserve_recording_slot_locked();
 
     if (slot == -1) {
         pthread_mutex_unlock(&recording_contexts_mutex);
         log_error("No slot available for new MP4 recording");
         return -1;
     }
-    // Slot reserved — release the mutex before file I/O and context setup
+    // Slot reserved — release the mutex before file I/O and context setup.
+    // The reservation keeps a concurrent starter from claiming the same slot
+    // while it is still NULL in recording_contexts[].
     pthread_mutex_unlock(&recording_contexts_mutex);
 
     // Create context
     mp4_recording_ctx_t *ctx = malloc(sizeof(mp4_recording_ctx_t));
     if (!ctx) {
+        // Hand the reservation back: leaking it would retire the slot for the
+        // life of the process, so repeated allocation failures would leave the
+        // NVR unable to record even after memory recovers.
+        publish_recording_slot(slot, NULL);
         log_error("Memory allocation failed for MP4 recording context");
         return -1;
     }
@@ -1253,43 +1169,16 @@ int start_mp4_recording_with_url_and_trigger(const char *stream_name, const char
     // Create output paths
     const config_t *global_config = get_streaming_config();
 
-    // Create timestamp for MP4 filename
-    char timestamp_str[32];
+    // Recording start time; prepare_mp4_recording_path() derives the filename
+    // and any month/day directories from it.
     time_t now = time(NULL);
-    struct tm tm_buf;
-    const struct tm *tm_info = localtime_r(&now, &tm_buf);
-    strftime(timestamp_str, sizeof(timestamp_str), "%Y%m%d_%H%M%S", tm_info);
 
-    // Sanitize the stream name so that names with spaces work correctly.
-    char encoded_name[MAX_STREAM_NAME];
-    sanitize_stream_name(stream_name, encoded_name, MAX_STREAM_NAME);
-
-    // Create MP4 directory path
-    char mp4_dir[MAX_PATH_LENGTH];
-    if (global_config->record_mp4_directly && global_config->mp4_storage_path[0] != '\0') {
-        snprintf(mp4_dir, MAX_PATH_LENGTH, "%s/%s",
-                global_config->mp4_storage_path, encoded_name);
-    } else {
-        snprintf(mp4_dir, MAX_PATH_LENGTH, "%s/mp4/%s",
-                global_config->storage_path, encoded_name);
-    }
-
-    // Create MP4 directory if it doesn't exist
-    int ret = mkdir_recursive(mp4_dir);
-    if (ret != 0) {
-        log_error("Failed to create MP4 directory: %s (return code: %d)", mp4_dir, ret);
-        free(ctx);
-        return -1;
-    }
-
-    // Set permissions for MP4 directory (owner rwx, group/others rx)
-    if (chmod_path(mp4_dir, 0755) != 0) {
-        log_warn("Failed to set permissions on MP4 directory: %s", mp4_dir);
-    }
-
-    if (prepare_mp4_recording_path(global_config, stream_name, now,
-                                   ctx->output_path, sizeof(ctx->output_path)) != 0) {
-        log_error("Failed to prepare MP4 output path for %s", stream_name);
+    if (prepare_placed_mp4_recording_path(
+            global_config, stream_name, now, ctx->output_path,
+            sizeof(ctx->output_path), &ctx->placement) != 0) {
+        log_error("Storage placement blocked MP4 output for %s (reason: %s)",
+                  stream_name, ctx->placement.reason);
+        publish_recording_slot(slot, NULL);
         free(ctx);
         return -1;
     }
@@ -1297,12 +1186,14 @@ int start_mp4_recording_with_url_and_trigger(const char *stream_name, const char
     // Start recording thread and store context under the mutex
     pthread_mutex_lock(&recording_contexts_mutex);
     if (pthread_create(&ctx->thread, NULL, mp4_recording_thread, ctx) != 0) {
+        recording_slot_reserved[slot] = false;
         pthread_mutex_unlock(&recording_contexts_mutex);
         free(ctx);
         log_error("Failed to create MP4 recording thread for %s", stream_name);
         return -1;
     }
     recording_contexts[slot] = ctx;
+    recording_slot_reserved[slot] = false;
     pthread_mutex_unlock(&recording_contexts_mutex);
 
     log_info("Started MP4 recording for %s in slot %d with trigger_type: %s",
