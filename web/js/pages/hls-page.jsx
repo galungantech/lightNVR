@@ -20,6 +20,8 @@ import { AuthGate } from '../components/preact/AuthGate.jsx';
  */
 function App() {
     const [viewFlags, setViewFlags] = useState({
+        audioDisabled: false,
+        autoDisabled: false,
         webrtcDisabled: false,
         hlsDisabled: false,
         mseDisabled: false,
@@ -40,6 +42,8 @@ function App() {
                 const settings = await response.json();
                 const go2rtcOff = settings.go2rtc_enabled === false;
                 setViewFlags({
+                    audioDisabled:  !!settings.audio_disabled,
+                    autoDisabled:   !!settings.auto_disabled,
                     webrtcDisabled: !!settings.webrtc_disabled || go2rtcOff,
                     hlsDisabled:    !!settings.hls_disabled,
                     mseDisabled:    !!settings.mse_disabled  || go2rtcOff,
@@ -63,6 +67,8 @@ function App() {
             <Header />
             <ToastContainer />
             <LiveView
+                audioDisabled={viewFlags.audioDisabled}
+                isAutoDisabled={viewFlags.autoDisabled}
                 isWebRTCDisabled={viewFlags.webrtcDisabled}
                 isHlsDisabled={viewFlags.hlsDisabled}
                 isMseDisabled={viewFlags.mseDisabled}

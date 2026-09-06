@@ -50,7 +50,8 @@ static bool sensitive_detail_key(const char *key) {
         contains_case_insensitive(key, "authorization") ||
         contains_case_insensitive(key, "cookie") ||
         contains_case_insensitive(key, "api_key") ||
-        contains_case_insensitive(key, "apikey")) {
+        contains_case_insensitive(key, "apikey") ||
+        contains_case_insensitive(key, "plate")) {
         return true;
     }
     return contains_case_insensitive(key, "token") &&
@@ -329,6 +330,14 @@ static const char *camera_configuration_operation(
         (void)path_segment(path, "/api/locations/", identity, identity_size);
         if (strcmp(method, "PUT") == 0) return "location.update";
         if (strcmp(method, "DELETE") == 0) return "location.delete";
+    }
+    if (strncmp(path, "/api/live/plans", 15) == 0) {
+        safe_strcpy(target_type, "operator_floor_plan", target_type_size, 0);
+        if (strcmp(path, "/api/live/plans") == 0 &&
+            strcmp(method, "POST") == 0) return "operator_floor_plan.create";
+        (void)path_segment(path, "/api/live/plans/", identity, identity_size);
+        if (strcmp(method, "PUT") == 0) return "operator_floor_plan.update";
+        if (strcmp(method, "DELETE") == 0) return "operator_floor_plan.delete";
     }
     if (strncmp(path, "/api/camera-tags", 16) == 0) {
         safe_strcpy(target_type, "camera_tag", target_type_size, 0);

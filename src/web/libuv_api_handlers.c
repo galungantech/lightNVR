@@ -16,6 +16,7 @@
 #include "web/api_handlers_health.h"
 #include "web/api_handlers_settings.h"
 #include "web/api_handlers_system.h"
+#include "web/api_handlers_system_health.h"
 #include "web/api_handlers_zones.h"
 #include "web/api_handlers_ptz.h"
 #include "web/api_handlers_imaging.h"
@@ -52,6 +53,11 @@
 #include "web/api_handlers_storage_policies.h"
 #include "web/api_handlers_storage_pools.h"
 #include "web/api_handlers_storage_compliance.h"
+#include "web/api_handlers_workspaces.h"
+#include "web/api_handlers_live_layouts.h"
+#include "web/api_handlers_operator_floor_plans.h"
+#include "web/api_handlers_lpr.h"
+#include "web/api_handlers_detection_engines.h"
 #define LOG_COMPONENT "HTTP"
 #include "core/logger.h"
 #include "core/config.h"
@@ -109,6 +115,25 @@ int register_all_libuv_handlers(http_server_handle_t server) {
     http_server_register_handler(server, "/api/cameras/#/location", "PUT",
                                  handle_put_camera_location);
 
+    // Shared spatial plans for the operator Live workspace.
+    http_server_register_handler(server, "/api/live/plans", "GET",
+                                 handle_get_operator_floor_plans);
+    http_server_register_handler(server, "/api/live/plans", "POST",
+                                 handle_post_operator_floor_plan);
+    // Specific child routes must precede the single-plan wildcard routes.
+    http_server_register_handler(server, "/api/live/plans/#/background", "GET",
+                                 handle_get_operator_floor_plan_background);
+    http_server_register_handler(server, "/api/live/plans/#/background", "PUT",
+                                 handle_put_operator_floor_plan_background);
+    http_server_register_handler(server, "/api/live/plans/#/background",
+                                 "DELETE",
+                                 handle_delete_operator_floor_plan_background);
+    http_server_register_handler(server, "/api/live/plans/#", "GET",
+                                 handle_get_operator_floor_plan);
+    http_server_register_handler(server, "/api/live/plans/#", "PUT",
+                                 handle_put_operator_floor_plan);
+    http_server_register_handler(server, "/api/live/plans/#", "DELETE",
+                                 handle_delete_operator_floor_plan);
     // Normalized camera tag dictionary and UUID-based assignments
     http_server_register_handler(server, "/api/camera-tags", "GET",
                                  handle_get_camera_tags);
@@ -143,6 +168,16 @@ int register_all_libuv_handlers(http_server_handle_t server) {
     http_server_register_handler(server, "/api/fleet/views/#", "DELETE",
                                  handle_delete_fleet_saved_view);
 
+    // Per-user and administrator-shared operator Live layouts
+    http_server_register_handler(server, "/api/live/layouts", "GET",
+                                 handle_get_live_layouts);
+    http_server_register_handler(server, "/api/live/layouts", "POST",
+                                 handle_post_live_layout);
+    http_server_register_handler(server, "/api/live/layouts/#", "PUT",
+                                 handle_put_live_layout);
+    http_server_register_handler(server, "/api/live/layouts/#", "DELETE",
+                                 handle_delete_live_layout);
+
     // Saved static and selector-backed smart camera collections
     http_server_register_handler(server, "/api/camera-collections", "GET",
                                  handle_get_camera_collections);
@@ -175,6 +210,10 @@ int register_all_libuv_handlers(http_server_handle_t server) {
     // Stream Retention API
     http_server_register_handler(server, "/api/streams/#/retention", "GET", handle_get_stream_retention);
     http_server_register_handler(server, "/api/streams/#/retention", "PUT", handle_put_stream_retention);
+    http_server_register_handler(server, "/api/streams/#/detection-engines", "GET",
+                                 handle_get_detection_engines);
+    http_server_register_handler(server, "/api/streams/#/detection-engines", "PUT",
+                                 handle_put_detection_engines);
 
     // Stream Refresh API
     http_server_register_handler(server, "/api/streams/#/refresh", "POST", handle_post_stream_refresh);
@@ -211,6 +250,10 @@ int register_all_libuv_handlers(http_server_handle_t server) {
     http_server_register_handler(server, "/api/settings", "POST", handle_post_settings);
     http_server_register_handler(server, "/api/settings/go2rtc/validate", "POST",
                                  handle_post_settings_go2rtc_validate);
+    http_server_register_handler(server, "/api/ui/workspaces", "GET",
+                                 handle_get_ui_workspaces);
+    http_server_register_handler(server, "/api/ui/workspaces", "PUT",
+                                 handle_put_ui_workspaces);
 
     // ICE Servers API (WebRTC TURN/STUN configuration)
     http_server_register_handler(server, "/api/ice-servers", "GET", handle_get_ice_servers);
@@ -218,6 +261,10 @@ int register_all_libuv_handlers(http_server_handle_t server) {
     // System API
     http_server_register_handler(server, "/api/system", "GET", handle_get_system_info);
     http_server_register_handler(server, "/api/system/info", "GET", handle_get_system_info);
+    http_server_register_handler(server, "/api/system/health/incidents", "GET",
+                                 handle_get_system_health_incidents);
+    http_server_register_handler(server, "/api/system/health", "GET",
+                                 handle_get_system_health);
     http_server_register_handler(server, "/api/system/logs", "GET", handle_get_system_logs);
     http_server_register_handler(server, "/api/system/restart", "POST", handle_post_system_restart);
     http_server_register_handler(server, "/api/system/shutdown", "POST", handle_post_system_shutdown);
@@ -234,6 +281,9 @@ int register_all_libuv_handlers(http_server_handle_t server) {
     // Detection API
     http_server_register_handler(server, "/api/detection/results/#", "GET", handle_get_detection_results);
     http_server_register_handler(server, "/api/detection/models", "GET", handle_get_detection_models);
+    http_server_register_handler(server, "/api/lpr/search", "POST", handle_post_lpr_search);
+    http_server_register_handler(server, "/api/lpr/export", "POST", handle_post_lpr_export);
+    http_server_register_handler(server, "/api/lpr/reads/#", "DELETE", handle_delete_lpr_read);
     // Detection event snapshots (saved on MQTT publish, see issue #449)
     http_server_register_handler(server, "/api/snapshots/#/#", "GET", handle_get_detection_snapshot);
 
@@ -422,6 +472,7 @@ int register_all_libuv_handlers(http_server_handle_t server) {
     http_server_register_handler(server, "/api/timeline/manifest", "GET", handle_timeline_manifest);
     http_server_register_handler(server, "/api/timeline/play", "GET", handle_timeline_playback);
     http_server_register_handler(server, "/api/investigations/timeline", "POST", handle_post_investigation_timeline);
+    http_server_register_handler(server, "/api/investigations/segment-at", "POST", handle_post_investigation_segment_at);
     http_server_register_handler(server, "/api/investigations/search", "POST", handle_post_investigation_search);
     http_server_register_handler(server, "/api/investigations/recordings/preview", "POST", handle_post_investigation_recording_preview);
     http_server_register_handler(server, "/api/investigations/thumbnail-samples", "POST", handle_post_investigation_thumbnail_samples);

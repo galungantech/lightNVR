@@ -9,6 +9,7 @@
 #include "web/api_handlers.h"
 #include "web/request_response.h"
 #include "web/httpd_utils.h"
+#include "web/fleet_health.h"
 #define LOG_COMPONENT "StreamsAPI"
 #include "core/logger.h"
 #include "core/config.h"
@@ -32,8 +33,8 @@
  * When go2rtc manages streams the stream-state manager stays at INACTIVE
  * (STOPPED) because start_stream_with_state() is not called on startup.
  * This helper consults the Unified Detection Thread (UDT) to obtain a more
- * accurate status, then falls back to RUNNING when the UDT is not active
- * but go2rtc is initialized and the stream is enabled.
+ * accurate status. An open go2rtc session alone is not evidence of usable
+ * video, so a missing/stopped producer remains STOPPED.
  */
 static stream_status_t resolve_effective_stream_status(stream_status_t raw_status,
                                                        const char *stream_name,
@@ -45,9 +46,7 @@ static stream_status_t resolve_effective_stream_status(stream_status_t raw_statu
         if (udt_status != STREAM_STATUS_STOPPED) {
             return udt_status;
         }
-        /* UDT not running / already stopped — default to RUNNING since go2rtc
-         * is initialized and the stream is enabled. */
-        return STREAM_STATUS_RUNNING;
+        return STREAM_STATUS_STOPPED;
     }
     return raw_status;
 }
@@ -115,14 +114,308 @@ static const fleet_camera_t *find_loaded_camera(
     const fleet_camera_t *cameras, int camera_count,
     const stream_config_t *config) {
     if (!cameras || !config) return NULL;
-    for (int i = 0; i < camera_count; i++) {
-        if ((config->camera_uuid[0] != '\0' &&
-             strcmp(cameras[i].camera_uuid, config->camera_uuid) == 0) ||
-            strcmp(cameras[i].name, config->name) == 0) {
+    if (config->camera_uuid[0] != '\0') {
+        int low = 0;
+        int high = camera_count - 1;
+        while (low <= high) {
+            int middle = low + (high - low) / 2;
+            int comparison = strcmp(cameras[middle].camera_uuid,
+                                    config->camera_uuid);
+            if (comparison == 0) return &cameras[middle];
+            if (comparison < 0) low = middle + 1;
+            else high = middle - 1;
+        }
+    }
+    /* Legacy rows may predate camera UUIDs. Keep the name fallback isolated
+     * to those exceptional records instead of scanning for every camera. */
+    for (int i = 0; config->camera_uuid[0] == '\0' && i < camera_count; i++) {
+        if (strcmp(cameras[i].name, config->name) == 0) {
             return &cameras[i];
         }
     }
     return NULL;
+}
+
+typedef struct {
+    const stream_config_t *config;
+    const fleet_camera_t *camera;
+    bool can_configure;
+} stream_summary_row_t;
+
+static _Thread_local char stream_summary_sort[24];
+static _Thread_local bool stream_summary_descending;
+
+static const char *summary_status(const fleet_camera_t *camera) {
+    if (!camera || !camera->enabled) return "Stopped";
+    switch (camera->health) {
+        case FLEET_HEALTH_UP: return "Running";
+        case FLEET_HEALTH_DEGRADED: return "Degraded";
+        case FLEET_HEALTH_DOWN: return "Error";
+        case FLEET_HEALTH_DISABLED: return "Stopped";
+        case FLEET_HEALTH_UNKNOWN: default: return "Unknown";
+    }
+}
+
+static int compare_stream_summaries(const void *left_ptr,
+                                    const void *right_ptr) {
+    const stream_summary_row_t *left = left_ptr;
+    const stream_summary_row_t *right = right_ptr;
+    int result = 0;
+    if (strcmp(stream_summary_sort, "status") == 0) {
+        result = strcasecmp(summary_status(left->camera),
+                            summary_status(right->camera));
+    } else if (strcmp(stream_summary_sort, "resolution") == 0) {
+        int64_t left_pixels =
+            (int64_t)left->config->width * left->config->height;
+        int64_t right_pixels =
+            (int64_t)right->config->width * right->config->height;
+        result = left_pixels < right_pixels ? -1 : left_pixels > right_pixels;
+    } else if (strcmp(stream_summary_sort, "fps") == 0) {
+        result = left->config->fps - right->config->fps;
+    } else if (strcmp(stream_summary_sort, "recording") == 0) {
+        result = (int)left->config->record - (int)right->config->record;
+    } else {
+        result = strcasecmp(left->config->name, right->config->name);
+    }
+    if (result == 0) {
+        result = strcasecmp(left->config->name, right->config->name);
+    }
+    return stream_summary_descending ? -result : result;
+}
+
+static bool contains_case_insensitive(const char *text, const char *needle) {
+    if (!needle || needle[0] == '\0') return true;
+    if (!text) return false;
+    size_t length = strlen(needle);
+    for (const char *cursor = text; *cursor; cursor++) {
+        if (strncasecmp(cursor, needle, length) == 0) return true;
+    }
+    return false;
+}
+
+static bool stream_summary_matches(const stream_config_t *config,
+                                   const fleet_camera_t *camera,
+                                   const char *search) {
+    return !search || search[0] == '\0' ||
+           contains_case_insensitive(config->name, search) ||
+           contains_case_insensitive(config->camera_uuid, search) ||
+           contains_case_insensitive(config->tags, search) ||
+           (camera &&
+            (contains_case_insensitive(camera->location_path, search) ||
+             contains_case_insensitive(camera->address, search)));
+}
+
+static bool parse_summary_positive_int(const http_request_t *req,
+                                       const char *name, int fallback,
+                                       int maximum, int *value) {
+    char text[32] = {0};
+    if (http_request_get_query_param(req, name, text, sizeof(text)) < 0) {
+        *value = fallback;
+        return true;
+    }
+    char *end = NULL;
+    long parsed = strtol(text, &end, 10);
+    if (!text[0] || !end || *end != '\0' || parsed < 1 || parsed > maximum) {
+        return false;
+    }
+    *value = (int)parsed;
+    return true;
+}
+
+static int handle_get_stream_summaries(
+    const http_request_t *req, http_response_t *res, const user_t *user,
+    authorization_context_t *authz_context, stream_config_t *db_streams,
+    int stream_count, fleet_camera_t *fleet_cameras, int fleet_camera_count) {
+    int page = 1;
+    int page_size = 50;
+    if (!parse_summary_positive_int(req, "page", 1, 1000000, &page) ||
+        !parse_summary_positive_int(req, "page_size", 50, 100, &page_size)) {
+        http_response_set_json_error(
+            res, 400, "page and page_size must be positive; page_size max is 100");
+        return -1;
+    }
+    char search[256] = {0};
+    char sort_by[24] = "name";
+    char sort_order[8] = "asc";
+    char surface[16] = "admin";
+    char availability[24] = "all";
+    char include_admin_url_param[8] = {0};
+    http_request_get_query_param(req, "search", search, sizeof(search));
+    http_request_get_query_param(req, "sort_by", sort_by, sizeof(sort_by));
+    http_request_get_query_param(req, "sort_order", sort_order,
+                                 sizeof(sort_order));
+    http_request_get_query_param(req, "surface", surface, sizeof(surface));
+    http_request_get_query_param(req, "availability", availability,
+                                 sizeof(availability));
+    bool include_admin_url =
+        http_request_get_query_param(
+            req, "include_admin_url", include_admin_url_param,
+            sizeof(include_admin_url_param)) > 0 &&
+        (strcmp(include_admin_url_param, "true") == 0 ||
+         strcmp(include_admin_url_param, "1") == 0);
+    if (strcmp(sort_by, "name") != 0 && strcmp(sort_by, "status") != 0 &&
+        strcmp(sort_by, "resolution") != 0 && strcmp(sort_by, "fps") != 0 &&
+        strcmp(sort_by, "recording") != 0) {
+        http_response_set_json_error(res, 400, "Invalid stream summary sort field");
+        return -1;
+    }
+    if (strcmp(sort_order, "asc") != 0 && strcmp(sort_order, "desc") != 0) {
+        http_response_set_json_error(res, 400, "sort_order must be asc or desc");
+        return -1;
+    }
+    bool live_surface = strcmp(surface, "live") == 0;
+    if (!live_surface && strcmp(surface, "admin") != 0) {
+        http_response_set_json_error(res, 400,
+                                     "surface must be admin or live");
+        return -1;
+    }
+    if (strcmp(availability, "all") != 0 &&
+        strcmp(availability, "live") != 0 &&
+        strcmp(availability, "offline") != 0 &&
+        strcmp(availability, "never_connected") != 0 &&
+        strcmp(availability, "disabled") != 0) {
+        http_response_set_json_error(res, 400,
+                                     "Invalid availability value");
+        return -1;
+    }
+
+    stream_summary_row_t *rows = calloc((size_t)stream_count, sizeof(*rows));
+    if (!rows) {
+        http_response_set_json_error(res, 500, "Out of memory");
+        return -1;
+    }
+    int row_count = 0;
+    for (int i = 0; i < stream_count; i++) {
+        const fleet_camera_t *camera = find_loaded_camera(
+            fleet_cameras, fleet_camera_count, &db_streams[i]);
+        authorization_evaluation_t live = {0};
+        authorization_evaluation_t configure = {0};
+        if (!camera || authorization_evaluate_in_context(
+                authz_context, user, AUTHZ_LIVE_VIEW, camera, &live) != 0 ||
+            authorization_evaluate_in_context(
+                authz_context, user, AUTHZ_CAMERA_CONFIGURE, camera,
+                &configure) != 0) {
+            free(rows);
+            http_response_set_json_error(
+                res, 500, "Authorization policy evaluation failed");
+            return -1;
+        }
+        if (live.decision != AUTHZ_DECISION_ALLOW ||
+            !stream_summary_matches(&db_streams[i], camera, search) ||
+            (strcmp(availability, "all") != 0 &&
+             strcmp(availability, fleet_availability_state_name(
+                        camera->availability)) != 0)) {
+            continue;
+        }
+        rows[row_count++] = (stream_summary_row_t){
+            .config = &db_streams[i],
+            .camera = camera,
+            .can_configure = configure.decision == AUTHZ_DECISION_ALLOW,
+        };
+    }
+    safe_strcpy(stream_summary_sort, sort_by, sizeof(stream_summary_sort), 0);
+    stream_summary_descending = strcmp(sort_order, "desc") == 0;
+    if (row_count > 1) {
+        qsort(rows, (size_t)row_count, sizeof(*rows),
+              compare_stream_summaries);
+    }
+
+    cJSON *root = cJSON_CreateObject();
+    cJSON *items = root ? cJSON_AddArrayToObject(root, "streams") : NULL;
+    if (!root || !items) {
+        cJSON_Delete(root);
+        free(rows);
+        http_response_set_json_error(res, 500, "Failed to create stream summaries");
+        return -1;
+    }
+    int64_t offset64 = (int64_t)(page - 1) * page_size;
+    int offset = offset64 > row_count ? row_count : (int)offset64;
+    int end = offset + page_size;
+    if (end > row_count) end = row_count;
+    for (int i = offset; i < end; i++) {
+        const stream_config_t *config = rows[i].config;
+        const fleet_camera_t *camera = rows[i].camera;
+        cJSON *item = cJSON_CreateObject();
+        if (!item) continue;
+        cJSON_AddStringToObject(item, "camera_uuid", config->camera_uuid);
+        cJSON_AddStringToObject(item, "location_uuid", config->location_uuid);
+        cJSON_AddStringToObject(item, "location_name", camera->location_name);
+        cJSON_AddStringToObject(item, "location_path", camera->location_path);
+        cJSON_AddStringToObject(item, "name", config->name);
+        cJSON_AddBoolToObject(item, "enabled", config->enabled);
+        cJSON_AddNumberToObject(item, "width", config->width);
+        cJSON_AddNumberToObject(item, "height", config->height);
+        cJSON_AddNumberToObject(item, "fps", config->fps);
+        cJSON_AddStringToObject(item, "codec", config->codec);
+        cJSON_AddNumberToObject(item, "protocol", (int)config->protocol);
+        cJSON_AddBoolToObject(item, "record", config->record);
+        cJSON_AddBoolToObject(item, "record_on_schedule",
+                              config->record_on_schedule);
+        cJSON_AddBoolToObject(item, "detection_based_recording",
+                              config->detection_based_recording);
+        cJSON_AddBoolToObject(item, "isOnvif", config->is_onvif);
+        cJSON_AddStringToObject(item, "tags", config->tags);
+        cJSON_AddStringToObject(item, "status", summary_status(camera));
+        cJSON_AddStringToObject(
+            item, "availability",
+            fleet_availability_state_name(camera->availability));
+        cJSON_AddNumberToObject(item, "first_video_at",
+                                (double)camera->first_video_at);
+        cJSON_AddNumberToObject(item, "last_frame_ts",
+                                (double)camera->last_frame_ts);
+        cJSON_AddNumberToObject(item, "current_fps", camera->current_fps);
+        cJSON_AddBoolToObject(item, "recording_active",
+                              camera->recording_active);
+        cJSON_AddNumberToObject(item, "last_recording_at",
+                                (double)camera->last_recording_at);
+        cJSON_AddBoolToObject(item, "can_configure", rows[i].can_configure);
+        if (!live_surface && include_admin_url) {
+            cJSON_AddStringToObject(
+                item, "admin_url",
+                rows[i].can_configure ? config->admin_url : "");
+        }
+        if (live_surface) {
+            cJSON_AddBoolToObject(item, "streaming_enabled",
+                                  config->streaming_enabled);
+            cJSON_AddStringToObject(
+                item, "playback_transport",
+                playback_transport_is_valid(config->playback_transport)
+                    ? config->playback_transport : "auto");
+            cJSON_AddStringToObject(item, "eptz_config", config->eptz_config);
+            cJSON_AddStringToObject(item, "detection_model",
+                                    config->detection_model);
+            cJSON_AddBoolToObject(item, "privacy_mode", config->privacy_mode);
+            cJSON_AddBoolToObject(item, "can_control_privacy",
+                                  rows[i].can_configure);
+            cJSON_AddBoolToObject(item, "has_sub_stream",
+                                  config->sub_stream_url[0] != '\0');
+            cJSON_AddBoolToObject(item, "ptz_enabled", config->ptz_enabled);
+            cJSON_AddBoolToObject(item, "backchannel_enabled",
+                                  config->backchannel_enabled);
+            cJSON_AddBoolToObject(
+                item, "go2rtc_hls_available",
+                go2rtc_integration_is_using_go2rtc_for_hls(config->name));
+        }
+        cJSON_AddItemToArray(items, item);
+    }
+    cJSON_AddNumberToObject(root, "total", row_count);
+    cJSON_AddNumberToObject(root, "page", page);
+    cJSON_AddNumberToObject(root, "page_size", page_size);
+    cJSON_AddNumberToObject(root, "total_pages",
+                            row_count == 0 ? 0 :
+                            (row_count + page_size - 1) / page_size);
+    char *encoded = cJSON_PrintUnformatted(root);
+    if (!encoded) {
+        cJSON_Delete(root);
+        free(rows);
+        http_response_set_json_error(res, 500, "Failed to encode stream summaries");
+        return -1;
+    }
+    http_response_set_json(res, 200, encoded);
+    free(encoded);
+    cJSON_Delete(root);
+    free(rows);
+    return 0;
 }
 
 /**
@@ -171,6 +464,27 @@ void handle_get_streams(const http_request_t *req, http_response_t *res) {
         free(db_streams);
         authorization_context_free(authz_context);
         http_response_set_json_error(res, 500, "Failed to load camera inventory");
+        return;
+    }
+    /* Build runtime health once for both the summary and compatibility
+     * contracts. This is keyed by stream name internally, so the legacy list
+     * no longer performs a linear runtime lookup for every camera. */
+    fleet_camera_enrich_runtime_health(fleet_cameras, fleet_camera_count);
+    fleet_health_enrich_go2rtc_activity(fleet_cameras, fleet_camera_count);
+
+    char summary_param[8] = {0};
+    bool summary_request =
+        http_request_get_query_param(req, "summary", summary_param,
+                                     sizeof(summary_param)) > 0 &&
+        (strcmp(summary_param, "true") == 0 ||
+         strcmp(summary_param, "1") == 0);
+    if (summary_request) {
+        handle_get_stream_summaries(
+            req, res, &auth_user, authz_context, db_streams, count,
+            fleet_cameras, fleet_camera_count);
+        free(fleet_cameras);
+        free(db_streams);
+        authorization_context_free(authz_context);
         return;
     }
 
@@ -240,6 +554,7 @@ void handle_get_streams(const http_request_t *req, http_response_t *res) {
         cJSON_AddStringToObject(stream_obj, "playback_transport",
                                 playback_transport_is_valid(db_streams[i].playback_transport)
                                     ? db_streams[i].playback_transport : "auto");
+        cJSON_AddStringToObject(stream_obj, "eptz_config", db_streams[i].eptz_config);
         cJSON_AddNumberToObject(stream_obj, "width", db_streams[i].width);
         cJSON_AddNumberToObject(stream_obj, "height", db_streams[i].height);
         cJSON_AddNumberToObject(stream_obj, "fps", db_streams[i].fps);
@@ -319,25 +634,28 @@ void handle_get_streams(const http_request_t *req, http_response_t *res) {
         cJSON_AddStringToObject(stream_obj, "publish_url",
                                 expose_sensitive_config ? db_streams[i].publish_url : "");
 
-        // Get stream status
-        stream_handle_t stream = get_stream_by_name(db_streams[i].name);
-        const char *status = "Unknown";
-        if (stream) {
-            stream_status_t stream_status = get_stream_status(stream);
+        /* Prefer frame-derived fleet health. An open session (or advancing
+         * audio alone) is not sufficient evidence that video is usable. */
+        const char *status = summary_status(camera);
+        if (camera->health == FLEET_HEALTH_UNKNOWN && db_streams[i].enabled) {
+            stream_handle_t stream = get_stream_by_name(db_streams[i].name);
+            status = "Unknown";
+            if (stream) {
+                stream_status_t stream_status = get_stream_status(stream);
 
-            // Resolve the effective status using UDT state when go2rtc manages
-            // streams (state manager stays INACTIVE/STOPPED at startup).
-            stream_status = resolve_effective_stream_status(
-                stream_status, db_streams[i].name, db_streams[i].enabled);
+                // Resolve effective status when go2rtc manages the stream.
+                stream_status = resolve_effective_stream_status(
+                    stream_status, db_streams[i].name, db_streams[i].enabled);
 
-            switch (stream_status) {
-                case STREAM_STATUS_STOPPED:       status = "Stopped";      break;
-                case STREAM_STATUS_STARTING:      status = "Starting";     break;
-                case STREAM_STATUS_RUNNING:       status = "Running";      break;
-                case STREAM_STATUS_STOPPING:      status = "Stopping";     break;
-                case STREAM_STATUS_ERROR:         status = "Error";        break;
-                case STREAM_STATUS_RECONNECTING:  status = "Reconnecting"; break;
-                default:                          status = "Unknown";      break;
+                switch (stream_status) {
+                    case STREAM_STATUS_STOPPED:       status = "Stopped";      break;
+                    case STREAM_STATUS_STARTING:      status = "Starting";     break;
+                    case STREAM_STATUS_RUNNING:       status = "Running";      break;
+                    case STREAM_STATUS_STOPPING:      status = "Stopping";     break;
+                    case STREAM_STATUS_ERROR:         status = "Error";        break;
+                    case STREAM_STATUS_RECONNECTING:  status = "Reconnecting"; break;
+                    default:                          status = "Unknown";      break;
+                }
             }
         }
         cJSON_AddStringToObject(stream_obj, "status", status);
@@ -425,6 +743,7 @@ void handle_get_stream(const http_request_t *req, http_response_t *res) {
             &live_evaluation)) {
         return;
     }
+    fleet_camera_enrich_runtime_health(&camera, 1);
     const bool expose_sensitive_config =
         stream_user_can_modify(&auth_user, &camera);
 
@@ -454,6 +773,7 @@ void handle_get_stream(const http_request_t *req, http_response_t *res) {
     cJSON_AddStringToObject(stream_obj, "playback_transport",
                             playback_transport_is_valid(config.playback_transport)
                                 ? config.playback_transport : "auto");
+    cJSON_AddStringToObject(stream_obj, "eptz_config", config.eptz_config);
     cJSON_AddNumberToObject(stream_obj, "width", config.width);
     cJSON_AddNumberToObject(stream_obj, "height", config.height);
     cJSON_AddNumberToObject(stream_obj, "fps", config.fps);
@@ -535,19 +855,20 @@ void handle_get_stream(const http_request_t *req, http_response_t *res) {
 
     // Get stream status — resolve using UDT state so that go2rtc-managed
     // streams (which stay INACTIVE in the state manager) report accurately.
-    stream_status_t stream_status = get_stream_status(stream);
-    stream_status = resolve_effective_stream_status(
-        stream_status, config.name, config.enabled);
-
-    const char *status;
-    switch (stream_status) {
-        case STREAM_STATUS_STOPPED:       status = "Stopped";      break;
-        case STREAM_STATUS_STARTING:      status = "Starting";     break;
-        case STREAM_STATUS_RUNNING:       status = "Running";      break;
-        case STREAM_STATUS_STOPPING:      status = "Stopping";     break;
-        case STREAM_STATUS_ERROR:         status = "Error";        break;
-        case STREAM_STATUS_RECONNECTING:  status = "Reconnecting"; break;
-        default:                          status = "Unknown";      break;
+    const char *status = summary_status(&camera);
+    if (camera.health == FLEET_HEALTH_UNKNOWN && config.enabled) {
+        stream_status_t stream_status = get_stream_status(stream);
+        stream_status = resolve_effective_stream_status(
+            stream_status, config.name, config.enabled);
+        switch (stream_status) {
+            case STREAM_STATUS_STOPPED:       status = "Stopped";      break;
+            case STREAM_STATUS_STARTING:      status = "Starting";     break;
+            case STREAM_STATUS_RUNNING:       status = "Running";      break;
+            case STREAM_STATUS_STOPPING:      status = "Stopping";     break;
+            case STREAM_STATUS_ERROR:         status = "Error";        break;
+            case STREAM_STATUS_RECONNECTING:  status = "Reconnecting"; break;
+            default:                          status = "Unknown";      break;
+        }
     }
     cJSON_AddStringToObject(stream_obj, "status", status);
 
@@ -632,6 +953,7 @@ void handle_get_stream_full(const http_request_t *req, http_response_t *res) {
             &live_evaluation)) {
         return;
     }
+    fleet_camera_enrich_runtime_health(&camera, 1);
     const bool expose_sensitive_config =
         stream_user_can_modify(&auth_user, &camera);
 
@@ -660,6 +982,7 @@ void handle_get_stream_full(const http_request_t *req, http_response_t *res) {
     cJSON_AddStringToObject(stream_obj, "playback_transport",
                             playback_transport_is_valid(config.playback_transport)
                                 ? config.playback_transport : "auto");
+    cJSON_AddStringToObject(stream_obj, "eptz_config", config.eptz_config);
     cJSON_AddNumberToObject(stream_obj, "width", config.width);
     cJSON_AddNumberToObject(stream_obj, "height", config.height);
     cJSON_AddNumberToObject(stream_obj, "fps", config.fps);
@@ -738,19 +1061,20 @@ void handle_get_stream_full(const http_request_t *req, http_response_t *res) {
 
     // Status — resolve using UDT state for accurate reporting when go2rtc
     // manages the stream (state manager stays INACTIVE/STOPPED at startup).
-    stream_status_t stream_status = get_stream_status(stream);
-    stream_status = resolve_effective_stream_status(
-        stream_status, config.name, config.enabled);
-
-    const char *status;
-    switch (stream_status) {
-        case STREAM_STATUS_STOPPED:       status = "Stopped";      break;
-        case STREAM_STATUS_STARTING:      status = "Starting";     break;
-        case STREAM_STATUS_RUNNING:       status = "Running";      break;
-        case STREAM_STATUS_STOPPING:      status = "Stopping";     break;
-        case STREAM_STATUS_ERROR:         status = "Error";        break;
-        case STREAM_STATUS_RECONNECTING:  status = "Reconnecting"; break;
-        default:                          status = "Unknown";      break;
+    const char *status = summary_status(&camera);
+    if (camera.health == FLEET_HEALTH_UNKNOWN && config.enabled) {
+        stream_status_t stream_status = get_stream_status(stream);
+        stream_status = resolve_effective_stream_status(
+            stream_status, config.name, config.enabled);
+        switch (stream_status) {
+            case STREAM_STATUS_STOPPED:       status = "Stopped";      break;
+            case STREAM_STATUS_STARTING:      status = "Starting";     break;
+            case STREAM_STATUS_RUNNING:       status = "Running";      break;
+            case STREAM_STATUS_STOPPING:      status = "Stopping";     break;
+            case STREAM_STATUS_ERROR:         status = "Error";        break;
+            case STREAM_STATUS_RECONNECTING:  status = "Reconnecting"; break;
+            default:                          status = "Unknown";      break;
+        }
     }
     cJSON_AddStringToObject(stream_obj, "status", status);
 

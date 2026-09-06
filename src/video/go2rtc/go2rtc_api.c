@@ -9,6 +9,7 @@
 #include <curl/curl.h>
 #include <ctype.h>
 #include <cjson/cJSON.h>
+#include <pthread.h>
 
 #include "video/go2rtc/go2rtc_api.h"
 #include "core/config.h"
@@ -20,6 +21,21 @@
 static char *g_api_host = NULL;
 static int g_api_port = 0;
 static bool g_initialized = false;
+
+/*
+ * go2rtc's publish endpoint does not answer until it has connected to the
+ * external ingest. Keep those network waits out of startup while retaining a
+ * bounded cleanup path for the background jobs.
+ */
+typedef struct {
+    char *stream_id;
+    char *destination;
+} publish_job_t;
+
+static pthread_mutex_t g_publish_jobs_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t g_publish_jobs_done = PTHREAD_COND_INITIALIZER;
+static size_t g_active_publish_jobs = 0;
+static bool g_accept_publish_jobs = false;
 
 // Buffer sizes
 // HTTP_RESPONSE_SIZE must be large enough to hold the full JSON from
@@ -56,8 +72,16 @@ bool go2rtc_api_init(const char *api_host, int api_port) {
     }
     
     g_api_host = strdup(api_host);
+    if (!g_api_host) {
+        log_error("Failed to allocate go2rtc API host");
+        return false;
+    }
     g_api_port = api_port;
     g_initialized = true;
+
+    pthread_mutex_lock(&g_publish_jobs_mutex);
+    g_accept_publish_jobs = true;
+    pthread_mutex_unlock(&g_publish_jobs_mutex);
     
     log_info("go2rtc API client initialized with host: %s, port: %d", g_api_host, g_api_port);
     return true;
@@ -480,6 +504,86 @@ bool go2rtc_api_publish_stream(const char *stream_id, const char *destination) {
     return success;
 }
 
+static void *publish_stream_worker(void *arg) {
+    publish_job_t *job = (publish_job_t *)arg;
+
+    if (!go2rtc_api_publish_stream(job->stream_id, job->destination)) {
+        log_warn("Failed to start background RTMP restream for %s; will retry on next registration",
+                 job->stream_id);
+    }
+
+    free(job->stream_id);
+    free(job->destination);
+    free(job);
+
+    pthread_mutex_lock(&g_publish_jobs_mutex);
+    g_active_publish_jobs--;
+    if (g_active_publish_jobs == 0) {
+        pthread_cond_broadcast(&g_publish_jobs_done);
+    }
+    pthread_mutex_unlock(&g_publish_jobs_mutex);
+    return NULL;
+}
+
+bool go2rtc_api_publish_stream_async(const char *stream_id,
+                                     const char *destination) {
+    if (!stream_id || !destination || destination[0] == '\0') {
+        log_error("Invalid parameters for go2rtc_api_publish_stream_async");
+        return false;
+    }
+
+    publish_job_t *job = calloc(1, sizeof(*job));
+    if (!job) {
+        log_error("Failed to allocate background RTMP publish job");
+        return false;
+    }
+
+    job->stream_id = strdup(stream_id);
+    job->destination = strdup(destination);
+    if (!job->stream_id || !job->destination) {
+        log_error("Failed to copy background RTMP publish job parameters");
+        free(job->stream_id);
+        free(job->destination);
+        free(job);
+        return false;
+    }
+
+    pthread_mutex_lock(&g_publish_jobs_mutex);
+    if (!g_initialized || !g_accept_publish_jobs) {
+        pthread_mutex_unlock(&g_publish_jobs_mutex);
+        log_error("go2rtc API client is not accepting RTMP publish jobs");
+        free(job->stream_id);
+        free(job->destination);
+        free(job);
+        return false;
+    }
+
+    pthread_t thread;
+    g_active_publish_jobs++;
+    int create_result = pthread_create(&thread, NULL, publish_stream_worker, job);
+    if (create_result != 0) {
+        g_active_publish_jobs--;
+        pthread_mutex_unlock(&g_publish_jobs_mutex);
+        log_error("Failed to create background RTMP publish thread: %s",
+                  strerror(create_result));
+        free(job->stream_id);
+        free(job->destination);
+        free(job);
+        return false;
+    }
+
+    int detach_result = pthread_detach(thread);
+    if (detach_result != 0) {
+        /* The job is still tracked and safe; only its pthread resources may
+         * remain allocated until process exit on this exceptional path. */
+        log_warn("Failed to detach background RTMP publish thread: %s",
+                 strerror(detach_result));
+    }
+    pthread_mutex_unlock(&g_publish_jobs_mutex);
+    log_info("Scheduled background RTMP restream for go2rtc stream %s", stream_id);
+    return true;
+}
+
 bool go2rtc_api_stream_exists(const char *stream_id) {
     if (!g_initialized) {
         log_error("go2rtc API client not initialized");
@@ -557,6 +661,132 @@ bool go2rtc_api_stream_exists(const char *stream_id) {
         log_debug("Stream %s not found in go2rtc", stream_id);
     }
     return exists;
+}
+
+static bool json_counter_is_positive(const cJSON *object, const char *key) {
+    const cJSON *counter = cJSON_GetObjectItemCaseSensitive(object, key);
+    return cJSON_IsNumber(counter) && counter->valuedouble > 0.0;
+}
+
+static bool producer_has_received_video(const cJSON *producer) {
+    if (!cJSON_IsObject(producer)) return false;
+
+    const cJSON *receivers =
+        cJSON_GetObjectItemCaseSensitive(producer, "receivers");
+    if (cJSON_IsArray(receivers)) {
+        const cJSON *receiver = NULL;
+        cJSON_ArrayForEach(receiver, receivers) {
+            const cJSON *codec =
+                cJSON_GetObjectItemCaseSensitive(receiver, "codec");
+            const cJSON *codec_type = codec
+                ? cJSON_GetObjectItemCaseSensitive(codec, "codec_type")
+                : NULL;
+            if (cJSON_IsString(codec_type) &&
+                strcmp(codec_type->valuestring, "video") == 0 &&
+                (json_counter_is_positive(receiver, "packets") ||
+                 json_counter_is_positive(receiver, "bytes"))) {
+                return true;
+            }
+        }
+    }
+
+    /* Some go2rtc producers expose only connection-level byte totals. Require
+     * a video media declaration as well so an audio-only source cannot make a
+     * camera appear online. */
+    if (!json_counter_is_positive(producer, "bytes_recv")) return false;
+    const cJSON *medias = cJSON_GetObjectItemCaseSensitive(producer, "medias");
+    if (!cJSON_IsArray(medias)) return false;
+    const cJSON *media = NULL;
+    cJSON_ArrayForEach(media, medias) {
+        if (cJSON_IsString(media) && strstr(media->valuestring, "video")) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool stream_has_received_video(const cJSON *stream) {
+    if (!cJSON_IsObject(stream)) return false;
+    const cJSON *producers =
+        cJSON_GetObjectItemCaseSensitive(stream, "producers");
+    if (!cJSON_IsArray(producers)) return false;
+    const cJSON *producer = NULL;
+    cJSON_ArrayForEach(producer, producers) {
+        if (producer_has_received_video(producer)) return true;
+    }
+    return false;
+}
+
+bool go2rtc_api_parse_stream_activity_json(
+    const char *json, go2rtc_stream_activity_t *streams, size_t stream_count) {
+    if (!json || (!streams && stream_count > 0)) return false;
+    for (size_t i = 0; i < stream_count; i++) {
+        streams[i].video_active = false;
+    }
+
+    cJSON *root = cJSON_Parse(json);
+    if (!cJSON_IsObject(root)) {
+        cJSON_Delete(root);
+        return false;
+    }
+    for (size_t i = 0; i < stream_count; i++) {
+        if (!streams[i].stream_name || streams[i].stream_name[0] == '\0') {
+            continue;
+        }
+        const cJSON *stream = cJSON_GetObjectItemCaseSensitive(
+            root, streams[i].stream_name);
+        streams[i].video_active = stream_has_received_video(stream);
+        if (!streams[i].video_active && streams[i].alternate_stream_name &&
+            streams[i].alternate_stream_name[0] != '\0') {
+            stream = cJSON_GetObjectItemCaseSensitive(
+                root, streams[i].alternate_stream_name);
+            streams[i].video_active = stream_has_received_video(stream);
+        }
+    }
+    cJSON_Delete(root);
+    return true;
+}
+
+bool go2rtc_api_get_stream_activity(go2rtc_stream_activity_t *streams,
+                                    size_t stream_count) {
+    if (!streams && stream_count > 0) return false;
+    for (size_t i = 0; i < stream_count; i++) {
+        streams[i].video_active = false;
+    }
+    if (stream_count == 0) return true;
+    if (!g_initialized) return false;
+
+    CURL *curl = curl_easy_init();
+    if (!curl) {
+        log_error("Failed to initialize CURL for go2rtc stream activity");
+        return false;
+    }
+
+    char url[URL_BUFFER_SIZE];
+    struct MemoryStruct response = { .memory = NULL, .size = 0 };
+    snprintf(url, sizeof(url),
+             "http://%s:%d" GO2RTC_BASE_PATH "/api/streams", // codeql[cpp/non-https-url] - localhost-only internal API
+             g_api_host, g_api_port);
+    curl_easy_setopt(curl, CURLOPT_URL, url);
+    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, WriteMemoryCallback);
+    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response);
+    configure_curl_timeouts(curl, GO2RTC_API_READ_TIMEOUT_SECONDS);
+
+    CURLcode result = curl_easy_perform(curl);
+    long http_code = 0;
+    if (result == CURLE_OK) {
+        curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
+    }
+    bool success = result == CURLE_OK && http_code == 200 && response.memory &&
+        go2rtc_api_parse_stream_activity_json(response.memory, streams,
+                                              stream_count);
+    if (!success) {
+        log_debug("Could not read go2rtc stream activity (curl=%d, status=%ld)",
+                  (int)result, http_code);
+    }
+    free(response.memory);
+    curl_easy_cleanup(curl);
+    return success;
 }
 
 bool go2rtc_api_get_webrtc_url(const char *stream_id, char *buffer, size_t buffer_size) {
@@ -871,6 +1101,17 @@ void go2rtc_api_cleanup(void) {
     if (!g_initialized) {
         return;
     }
+
+    pthread_mutex_lock(&g_publish_jobs_mutex);
+    g_accept_publish_jobs = false;
+    if (g_active_publish_jobs > 0) {
+        log_info("Waiting for %zu background RTMP publish job(s) to finish",
+                 g_active_publish_jobs);
+    }
+    while (g_active_publish_jobs > 0) {
+        pthread_cond_wait(&g_publish_jobs_done, &g_publish_jobs_mutex);
+    }
+    pthread_mutex_unlock(&g_publish_jobs_mutex);
 
     free(g_api_host);
     g_api_host = NULL;

@@ -100,30 +100,56 @@ void test_default_config_db_path_nonempty(void) {
 
 void test_default_config_db_backup_settings(void) {
     load_default_config(&cfg);
-    TEST_ASSERT_EQUAL_INT(60, cfg.db_backup_interval_minutes);
+    TEST_ASSERT_EQUAL_INT(0, cfg.db_backup_interval_minutes);
     /* Each retained backup is a full copy of the database, so this count
      * multiplies disk usage by the database size. */
     TEST_ASSERT_EQUAL_INT(6, cfg.db_backup_retention_count);
     TEST_ASSERT_EQUAL_STRING("", cfg.db_post_backup_script);
 }
 
-void test_default_config_db_startup_check_is_quick(void) {
+void test_default_config_db_startup_check_is_off(void) {
     load_default_config(&cfg);
-    /* The boot check runs before the HTTP listener binds, so the default must
-     * be the cheap one; full integrity_check is opt-in. */
-    TEST_ASSERT_EQUAL_INT(DB_STARTUP_CHECK_QUICK, cfg.db_startup_check);
+    /* Even quick_check scans every database page before the HTTP listener
+     * binds, so consistency checks are explicit maintenance choices. */
+    TEST_ASSERT_EQUAL_INT(DB_STARTUP_CHECK_OFF, cfg.db_startup_check);
+}
+
+void test_default_config_health_matches_ops03(void) {
+    load_default_config(&cfg);
+    TEST_ASSERT_TRUE(cfg.health.enabled);
+    TEST_ASSERT_EQUAL_STRING("balanced", cfg.health.profile);
+    TEST_ASSERT_EQUAL_UINT32(10U, cfg.health.fast_interval_seconds);
+    TEST_ASSERT_EQUAL_UINT32(60U, cfg.health.normal_interval_seconds);
+    TEST_ASSERT_EQUAL_UINT32(300U, cfg.health.slow_interval_seconds);
+    TEST_ASSERT_EQUAL_UINT32(900U, cfg.health.device_interval_seconds);
+    TEST_ASSERT_TRUE(cfg.health.write_probe_enabled);
+    TEST_ASSERT_EQUAL_STRING("auto", cfg.health.hardware_provider);
+    TEST_ASSERT_EQUAL_UINT32(60U, cfg.health.presence_interval_seconds);
+    TEST_ASSERT_EQUAL_UINT32(90U, cfg.health.incident_retention_days);
+}
+
+void test_validate_config_rejects_unsafe_health_values(void) {
+    load_default_config(&cfg);
+    cfg.health.fast_interval_seconds = 1U;
+    TEST_ASSERT_NOT_EQUAL(0, validate_config(&cfg));
+    TEST_ASSERT_EQUAL_UINT32(1U, cfg.health.fast_interval_seconds);
+
+    load_default_config(&cfg);
+    snprintf(cfg.health.hardware_provider,
+             sizeof(cfg.health.hardware_provider), "%s", "/bin/x");
+    TEST_ASSERT_NOT_EQUAL(0, validate_config(&cfg));
 }
 
 void test_validate_config_clamps_out_of_range_startup_check(void) {
     load_default_config(&cfg);
     cfg.db_startup_check = 99;
     TEST_ASSERT_EQUAL_INT(0, validate_config(&cfg));
-    TEST_ASSERT_EQUAL_INT(DB_STARTUP_CHECK_QUICK, cfg.db_startup_check);
+    TEST_ASSERT_EQUAL_INT(DB_STARTUP_CHECK_OFF, cfg.db_startup_check);
 
     load_default_config(&cfg);
     cfg.db_startup_check = -1;
     TEST_ASSERT_EQUAL_INT(0, validate_config(&cfg));
-    TEST_ASSERT_EQUAL_INT(DB_STARTUP_CHECK_QUICK, cfg.db_startup_check);
+    TEST_ASSERT_EQUAL_INT(DB_STARTUP_CHECK_OFF, cfg.db_startup_check);
 }
 
 void test_validate_config_preserves_valid_startup_check(void) {
@@ -314,6 +340,16 @@ void test_default_config_auth_timeout(void) {
     TEST_ASSERT_EQUAL_INT(24, cfg.auth_timeout_hours);
 }
 
+void test_default_config_auto_view_enabled(void) {
+    load_default_config(&cfg);
+    TEST_ASSERT_FALSE(cfg.auto_disabled);
+}
+
+void test_default_config_audio_enabled(void) {
+    load_default_config(&cfg);
+    TEST_ASSERT_FALSE(cfg.audio_disabled);
+}
+
 void test_default_config_web_compression_enabled(void) {
     load_default_config(&cfg);
     TEST_ASSERT_TRUE(cfg.web_compression_enabled);
@@ -389,6 +425,11 @@ void test_save_config_accepts_hidden_ini_dotfile(void) {
     load_default_config(&cfg);
     cfg.db_backup_interval_minutes = 15;
     cfg.db_backup_retention_count = 8;
+    cfg.audio_disabled = true;
+    cfg.auto_disabled = true;
+    snprintf(cfg.health.profile, sizeof(cfg.health.profile), "%s",
+             "conservative");
+    cfg.health.presence_interval_seconds = 120U;
     snprintf(cfg.db_post_backup_script, sizeof(cfg.db_post_backup_script), "/usr/local/bin/post-backup");
     TEST_ASSERT_EQUAL_INT(0, save_config(&cfg, config_path));
 
@@ -404,6 +445,12 @@ void test_save_config_accepts_hidden_ini_dotfile(void) {
         TEST_ASSERT_NOT_NULL(strstr(file_buffer, "backup_retention_count = 8"));
         TEST_ASSERT_NOT_NULL(strstr(file_buffer, "post_backup_script = /usr/local/bin/post-backup"));
         TEST_ASSERT_NOT_NULL(strstr(file_buffer, "mp4_directory_format = year_month_day"));
+        TEST_ASSERT_NOT_NULL(strstr(file_buffer, "audio_disabled = true"));
+        TEST_ASSERT_NOT_NULL(strstr(file_buffer, "auto_disabled = true"));
+        TEST_ASSERT_NOT_NULL(strstr(file_buffer, "[health]"));
+        TEST_ASSERT_NOT_NULL(strstr(file_buffer, "profile = conservative"));
+        TEST_ASSERT_NOT_NULL(strstr(file_buffer,
+                                    "presence_interval_seconds = 120"));
         fclose(saved);
     }
 
@@ -451,8 +498,21 @@ void test_env_integer_whitespace_handling(void) {
             "backup_interval_minutes = 45\n"
             "backup_retention_count = 12\n"
             "post_backup_script = /usr/local/bin/backup-hook\n\n"
+            "[health]\n"
+            "enabled = true\n"
+            "profile = conservative\n"
+            "fast_interval_seconds = 15\n"
+            "normal_interval_seconds = 90\n"
+            "slow_interval_seconds = 360\n"
+            "device_interval_seconds = 1200\n"
+            "write_probe_enabled = false\n"
+            "hardware_provider = disabled\n"
+            "presence_interval_seconds = 120\n"
+            "incident_retention_days = 120\n\n"
             "[web]\n"
-            "root = %s\n",
+            "root = %s\n"
+            "audio_disabled = false\n"
+            "auto_disabled = true\n",
             pid_path, log_path, storage_path, storage_hls_path,
             models_path, db_path, web_root);
     fclose(config_file);
@@ -464,21 +524,40 @@ void test_env_integer_whitespace_handling(void) {
     if (previous_env) {
         TEST_ASSERT_NOT_NULL(saved_env);
     }
+    const char *previous_audio_env = getenv("LIGHTNVR_AUDIO_DISABLED");
+    char *saved_audio_env = previous_audio_env ? strdup(previous_audio_env) : NULL;
+    if (previous_audio_env) {
+        TEST_ASSERT_NOT_NULL(saved_audio_env);
+    }
 
     set_custom_config_path(config_path);
     /* Trailing whitespace should be ignored. */
     TEST_ASSERT_EQUAL_INT(0, setenv("LIGHTNVR_WEB_PORT", "9099   ", 1));
+    TEST_ASSERT_EQUAL_INT(0, setenv("LIGHTNVR_AUDIO_DISABLED", "true", 1));
     TEST_ASSERT_EQUAL_INT(0, load_config(&cfg));
     TEST_ASSERT_EQUAL_INT(9099, cfg.web_port);
     TEST_ASSERT_EQUAL_INT(45, cfg.db_backup_interval_minutes);
     TEST_ASSERT_EQUAL_INT(12, cfg.db_backup_retention_count);
     TEST_ASSERT_EQUAL_STRING("/usr/local/bin/backup-hook", cfg.db_post_backup_script);
     TEST_ASSERT_EQUAL_STRING("year_month", cfg.mp4_directory_format);
+    TEST_ASSERT_TRUE(cfg.audio_disabled);
+    TEST_ASSERT_TRUE(cfg.auto_disabled);
+    TEST_ASSERT_EQUAL_STRING("conservative", cfg.health.profile);
+    TEST_ASSERT_EQUAL_UINT32(15U, cfg.health.fast_interval_seconds);
+    TEST_ASSERT_EQUAL_UINT32(90U, cfg.health.normal_interval_seconds);
+    TEST_ASSERT_EQUAL_UINT32(360U, cfg.health.slow_interval_seconds);
+    TEST_ASSERT_EQUAL_UINT32(1200U, cfg.health.device_interval_seconds);
+    TEST_ASSERT_FALSE(cfg.health.write_probe_enabled);
+    TEST_ASSERT_EQUAL_STRING("disabled", cfg.health.hardware_provider);
+    TEST_ASSERT_EQUAL_UINT32(120U, cfg.health.presence_interval_seconds);
+    TEST_ASSERT_EQUAL_UINT32(120U, cfg.health.incident_retention_days);
 
     /* Leading whitespace should be ignored. */
+    TEST_ASSERT_EQUAL_INT(0, unsetenv("LIGHTNVR_AUDIO_DISABLED"));
     TEST_ASSERT_EQUAL_INT(0, setenv("LIGHTNVR_WEB_PORT", "   9099", 1));
     TEST_ASSERT_EQUAL_INT(0, load_config(&cfg));
     TEST_ASSERT_EQUAL_INT(9099, cfg.web_port);
+    TEST_ASSERT_FALSE(cfg.audio_disabled);
 
     /* Mixed leading and trailing whitespace should be ignored. */
     TEST_ASSERT_EQUAL_INT(0, setenv("LIGHTNVR_WEB_PORT", "   9099   ", 1));
@@ -490,6 +569,12 @@ void test_env_integer_whitespace_handling(void) {
         free(saved_env);
     } else {
         TEST_ASSERT_EQUAL_INT(0, unsetenv("LIGHTNVR_WEB_PORT"));
+    }
+    if (saved_audio_env) {
+        TEST_ASSERT_EQUAL_INT(0, setenv("LIGHTNVR_AUDIO_DISABLED", saved_audio_env, 1));
+        free(saved_audio_env);
+    } else {
+        TEST_ASSERT_EQUAL_INT(0, unsetenv("LIGHTNVR_AUDIO_DISABLED"));
     }
 
     unlink(config_path);
@@ -521,6 +606,8 @@ int main(void) {
     RUN_TEST(test_default_config_storage_path_nonempty);
     RUN_TEST(test_default_config_db_path_nonempty);
     RUN_TEST(test_default_config_db_backup_settings);
+    RUN_TEST(test_default_config_health_matches_ops03);
+    RUN_TEST(test_validate_config_rejects_unsafe_health_values);
     RUN_TEST(test_default_config_models_path_nonempty);
     RUN_TEST(test_default_config_null_safe);
 
@@ -537,7 +624,7 @@ int main(void) {
     RUN_TEST(test_validate_config_buffer_size_zero);
     RUN_TEST(test_validate_config_clamps_absolute_timeout_to_idle_timeout);
     RUN_TEST(test_validate_config_clamps_negative_db_backup_values);
-    RUN_TEST(test_default_config_db_startup_check_is_quick);
+    RUN_TEST(test_default_config_db_startup_check_is_off);
     RUN_TEST(test_validate_config_clamps_out_of_range_startup_check);
     RUN_TEST(test_validate_config_preserves_valid_startup_check);
 
@@ -555,6 +642,8 @@ int main(void) {
     RUN_TEST(test_default_config_mp4_directory_format);
     RUN_TEST(test_default_config_stream_defaults);
     RUN_TEST(test_default_config_auth_timeout);
+    RUN_TEST(test_default_config_audio_enabled);
+    RUN_TEST(test_default_config_auto_view_enabled);
     RUN_TEST(test_default_config_web_compression_enabled);
 
     RUN_TEST(test_validate_config_swap_size_zero_with_use_swap);

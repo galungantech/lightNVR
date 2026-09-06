@@ -6,7 +6,7 @@
 import { useState, useEffect, useMemo, useCallback } from 'preact/hooks';
 import { showStatusMessage } from './ToastContainer.jsx';
 import { useFullscreenManager, FullscreenManager, useFullscreenGridNav, useFullscreenCellStream, getNativeFullscreenElement, requestNativeFullscreen, exitNativeFullscreen } from './FullscreenManager.jsx';
-import { useQuery, useQueryClient } from '../../query-client.js';
+import { useQuery } from '../../query-client.js';
 import { SnapshotManager, useSnapshotManager } from './SnapshotManager.jsx';
 import { PlaybackTransportCell } from './PlaybackTransportCell.jsx';
 import { isGo2rtcEnabled } from '../../utils/settings-utils.js';
@@ -19,6 +19,10 @@ import { AlwaysFullscreenToggle } from './AlwaysFullscreenToggle.jsx';
 import { useAlwaysFullscreenOnTap } from './useAlwaysFullscreenOnTap.js';
 import { usePullToRefresh } from './usePullToRefresh.js';
 import { shouldShowGestureTip } from './mobileLiveGestures.js';
+import { fetchAllStreamSummaries } from '../../utils/stream-summaries.js';
+import { LiveOperatorNavigator } from './live/LiveOperatorNavigator.jsx';
+import { LiveBuildingPlan } from './live/LiveBuildingPlan.jsx';
+import { filterLiveNavigatorInventory } from './live/liveOperator.js';
 
 /**
  * Convert the old single-string layout value to cols/rows for backward compat.
@@ -39,11 +43,19 @@ function legacyLayoutToColsRowsHLS(layout) {
  * LiveView component
  * @returns {JSX.Element} LiveView component
  */
-export function LiveView({isWebRTCDisabled, isHlsDisabled = false, isMseDisabled = false}) {
+export function LiveView({audioDisabled = false, isAutoDisabled = false, isWebRTCDisabled, isHlsDisabled = false, isMseDisabled = false}) {
   const { t } = useI18n();
   const forcedTransport = resolveForcedLiveTransport(
     window.location.pathname,
-    window.location.search
+    window.location.search,
+    {
+      autoDisabled: isAutoDisabled,
+      offerings: {
+        webrtc: !isWebRTCDisabled,
+        mse: !isMseDisabled,
+        hls: !isHlsDisabled,
+      },
+    }
   );
   const [alwaysFullscreenOnTap, setAlwaysFullscreenOnTap] = useAlwaysFullscreenOnTap();
   // Use the snapshot manager hook
@@ -60,6 +72,30 @@ export function LiveView({isWebRTCDisabled, isHlsDisabled = false, isMseDisabled
   // State for streams and layout
   const [streams, setStreams] = useState([]);
   const [refreshGeneration, setRefreshGeneration] = useState(0);
+  const [operatorFilter, setOperatorFilter] = useState(null);
+  const [operatorSurface, setOperatorSurfaceState] = useState(() =>
+    new URLSearchParams(window.location.search).get('surface') === 'plan' ? 'plan' : 'grid');
+  const [selectedPlanUuid, setSelectedPlanUuidState] = useState(() =>
+    new URLSearchParams(window.location.search).get('plan') ||
+    localStorage.getItem('lightnvr-live-plan') || '');
+
+  const setOperatorSurface = useCallback((surface) => {
+    const next = surface === 'plan' ? 'plan' : 'grid';
+    setOperatorSurfaceState(next);
+    const url = new URL(window.location.href);
+    if (next === 'plan') url.searchParams.set('surface', 'plan');
+    else url.searchParams.delete('surface');
+    window.history.replaceState({}, '', url);
+  }, []);
+  const setSelectedPlanUuid = useCallback((uuid) => {
+    setSelectedPlanUuidState(uuid || '');
+    if (uuid) localStorage.setItem('lightnvr-live-plan', uuid);
+    else localStorage.removeItem('lightnvr-live-plan');
+    const url = new URL(window.location.href);
+    if (uuid) url.searchParams.set('plan', uuid);
+    else url.searchParams.delete('plan');
+    window.history.replaceState({}, '', url);
+  }, []);
 
   // Tag filter: '' means "All"
   const [tagFilter, setTagFilter] = useState(() => {
@@ -191,9 +227,6 @@ export function LiveView({isWebRTCDisabled, isHlsDisabled = false, isMseDisabled
     return 0;
   });
 
-  // Get query client for fetching and invalidating queries
-  const queryClient = useQueryClient();
-
   // Check if go2rtc is enabled (for showing mode toggle)
   useEffect(() => {
     const checkGo2rtcMode = async () => {
@@ -216,18 +249,14 @@ export function LiveView({isWebRTCDisabled, isHlsDisabled = false, isMseDisabled
     isLoading: isLoadingStreams,
     error: streamsError,
     refetch: refetchStreams,
-  } = useQuery(
-    'streams',
-    '/api/streams',
-    {
-      timeout: 15000, // 15 second timeout
-      retries: 2,     // Retry twice
-      retryDelay: 1000 // 1 second between retries
-    },
-    {
-      refetchInterval: 30000 // Re-poll stream list (and status) every 30 s
-    }
-  );
+  } = useQuery({
+    queryKey: ['streams', 'live-summary'],
+    queryFn: ({ signal }) => fetchAllStreamSummaries({
+      surface: 'live', signal,
+    }),
+    staleTime: 15000,
+    refetchInterval: 30000,
+  });
 
   const refreshLiveGrid = useCallback(async () => {
     try {
@@ -257,39 +286,7 @@ export function LiveView({isWebRTCDisabled, isHlsDisabled = false, isMseDisabled
           const candidateStreams = collectionFilter
             ? streamsData.filter((stream) => collectionCameraUuids.has(stream.camera_uuid))
             : streamsData;
-          // Filter and process the streams
-          // Note: filterStreamsForHLS is defined below but called here via closure
-          // We use a local function to fetch stream details to avoid hoisting issues
-          const fetchStreamDetails = async (stream) => {
-            try {
-              const streamId = stream.id || stream.name;
-              const streamDetails = await queryClient.fetchQuery({
-                queryKey: ['stream-details', streamId],
-                queryFn: async () => {
-                  const response = await fetch(`/api/streams/${encodeURIComponent(streamId)}`);
-                  if (!response.ok) {
-                    throw new Error(`Failed to load details for stream ${stream.name}`);
-                  }
-                  return response.json();
-                },
-                staleTime: 30000 // 30 seconds
-              });
-              return streamDetails;
-            } catch (error) {
-              console.error(`Error loading details for stream ${stream.name}:`, error);
-              return stream;
-            }
-          };
-
-          // Fetch stream details with bounded concurrency (max 3 at a time) to avoid
-          // overwhelming the backend with simultaneous /api/streams/{id} requests.
-          const BATCH_SIZE = 3;
-          const detailedStreams = [];
-          for (let i = 0; i < candidateStreams.length; i += BATCH_SIZE) {
-            const batch = candidateStreams.slice(i, i + BATCH_SIZE);
-            const batchResults = await Promise.all(batch.map(fetchStreamDetails));
-            detailedStreams.push(...batchResults);
-          }
+          const detailedStreams = candidateStreams;
           if (cancelled) return;
           console.log('Loaded detailed streams for HLS view:', detailedStreams);
 
@@ -352,7 +349,7 @@ export function LiveView({isWebRTCDisabled, isHlsDisabled = false, isMseDisabled
     return () => { cancelled = true; };
     // selectedStream is read but intentionally omitted from the dependencies.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [streamsData, queryClient, collectionFilter, collectionCameraUuids, isCollectionLoading]);
+  }, [streamsData, collectionFilter, collectionCameraUuids, isCollectionLoading]);
 
   // Sync layout/page/stream to URL — only meaningful once streams are loaded.
   useEffect(() => {
@@ -427,6 +424,16 @@ export function LiveView({isWebRTCDisabled, isHlsDisabled = false, isMseDisabled
     }
   }, [collectionError, t]);
 
+  // The playback grid intentionally excludes administratively disabled
+  // cameras, but the Navigator's availability inventory must still include
+  // them. Keep its source separate from the playable stream list.
+  const navigatorStreams = useMemo(() => {
+    if (!Array.isArray(streamsData)) return streams;
+    if (collectionFilter && isCollectionLoading) return streams;
+    return filterLiveNavigatorInventory(
+      streamsData, collectionFilter ? collectionCameraUuids : null);
+  }, [streamsData, streams, collectionFilter, collectionCameraUuids, isCollectionLoading]);
+
   // Derive unique tags from all streams for the filter dropdown
   const availableTags = useMemo(() => {
     const tags = new Set();
@@ -440,9 +447,12 @@ export function LiveView({isWebRTCDisabled, isHlsDisabled = false, isMseDisabled
   const tagFilteredStreams = useMemo(() => {
     return streams.filter((stream) => {
       if (collectionFilter && !collectionCameraUuids.has(stream.camera_uuid)) return false;
+      if (operatorFilter && !operatorFilter.cameraUuids.has(stream.camera_uuid)) return false;
+      if (operatorFilter && operatorFilter.availability !== 'all' &&
+          stream.availability !== operatorFilter.availability) return false;
       return !tagFilter || (stream.tags && stream.tags.split(',').map(tag => tag.trim()).includes(tagFilter));
     });
-  }, [streams, tagFilter, collectionFilter, collectionCameraUuids]);
+  }, [streams, tagFilter, collectionFilter, collectionCameraUuids, operatorFilter]);
 
   // Camera ordering hook (operates on group-filtered streams)
   const {
@@ -451,6 +461,8 @@ export function LiveView({isWebRTCDisabled, isHlsDisabled = false, isMseDisabled
     toggleReorderMode,
     enterReorderMode,
     resetOrder,
+    setCameraOrder,
+    placeCameraAtIndex,
     handleDragStart,
     handleDragOver,
     handleDrop,
@@ -460,6 +472,26 @@ export function LiveView({isWebRTCDisabled, isHlsDisabled = false, isMseDisabled
     handleReorderPointerUp,
     handleReorderPointerCancel,
   } = useCameraOrder(tagFilteredStreams, 'hls');
+
+  const applyOperatorLayout = useCallback((layout) => {
+    const nextCols = Math.max(1, Math.min(9, Number(layout.columns) || cols));
+    const nextRows = Math.max(1, Math.min(9, Number(layout.rows) || rows));
+    setCols(nextCols);
+    setRows(Math.min(nextRows, Math.floor(MAX_GRID_CELLS / nextCols)));
+    setCurrentPage(0);
+    setAutoGrid(false);
+    const names = (layout.cameraUuids || []).map((cameraUuid) =>
+      streams.find((stream) => stream.camera_uuid === cameraUuid)?.name).filter(Boolean);
+    setCameraOrder(names);
+    if (nextCols * nextRows === 1 && names[0]) setSelectedStream(names[0]);
+  }, [cols, rows, streams, setCameraOrder]);
+
+  const openPlanCamera = useCallback((stream) => {
+    setOperatorSurface('grid');
+    applyOperatorLayout({
+      cameraUuids: [stream.camera_uuid], columns: 1, rows: 1,
+    });
+  }, [applyOperatorLayout, setOperatorSurface]);
 
   // Ensure current page is valid when orderedStreams or layout changes
   useEffect(() => {
@@ -572,17 +604,19 @@ export function LiveView({isWebRTCDisabled, isHlsDisabled = false, isMseDisabled
               tile. Each transport only renders if enabled in settings
               (#397). MSE additionally requires go2rtc to be reachable. */}
           <div className="inline-flex items-center bg-muted rounded-lg p-1 gap-1" style={{ position: 'relative', zIndex: 50 }}>
-            {forcedTransport === null ? (
-              <span className="px-3 py-1.5 rounded text-sm font-medium bg-primary text-primary-foreground select-none">
-                Auto
-              </span>
-            ) : (
-              <a
-                href={buildLiveViewHref('/index.html', window.location.search)}
-                className="px-3 py-1.5 rounded text-sm font-medium transition-colors no-underline text-muted-foreground hover:bg-background hover:text-foreground focus:outline-none"
-              >
-                Auto
-              </a>
+            {!isAutoDisabled && (
+              forcedTransport === null ? (
+                <span className="px-3 py-1.5 rounded text-sm font-medium bg-primary text-primary-foreground select-none">
+                  Auto
+                </span>
+              ) : (
+                <a
+                  href={buildLiveViewHref('/index.html', window.location.search)}
+                  className="px-3 py-1.5 rounded text-sm font-medium transition-colors no-underline text-muted-foreground hover:bg-background hover:text-foreground focus:outline-none"
+                >
+                  Auto
+                </a>
+              )
             )}
             {!isWebRTCDisabled && (
               forcedTransport === 'webrtc' ? (
@@ -628,6 +662,7 @@ export function LiveView({isWebRTCDisabled, isHlsDisabled = false, isMseDisabled
             )}
           </div>
         </div>
+        {operatorSurface === 'grid' && (
         <div className="controls flex items-center space-x-2">
           {collections.length > 0 && (
             <div className="flex items-center gap-1.5">
@@ -784,12 +819,35 @@ export function LiveView({isWebRTCDisabled, isHlsDisabled = false, isMseDisabled
             </svg>
           </button>
         </div>
+        )}
       </div>
 
-      <div
-        className="live-grid-frame flex flex-col space-y-4 h-full"
-        {...pullToRefresh.bind}
-      >
+      <div className="live-workspace-shell">
+        <LiveOperatorNavigator
+          streams={navigatorStreams}
+          orderedStreams={orderedStreams}
+          columns={cols}
+          rows={rows}
+          operatorSurface={operatorSurface}
+          selectedPlanUuid={selectedPlanUuid}
+          onFilterChange={setOperatorFilter}
+          onApplyLayout={applyOperatorLayout}
+          onSurfaceChange={setOperatorSurface}
+          onSelectPlan={setSelectedPlanUuid}
+        />
+        <div className="live-operator-main">
+        {operatorSurface === 'plan' ? (
+          <LiveBuildingPlan
+            streams={navigatorStreams}
+            selectedPlanUuid={selectedPlanUuid}
+            onSelectPlan={setSelectedPlanUuid}
+            onOpenCamera={openPlanCamera}
+          />
+        ) : (
+        <div
+          className="live-grid-frame flex flex-col space-y-4 h-full"
+          {...pullToRefresh.bind}
+        >
         {(pullToRefresh.distance > 0 || pullToRefresh.refreshing) && (
           <div
             className={`mobile-pull-refresh ${pullToRefresh.ready ? 'ready' : ''}`}
@@ -846,6 +904,10 @@ export function LiveView({isWebRTCDisabled, isHlsDisabled = false, isMseDisabled
               <p className="mb-6 text-muted-foreground text-lg">{t('live.noStreamsConfigured')}</p>
               <a href="streams.html" className="btn-primary">{t('live.configureStreams')}</a>
             </div>
+          ) : orderedStreams.length === 0 ? (
+            <div className="placeholder flex flex-col justify-center items-center col-span-full row-span-full bg-card text-card-foreground rounded-lg shadow-md text-center p-8">
+              <p className="mb-0 text-muted-foreground text-lg">{t('live.navigator.noCameras')}</p>
+            </div>
           ) : (
             // Render each tile using its persisted playback profile. The active
             // HLS/MSE tab remains the default for streams set to Auto.
@@ -869,8 +931,17 @@ export function LiveView({isWebRTCDisabled, isHlsDisabled = false, isMseDisabled
                   style={{ position: 'relative', touchAction: reorderMode ? 'none' : undefined }}
                   draggable={reorderMode}
                   onDragStart={reorderMode ? () => handleDragStart(globalIndex) : undefined}
-                  onDragOver={reorderMode ? (e) => handleDragOver(e, globalIndex) : undefined}
-                  onDrop={reorderMode ? handleDrop : undefined}
+                  onDragOver={(event) => {
+                    if (reorderMode) handleDragOver(event, globalIndex);
+                    else if (event.dataTransfer?.types?.includes('application/x-lightnvr-camera')) event.preventDefault();
+                  }}
+                  onDrop={(event) => {
+                    if (reorderMode) handleDrop(event);
+                    else {
+                      const cameraUuid = event.dataTransfer?.getData('application/x-lightnvr-camera');
+                      if (cameraUuid) { event.preventDefault(); placeCameraAtIndex(cameraUuid, globalIndex); }
+                    }
+                  }}
                   onDragEnd={reorderMode ? handleDragEnd : undefined}
                   onPointerDown={reorderMode ? (event) => handleReorderPointerDown(event, globalIndex) : undefined}
                   onPointerMove={reorderMode ? handleReorderPointerMove : undefined}
@@ -897,6 +968,7 @@ export function LiveView({isWebRTCDisabled, isHlsDisabled = false, isMseDisabled
                   )}
                   <PlaybackTransportCell
                     stream={stream}
+                    audioDisabled={audioDisabled}
                     offerings={{
                       webrtc: !isWebRTCDisabled,
                       mse: !isMseDisabled,
@@ -905,6 +977,7 @@ export function LiveView({isWebRTCDisabled, isHlsDisabled = false, isMseDisabled
                     defaultTransport="webrtc"
                     forcedTransport={forcedTransport}
                     useSubStream={!isSingleStream && fullscreenCellStream !== stream.name && (stream.has_sub_stream || !!stream.sub_stream_url)}
+                    fullscreenUpgraded={!isSingleStream && fullscreenCellStream === stream.name && (stream.has_sub_stream || !!stream.sub_stream_url)}
                     onToggleFullscreen={toggleStreamFullscreen}
                     streamId={stream.name}
                     showLabels={showLabels}
@@ -950,6 +1023,9 @@ export function LiveView({isWebRTCDisabled, isHlsDisabled = false, isMseDisabled
             </button>
           </div>
         ) : null}
+        </div>
+        )}
+        </div>
       </div>
     </section>
   );

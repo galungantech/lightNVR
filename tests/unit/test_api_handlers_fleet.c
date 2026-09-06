@@ -18,6 +18,7 @@
 #include "database/db_auth.h"
 #include "database/db_authorization.h"
 #include "database/db_camera_collections.h"
+#include "database/db_camera_observations.h"
 #include "database/db_camera_tags.h"
 #include "database/db_core.h"
 #include "database/db_fleet_query.h"
@@ -33,6 +34,8 @@
 #include "web/request_response.h"
 
 #define TEST_DB_PATH "/tmp/lightnvr_unit_fleet_query_test.db"
+#define OPERATOR_ROLE_UUID "00000000-0000-4000-8000-000000000002"
+#define VIEWER_ROLE_UUID "00000000-0000-4000-8000-000000000003"
 
 static stream_config_t make_stream(const char *name, const char *url,
                                    const char *tags, bool enabled) {
@@ -385,6 +388,53 @@ void test_existing_tag_rbac_is_applied_before_totals_and_facets(void) {
     cJSON_Delete(json);
 }
 
+void test_query_reports_camera_configure_capability_per_scope(void) {
+    stream_config_t editable = create_camera(
+        "Editable Camera", "rtsp://10.0.0.32/live", "Outdoor", true, NULL);
+    create_camera("Read Only Camera", "rtsp://10.0.0.33/live", "Indoor",
+                  true, NULL);
+    int64_t user_id = 0;
+    TEST_ASSERT_EQUAL_INT(
+        0, db_auth_create_user("fleetviewer", "password123", NULL,
+                               USER_ROLE_VIEWER, true, &user_id));
+    TEST_ASSERT_EQUAL_INT(0,
+                          db_authorization_set_user_mode(user_id, "policy"));
+    TEST_ASSERT_EQUAL_INT(
+        0, db_authorization_create_user_grant(
+               user_id, VIEWER_ROLE_UUID, "all", NULL, NULL, NULL));
+    char selector[512];
+    snprintf(selector, sizeof(selector),
+             "{\"version\":1,\"expression\":{\"op\":\"camera_uuid\","
+             "\"values\":[\"%s\"]}}",
+             editable.camera_uuid);
+    TEST_ASSERT_EQUAL_INT(
+        0, db_authorization_create_user_grant(
+               user_id, OPERATOR_ROLE_UUID, "selector", selector, NULL,
+               NULL));
+    char api_key[128] = {0};
+    TEST_ASSERT_EQUAL_INT(
+        0, db_auth_generate_api_key(user_id, api_key, sizeof(api_key)));
+    g_config.web_auth_enabled = true;
+
+    cJSON *json = call_handler(handle_post_fleet_camera_query, "{}",
+                               api_key, 200);
+    cJSON *cameras = cJSON_GetObjectItemCaseSensitive(json, "cameras");
+    TEST_ASSERT_EQUAL_INT(2, cJSON_GetArraySize(cameras));
+    cJSON *camera = NULL;
+    cJSON_ArrayForEach(camera, cameras) {
+        cJSON *name = cJSON_GetObjectItemCaseSensitive(camera, "name");
+        cJSON *can_configure =
+            cJSON_GetObjectItemCaseSensitive(camera, "can_configure");
+        TEST_ASSERT_TRUE(cJSON_IsBool(can_configure));
+        if (strcmp(name->valuestring, editable.name) == 0) {
+            TEST_ASSERT_TRUE(cJSON_IsTrue(can_configure));
+        } else {
+            TEST_ASSERT_FALSE(cJSON_IsTrue(can_configure));
+        }
+    }
+    cJSON_Delete(json);
+}
+
 void test_query_filters_by_collection_without_exposing_smart_rules(void) {
     stream_config_t outside = create_camera(
         "Outside", "rtsp://10.0.0.40/live", "Outdoor", true, NULL);
@@ -727,6 +777,64 @@ void test_saved_views_are_owner_scoped_shareable_and_revisioned(void) {
     cJSON_Delete(deleted);
 }
 
+void test_availability_distinguishes_live_offline_never_and_disabled(void) {
+    stream_config_t live = create_camera(
+        "Live Camera", "rtsp://camera/live", "", true, NULL);
+    stream_config_t offline = create_camera(
+        "Offline Camera", "rtsp://camera/offline", "", true, NULL);
+    create_camera("Never Camera", "rtsp://camera/never", "", true, NULL);
+    create_camera("Disabled Camera", "rtsp://camera/disabled", "", false,
+                  NULL);
+
+    TEST_ASSERT_EQUAL_INT(
+        0, db_camera_observation_record(offline.name, 1700000000, 1700000030));
+    TEST_ASSERT_EQUAL_INT(0, metrics_init(4));
+    metrics_record_frame(live.name, 4096, true);
+
+    cJSON *all = call_handler(
+        handle_post_fleet_camera_query,
+        "{\"selector\":{\"version\":1,\"expression\":{\"op\":\"all\"}},"
+        "\"availability\":\"all\",\"page_size\":20}", NULL, 200);
+    cJSON *facets = cJSON_GetObjectItemCaseSensitive(all, "facets");
+    cJSON *availability = cJSON_GetObjectItemCaseSensitive(
+        facets, "availability");
+    TEST_ASSERT_EQUAL_INT(4, cJSON_GetArraySize(availability));
+    cJSON_Delete(all);
+
+    cJSON *filtered = call_handler(
+        handle_post_fleet_camera_query,
+        "{\"selector\":{\"version\":1,\"expression\":{\"op\":\"all\"}},"
+        "\"availability\":\"offline\",\"page_size\":20}", NULL, 200);
+    TEST_ASSERT_EQUAL_INT(
+        1, cJSON_GetObjectItemCaseSensitive(filtered, "total")->valueint);
+    cJSON *camera = cJSON_GetArrayItem(
+        cJSON_GetObjectItemCaseSensitive(filtered, "cameras"), 0);
+    TEST_ASSERT_EQUAL_STRING(
+        "Offline Camera",
+        cJSON_GetObjectItemCaseSensitive(camera, "name")->valuestring);
+    TEST_ASSERT_EQUAL_STRING(
+        "offline",
+        cJSON_GetObjectItemCaseSensitive(camera, "availability")->valuestring);
+    TEST_ASSERT_EQUAL_INT64(
+        1700000000,
+        (int64_t)cJSON_GetObjectItemCaseSensitive(
+            camera, "first_video_at")->valuedouble);
+    cJSON_Delete(filtered);
+
+    filtered = call_handler(
+        handle_post_fleet_camera_query,
+        "{\"selector\":{\"version\":1,\"expression\":{\"op\":\"all\"}},"
+        "\"availability\":\"live\",\"page_size\":20}", NULL, 200);
+    TEST_ASSERT_EQUAL_INT(
+        1, cJSON_GetObjectItemCaseSensitive(filtered, "total")->valueint);
+    camera = cJSON_GetArrayItem(
+        cJSON_GetObjectItemCaseSensitive(filtered, "cameras"), 0);
+    TEST_ASSERT_EQUAL_STRING(
+        "Live Camera",
+        cJSON_GetObjectItemCaseSensitive(camera, "name")->valuestring);
+    cJSON_Delete(filtered);
+}
+
 int main(void) {
     unlink(TEST_DB_PATH);
     if (init_database(TEST_DB_PATH) != 0) {
@@ -738,12 +846,14 @@ int main(void) {
     RUN_TEST(test_query_composes_selector_search_sort_pagination_and_facets);
     RUN_TEST(test_preview_returns_bounded_match_explanation);
     RUN_TEST(test_existing_tag_rbac_is_applied_before_totals_and_facets);
+    RUN_TEST(test_query_reports_camera_configure_capability_per_scope);
     RUN_TEST(test_query_filters_by_collection_without_exposing_smart_rules);
     RUN_TEST(test_rejects_malformed_selector_and_oversized_page);
     RUN_TEST(test_recordings_filter_by_collection_uuid);
     RUN_TEST(test_thousand_camera_fixture_returns_only_requested_page);
     RUN_TEST(test_operational_queue_counts_follow_authorized_inventory);
     RUN_TEST(test_saved_views_are_owner_scoped_shareable_and_revisioned);
+    RUN_TEST(test_availability_distinguishes_live_offline_never_and_disabled);
     int result = UNITY_END();
     shutdown_database();
     unlink(TEST_DB_PATH);

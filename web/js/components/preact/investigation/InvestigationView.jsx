@@ -3,7 +3,13 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'preact/hooks'
 import { fetchJSON, useQuery } from '../../../query-client.js';
 import { useI18n } from '../../../i18n.js';
 import { Priority, queueThumbnailLoad } from '../../../request-queue.js';
+import {
+  fetchAllStreamSummaries,
+  resolveRecordedStreamSummary,
+} from '../../../utils/stream-summaries.js';
+import { isEptzEnabled } from '../../../utils/eptz-config.js';
 import { LoadingIndicator } from '../LoadingIndicator.jsx';
+import { FisheyeEptzCanvas } from '../FisheyeEptzCanvas.jsx';
 import { formatUtils } from '../recordings/formatUtils.js';
 import { InvestigationActions } from './InvestigationActions.jsx';
 import { InvestigationBookmarks } from './InvestigationBookmarks.jsx';
@@ -15,6 +21,8 @@ import {
   findSegmentAt,
   formatCursorTime,
   formatDateTimeLocal,
+  histogramEventTime,
+  investigationPlayerAspectRatio,
   normalizedRegionRectangle,
   narrowThumbnailWindow,
   parseDateTimeLocal,
@@ -58,23 +66,124 @@ function InvestigationPlayer({
   playing,
   speed,
   primary,
+  streamConfig,
   region,
   drawingRegion,
   onRegionChange,
   onRegionComplete,
   onMakePrimary,
+  onPlayingChange,
+  onSeek,
   t,
 }) {
   const videoRef = useRef(null);
+  const videoShellRef = useRef(null);
+  const videoFrameRef = useRef(null);
   const cursorRef = useRef(cursor);
   const regionAnchorRef = useRef(null);
-  const segment = findSegmentAt(track.segments, cursor);
-  const [status, setStatus] = useState(segment ? 'loading' : 'gap');
+  const coverageSegment = findSegmentAt(track.segments, cursor);
+  const [resolvedSegment, setResolvedSegment] = useState(null);
+  const [resolvedGap, setResolvedGap] = useState(null);
+  const segment = track.aggregated ? resolvedSegment : coverageSegment;
+  const cursorSecond = Math.floor(cursor);
+  const [status, setStatus] = useState(coverageSegment ? 'loading' : 'gap');
   const [videoDimensions, setVideoDimensions] = useState({ width: 16, height: 9 });
+  const [frameDimensions, setFrameDimensions] = useState({ width: 16, height: 9 });
+  // Region metadata is stored in raw-frame coordinates. Keep that workflow on
+  // the raw recording so drawing and the persisted boxes stay spatially exact.
+  const eptzConfigured = isEptzEnabled(streamConfig?.eptz_config);
+  const eptzActive = eptzConfigured && !drawingRegion && !region;
+  const playerAspectRatio = investigationPlayerAspectRatio(
+    videoDimensions.width, videoDimensions.height,
+  );
 
   useEffect(() => {
     cursorRef.current = cursor;
   }, [cursor]);
+
+  useEffect(() => {
+    const frame = videoFrameRef.current;
+    if (!frame) return undefined;
+    const updateFrameDimensions = () => {
+      const bounds = frame.getBoundingClientRect();
+      if (bounds.width <= 0 || bounds.height <= 0) return;
+      setFrameDimensions((current) =>
+        Math.abs(current.width - bounds.width) < 0.5 &&
+        Math.abs(current.height - bounds.height) < 0.5
+          ? current
+          : { width: bounds.width, height: bounds.height });
+    };
+    updateFrameDimensions();
+    if (typeof ResizeObserver === 'undefined') return undefined;
+    const observer = new ResizeObserver(updateFrameDimensions);
+    observer.observe(frame);
+    return () => observer.disconnect();
+  }, []);
+
+  useEffect(() => {
+    if (!track.aggregated) {
+      setResolvedSegment(null);
+      setResolvedGap(null);
+      return undefined;
+    }
+    if (!coverageSegment) {
+      setResolvedSegment(null);
+      setStatus('gap');
+      return undefined;
+    }
+    if (resolvedSegment && cursor >= resolvedSegment.start_time &&
+        cursor <= resolvedSegment.end_time) {
+      return undefined;
+    }
+    if (resolvedGap && cursor >= resolvedGap.start && cursor <= resolvedGap.end) {
+      setResolvedSegment(null);
+      setStatus('gap');
+      return undefined;
+    }
+
+    const controller = new AbortController();
+    setStatus('loading');
+    fetchJSON('/api/investigations/segment-at', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        camera_uuids: [track.camera_uuid],
+        timestamp: cursorSecond,
+      }),
+      signal: controller.signal,
+      timeout: 10000,
+      retries: 0,
+    }).then((data) => {
+      if (controller.signal.aborted) return;
+      if (data?.segment) {
+        setResolvedGap(null);
+        setResolvedSegment(data.segment);
+      } else {
+        const resolution = Math.max(1, track.aggregation_bucket_seconds || 1);
+        setResolvedSegment(null);
+        setResolvedGap({
+          start: Math.floor(cursor / resolution) * resolution,
+          end: (Math.floor(cursor / resolution) + 1) * resolution,
+        });
+        setStatus('gap');
+      }
+    }).catch((error) => {
+      if (!controller.signal.aborted) {
+        console.warn('Could not resolve investigation playback segment', error);
+        setStatus('error');
+      }
+    });
+    return () => controller.abort();
+  }, [
+    track.aggregated,
+    track.camera_uuid,
+    track.aggregation_bucket_seconds,
+    coverageSegment?.id,
+    cursorSecond,
+    resolvedSegment?.id,
+    resolvedGap?.start,
+    resolvedGap?.end,
+  ]);
 
   const seekToCursor = useCallback(() => {
     const video = videoRef.current;
@@ -140,8 +249,31 @@ function InvestigationPlayer({
     }
   }, [playing, speed, segment?.id]);
 
+  const toggleFullscreen = useCallback(async () => {
+    const shell = videoShellRef.current;
+    if (!shell) return;
+    const fullscreenElement = document.fullscreenElement ||
+      document.webkitFullscreenElement;
+    try {
+      if (fullscreenElement === shell) {
+        const exit = document.exitFullscreen || document.webkitExitFullscreen;
+        await exit?.call(document);
+        return;
+      }
+      const request = shell.requestFullscreen || shell.webkitRequestFullscreen;
+      if (request) {
+        await request.call(shell);
+      } else if (videoRef.current?.webkitEnterFullscreen) {
+        videoRef.current.webkitEnterFullscreen();
+      }
+    } catch (error) {
+      console.warn('Could not toggle investigation player fullscreen', error);
+    }
+  }, []);
+
   const regionContent = videoContentBox(
-    16, 9, videoDimensions.width, videoDimensions.height,
+    frameDimensions.width, frameDimensions.height,
+    videoDimensions.width, videoDimensions.height,
   );
   const pointFromEvent = (event) => {
     const bounds = event.currentTarget.getBoundingClientRect();
@@ -165,7 +297,7 @@ function InvestigationPlayer({
   };
 
   return (
-    <article className="investigation-player" data-status={segment ? status : 'gap'}>
+    <article className="investigation-player" data-status={coverageSegment ? status : 'gap'}>
       <header>
         <div>
           <strong>{track.name}</strong>
@@ -182,72 +314,120 @@ function InvestigationPlayer({
           {primary ? t('investigation.primaryAudio') : t('investigation.makePrimary')}
         </button>
       </header>
-      <div className="investigation-video-frame">
-        {segment ? (
-          <video
-            ref={videoRef}
-            muted={!primary}
-            playsInline
-            preload="metadata"
-            controls
-            onWaiting={() => setStatus('late')}
-            onPlaying={() => setStatus('ready')}
-            onCanPlay={() => setStatus('ready')}
-            onError={() => setStatus('error')}
-          />
-        ) : (
-          <div className="investigation-gap-state">
-            <span>{t('investigation.noFootageAtTime')}</span>
-            <time>{formatCursorTime(cursor)}</time>
-          </div>
-        )}
-        {segment && (drawingRegion || region) && (
-          <div
-            className={`investigation-region-layer ${drawingRegion ? 'is-drawing' : ''}`}
-            style={{
-              left: `${regionContent.left * 100}%`,
-              top: `${regionContent.top * 100}%`,
-              width: `${regionContent.width * 100}%`,
-              height: `${regionContent.height * 100}%`,
-            }}
-            aria-label={drawingRegion ? t('investigation.drawRegionPrompt') : undefined}
-            onPointerDown={(event) => {
-              if (!drawingRegion || (event.button !== undefined && event.button !== 0)) return;
-              event.preventDefault();
-              const point = pointFromEvent(event);
-              if (!point) return;
-              regionAnchorRef.current = point;
-              event.currentTarget.setPointerCapture?.(event.pointerId);
-            }}
-            onPointerMove={(event) => {
-              if (!drawingRegion || !regionAnchorRef.current) return;
-              const rectangle = normalizedRegionRectangle(
-                regionAnchorRef.current, pointFromEvent(event),
-              );
-              if (rectangle) onRegionChange(rectangle);
-            }}
-            onPointerUp={finishRegion}
-            onPointerCancel={() => {
-              regionAnchorRef.current = null;
-              onRegionComplete();
-            }}
-          >
-            {region && (
-              <span
-                className="investigation-region-rectangle"
-                style={{
-                  left: `${region.x * 100}%`,
-                  top: `${region.y * 100}%`,
-                  width: `${region.width * 100}%`,
-                  height: `${region.height * 100}%`,
-                }}
-              />
-            )}
-            {drawingRegion && !region && (
-              <span className="investigation-region-prompt">
-                {t('investigation.drawRegionPrompt')}
-              </span>
-            )}
+      <div className="investigation-video-shell" ref={videoShellRef}>
+        <div
+          className="investigation-video-frame"
+          ref={videoFrameRef}
+          style={{ aspectRatio: playerAspectRatio }}
+        >
+          {segment ? (
+            <video
+              ref={videoRef}
+              muted={!primary}
+              playsInline
+              preload="metadata"
+              controls={!eptzActive}
+              onWaiting={() => setStatus('late')}
+              onPlaying={() => setStatus('ready')}
+              onCanPlay={() => setStatus('ready')}
+              onError={() => setStatus('error')}
+            />
+          ) : status === 'loading' ? (
+            <div className="investigation-gap-state">
+              <span>{t('investigation.loading')}</span>
+              <time>{formatCursorTime(cursor)}</time>
+            </div>
+          ) : (
+            <div className="investigation-gap-state">
+              <span>{t('investigation.noFootageAtTime')}</span>
+              <time>{formatCursorTime(cursor)}</time>
+            </div>
+          )}
+          {segment && eptzActive && (
+            <FisheyeEptzCanvas
+              videoRef={videoRef}
+              eptzConfig={streamConfig?.eptz_config}
+              streamName={streamConfig?.name || track.name}
+            />
+          )}
+          {segment && (drawingRegion || region) && (
+            <div
+              className={`investigation-region-layer ${drawingRegion ? 'is-drawing' : ''}`}
+              style={{
+                left: `${regionContent.left * 100}%`,
+                top: `${regionContent.top * 100}%`,
+                width: `${regionContent.width * 100}%`,
+                height: `${regionContent.height * 100}%`,
+              }}
+              aria-label={drawingRegion ? t('investigation.drawRegionPrompt') : undefined}
+              onPointerDown={(event) => {
+                if (!drawingRegion || (event.button !== undefined && event.button !== 0)) return;
+                event.preventDefault();
+                const point = pointFromEvent(event);
+                if (!point) return;
+                regionAnchorRef.current = point;
+                event.currentTarget.setPointerCapture?.(event.pointerId);
+              }}
+              onPointerMove={(event) => {
+                if (!drawingRegion || !regionAnchorRef.current) return;
+                const rectangle = normalizedRegionRectangle(
+                  regionAnchorRef.current, pointFromEvent(event),
+                );
+                if (rectangle) onRegionChange(rectangle);
+              }}
+              onPointerUp={finishRegion}
+              onPointerCancel={() => {
+                regionAnchorRef.current = null;
+                onRegionComplete();
+              }}
+            >
+              {region && (
+                <span
+                  className="investigation-region-rectangle"
+                  style={{
+                    left: `${region.x * 100}%`,
+                    top: `${region.y * 100}%`,
+                    width: `${region.width * 100}%`,
+                    height: `${region.height * 100}%`,
+                  }}
+                />
+              )}
+              {drawingRegion && !region && (
+                <span className="investigation-region-prompt">
+                  {t('investigation.drawRegionPrompt')}
+                </span>
+              )}
+            </div>
+          )}
+        </div>
+        {segment && (
+          <div className="investigation-player-controls">
+            <button
+              type="button"
+              onClick={() => onPlayingChange(!playing)}
+              aria-label={playing ? t('investigation.pause') : t('investigation.play')}
+            >
+              <span aria-hidden="true">{playing ? '❚❚' : '▶'}</span>
+              <span>{playing ? t('investigation.pause') : t('investigation.play')}</span>
+            </button>
+            <input
+              type="range"
+              min={segment.start_time}
+              max={segment.end_time}
+              step="0.1"
+              value={Math.max(segment.start_time, Math.min(segment.end_time, cursor))}
+              aria-label={t('investigation.sharedCursor')}
+              onInput={(event) => onSeek(Number(event.target.value))}
+            />
+            <time>
+              {formatUtils.formatDuration(Math.max(0, cursor - segment.start_time))}
+              {' / '}
+              {formatUtils.formatDuration(segment.end_time - segment.start_time)}
+            </time>
+            <button type="button" onClick={toggleFullscreen}>
+              <span aria-hidden="true">⛶</span>
+              <span>{t('timeline.fullscreen')}</span>
+            </button>
           </div>
         )}
       </div>
@@ -338,6 +518,7 @@ function InvestigationHistogram({ histogram, startTime, endTime, onSeek, t }) {
             0.35,
             ((Math.min(bucket.end_time, endTime) - bucket.start_time) / duration) * 100,
           );
+          const eventTime = histogramEventTime(bucket);
           return (
             <button
               key={`${bucket.start_time}-${bucket.end_time}`}
@@ -347,9 +528,9 @@ function InvestigationHistogram({ histogram, startTime, endTime, onSeek, t }) {
                 width: `${width}%`,
                 height: `${Math.max(10, (bucket.count / maximum) * 100)}%`,
               }}
-              title={`${bucket.count} · ${formatCursorTime(bucket.start_time)}`}
-              aria-label={`${bucket.count} ${t('investigation.results')} · ${formatCursorTime(bucket.start_time)}`}
-              onClick={() => onSeek(bucket.start_time)}
+              title={`${bucket.count} · ${formatCursorTime(eventTime)}`}
+              aria-label={`${bucket.count} ${t('investigation.results')} · ${formatCursorTime(eventTime)}`}
+              onClick={() => onSeek(eventTime)}
             />
           );
         })}
@@ -564,13 +745,15 @@ export function InvestigationView() {
   const initialQueryLoaded = useRef(false);
   const requestController = useRef(null);
   const searchRequestController = useRef(null);
+  const searchSummaryController = useRef(null);
   const thumbnailRequestController = useRef(null);
   const lastUrlCursor = useRef(null);
 
   const { data: streamData, isLoading: streamsLoading, error: streamsError } =
-    useQuery('investigation-streams', '/api/streams', {
-      timeout: 15000,
-      retries: 1,
+    useQuery({
+      queryKey: ['investigation-streams', 'summary', 'live'],
+      queryFn: ({ signal }) => fetchAllStreamSummaries({ surface: 'live', signal }),
+      staleTime: 30000,
     });
   const streams = Array.isArray(streamData) ? streamData : [];
 
@@ -648,18 +831,20 @@ export function InvestigationView() {
           match: searchFilters.region.match,
           min_intersection: searchFilters.region.minIntersection,
         } : undefined;
+      const searchRequest = {
+        camera_uuids: cameraUuids,
+        start_time: Math.floor(searchStart),
+        end_time: Math.floor(searchEnd),
+        filters,
+        region: activeRegion,
+        cursor: pageCursor,
+        limit: 24,
+        include_summary: false,
+      };
       const data = await fetchJSON('/api/investigations/search', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          camera_uuids: cameraUuids,
-          start_time: Math.floor(searchStart),
-          end_time: Math.floor(searchEnd),
-          filters,
-          region: activeRegion,
-          cursor: pageCursor,
-          limit: 24,
-        }),
+        body: JSON.stringify(searchRequest),
         signal: controller.signal,
         timeout: 30000,
         retries: 0,
@@ -668,6 +853,43 @@ export function InvestigationView() {
       setSearchPageIndex(pageIndex);
       setSearchPageCursors(pageCursors);
       setSelectedResultId(null);
+
+      /* Results are intentionally the latency-sensitive request. Totals,
+       * facets, histogram, and coverage are populated independently so their
+       * scans never delay the first result rail. */
+      searchSummaryController.current?.abort();
+      const summaryController = new AbortController();
+      searchSummaryController.current = summaryController;
+      void fetchJSON('/api/investigations/search', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          ...searchRequest,
+          cursor: null,
+          summary_only: true,
+          include_summary: true,
+        }),
+        signal: summaryController.signal,
+        timeout: 30000,
+        retries: 0,
+      }).then((summary) => {
+        if (summaryController.signal.aborted) return;
+        setSearchData((current) => current ? {
+          ...current,
+          facets: summary.facets,
+          histogram: summary.histogram,
+          coverage: summary.coverage,
+          summary_complete: true,
+          page: {
+            ...current.page,
+            total: summary.page?.total ?? current.page?.total ?? 0,
+          },
+        } : current);
+      }).catch((summaryError) => {
+        if (!summaryController.signal.aborted) {
+          console.warn('Investigation summary query failed', summaryError);
+        }
+      });
 
       const url = new URL(window.location.href);
       const filterParams = {
@@ -799,6 +1021,7 @@ export function InvestigationView() {
   useEffect(() => () => {
     requestController.current?.abort();
     searchRequestController.current?.abort();
+    searchSummaryController.current?.abort();
     thumbnailRequestController.current?.abort();
   }, []);
 
@@ -1184,7 +1407,7 @@ export function InvestigationView() {
               <input
                 type="datetime-local"
                 value={formatDateTimeLocal(startTime)}
-                onChange={(event) => {
+                onInput={(event) => {
                   const value = parseDateTimeLocal(event.target.value);
                   if (value !== null) setStartTime(value);
                 }}
@@ -1195,14 +1418,14 @@ export function InvestigationView() {
               <input
                 type="datetime-local"
                 value={formatDateTimeLocal(endTime)}
-                onChange={(event) => {
+                onInput={(event) => {
                   const value = parseDateTimeLocal(event.target.value);
                   if (value !== null) setEndTime(value);
                 }}
               />
             </label>
             <button type="button" className="btn-primary" disabled={loading} onClick={loadTimeline}>
-              {loading ? t('investigation.loading') : t('investigation.load')}
+              {loading ? t('investigation.loading') : t('investigation.applyWindow')}
             </button>
           </div>
         </div>
@@ -1333,7 +1556,7 @@ export function InvestigationView() {
           </label>
           <button
             type="button"
-            className="btn-secondary"
+            className="btn-primary"
             disabled={!timeline || searchLoading}
             onClick={() => loadSearchPage(null, 0, [null])}
           >
@@ -1461,41 +1684,6 @@ export function InvestigationView() {
 
       {timeline && !loading && (
         <>
-          <section className="investigation-controls" aria-label={t('investigation.playbackControls')}>
-            <button
-              type="button"
-              className="btn-primary investigation-play-button"
-              onClick={() => setPlaying((value) => !value)}
-              disabled={activeTracks.length === 0}
-            >
-              {playing ? '❚❚' : '▶'}
-              <span>{playing ? t('investigation.pause') : t('investigation.play')}</span>
-            </button>
-            <label>
-              <span>{t('investigation.mode')}</span>
-              <select value={playbackMode} onChange={(event) => setPlaybackMode(event.target.value)}>
-                <option value="wall-clock">{t('investigation.wallClock')}</option>
-                <option value="skip-common-gaps">{t('investigation.skipCommonGaps')}</option>
-              </select>
-            </label>
-            <label>
-              <span>{t('investigation.speed')}</span>
-              <select value={speed} onChange={(event) => setSpeed(Number(event.target.value))}>
-                <option value="0.5">0.5×</option>
-                <option value="1">1×</option>
-                <option value="2">2×</option>
-                <option value="4">4×</option>
-              </select>
-            </label>
-            <div className="investigation-cursor-time">
-              <span>{t('investigation.sharedCursor')}</span>
-              <strong>{formatCursorTime(cursor)}</strong>
-            </div>
-            <span className="investigation-decoder-count">
-              {activeTracks.length}/{timeline.max_active_decoders} {t('investigation.activePlayers')}
-            </span>
-          </section>
-
           <section className="investigation-search-panel" aria-label={t('investigation.searchResults')}>
             <div className="investigation-results-heading">
               <div>
@@ -1664,6 +1852,10 @@ export function InvestigationView() {
                   playing={playing}
                   speed={speed}
                   primary={primaryCameraUuid === track.camera_uuid}
+                  streamConfig={resolveRecordedStreamSummary(streams, {
+                    cameraUuid: track.camera_uuid,
+                    streamName: track.name,
+                  })}
                   region={searchFilters.region?.cameraUuid === track.camera_uuid
                     ? searchFilters.region : null}
                   drawingRegion={drawingRegion &&
@@ -1674,6 +1866,11 @@ export function InvestigationView() {
                     setDrawingRegion(false);
                     setPrimaryCameraUuid(track.camera_uuid);
                   }}
+                  onPlayingChange={setPlaying}
+                  onSeek={(value) => {
+                    setPlaying(false);
+                    setCursor(value);
+                  }}
                   t={t}
                 />
               ))}
@@ -1681,6 +1878,41 @@ export function InvestigationView() {
           ) : (
             <div className="investigation-empty">{t('investigation.activateCamera')}</div>
           )}
+
+          <section className="investigation-controls" aria-label={t('investigation.playbackControls')}>
+            <button
+              type="button"
+              className="btn-primary investigation-play-button"
+              onClick={() => setPlaying((value) => !value)}
+              disabled={activeTracks.length === 0}
+            >
+              {playing ? '❚❚' : '▶'}
+              <span>{playing ? t('investigation.pause') : t('investigation.play')}</span>
+            </button>
+            <label>
+              <span>{t('investigation.mode')}</span>
+              <select value={playbackMode} onChange={(event) => setPlaybackMode(event.target.value)}>
+                <option value="wall-clock">{t('investigation.wallClock')}</option>
+                <option value="skip-common-gaps">{t('investigation.skipCommonGaps')}</option>
+              </select>
+            </label>
+            <label>
+              <span>{t('investigation.speed')}</span>
+              <select value={speed} onChange={(event) => setSpeed(Number(event.target.value))}>
+                <option value="0.5">0.5×</option>
+                <option value="1">1×</option>
+                <option value="2">2×</option>
+                <option value="4">4×</option>
+              </select>
+            </label>
+            <div className="investigation-cursor-time">
+              <span>{t('investigation.sharedCursor')}</span>
+              <strong>{formatCursorTime(cursor)}</strong>
+            </div>
+            <span className="investigation-decoder-count">
+              {activeTracks.length}/{timeline.max_active_decoders} {t('investigation.activePlayers')}
+            </span>
+          </section>
         </>
       )}
     </div>

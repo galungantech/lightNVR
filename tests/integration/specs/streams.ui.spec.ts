@@ -54,6 +54,13 @@ test.describe('Streams Page @ui @streams', () => {
       route.fulfill({ status: 204, body: '' }).catch(() => {});
     });
 
+    // Global setup uses synthetic go2rtc sources that are configured but do
+    // not update LightNVR recorder metrics. Show all availability states so
+    // configuration tests can see both those sources and disabled additions.
+    await page.addInitScript(() => {
+      localStorage.setItem('lightnvr-stream-availability', 'all');
+    });
+
     await login(page, USERS.admin);
   });
 
@@ -203,8 +210,8 @@ test.describe('Streams Page @ui @streams', () => {
 
     // Minimal stream list + full-detail stubs for route-based clone tests
     async function setupCloneMocks(page: any) {
-      await page.route('**/api/streams', route => route.fulfill({
-        json: [{
+      await page.route(/\/api\/streams(?:\?.*)?$/, route => route.fulfill({
+        json: { streams: [{
           name: MOCK_STREAM_NAME,
           url: 'rtsp://192.168.1.100/stream1',
           enabled: true,
@@ -219,7 +226,7 @@ test.describe('Streams Page @ui @streams', () => {
           segment_duration: 30,
           record: true,
           record_audio: true,
-        }]
+        }], total_pages: 1 }
       }));
 
       await page.route(`**/api/streams/${MOCK_STREAM_NAME}/full`, route => route.fulfill({
@@ -346,6 +353,39 @@ test.describe('Streams Page @ui @streams', () => {
   });
 
   test.describe('Stream Details', () => {
+    test('should link to the configured camera admin page', async ({ page }) => {
+      const adminUrl = 'https://camera.example/admin';
+      await page.route(/\/api\/streams(?:\?.*)?$/, route => route.fulfill({
+        json: {
+          streams: [{
+            name: 'admin_link_camera',
+            admin_url: adminUrl,
+            enabled: true,
+            status: 'Running',
+            width: 1920,
+            height: 1080,
+            fps: 25,
+            codec: 'h264',
+            protocol: 0,
+            record: true,
+            can_configure: true,
+          }],
+          total: 1,
+          total_pages: 1,
+        },
+      }));
+
+      const streamsPage = new StreamsPage(page);
+      await streamsPage.goto({ waitForNetworkIdle: true });
+
+      const card = streamsPage.getStreamByName('admin_link_camera');
+      const adminLink = card.locator('a[title="Open Camera Admin Page"]');
+      await expect(adminLink).toBeVisible();
+      await expect(adminLink).toHaveAttribute('href', adminUrl);
+      await expect(adminLink).toHaveAttribute('target', '_blank');
+      await expect(adminLink).toHaveAttribute('rel', 'noopener noreferrer');
+    });
+
     test('should show stream card with name and URL', async ({ page }) => {
       const streamsPage = new StreamsPage(page);
       await streamsPage.goto({ waitForNetworkIdle: true });
@@ -383,4 +423,3 @@ test.describe('Streams Page @ui @streams', () => {
     });
   });
 });
-

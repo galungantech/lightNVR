@@ -22,6 +22,8 @@
 #include <errno.h>
 #include <dirent.h>
 #include <limits.h>
+#include <pthread.h>
+#include <stdatomic.h>
 #include <sqlite3.h>
 #include <curl/curl.h>
 #include <uv.h>
@@ -53,6 +55,7 @@
 #include "database/db_recordings.h"
 #include "storage/storage_manager_streams.h"
 #include "storage/storage_manager_streams_cache.h"
+#include "telemetry/system_health.h"
 
 #ifdef USE_GO2RTC
 #include "video/go2rtc/go2rtc_api.h"
@@ -63,6 +66,92 @@ extern bool get_go2rtc_memory_usage(unsigned long long *memory_usage);
 
 // External declarations
 extern bool daemon_mode;
+
+#define SYSTEM_RECORDING_AGGREGATE_TTL_SECONDS 30
+#define SYSTEM_INFO_RESPONSE_TTL_SECONDS 15
+
+typedef struct {
+    pthread_mutex_t mutex;
+    time_t refreshed_at;
+    int count;
+    int64_t bytes;
+} system_recording_aggregate_cache_t;
+
+static system_recording_aggregate_cache_t recording_aggregate_cache = {
+    .mutex = PTHREAD_MUTEX_INITIALIZER,
+    .refreshed_at = 0,
+    .count = 0,
+    .bytes = 0,
+};
+
+static pthread_mutex_t system_info_response_mutex = PTHREAD_MUTEX_INITIALIZER;
+static char *system_info_response_json = NULL;
+static time_t system_info_response_refreshed_at = 0;
+static uint64_t system_info_response_snapshot_sequence = 0;
+
+static const system_health_observation_t *find_health_observation(
+    const system_health_snapshot_t *snapshot, const char *metric,
+    const char *resource) {
+    if (!snapshot || !metric) return NULL;
+    for (size_t index = 0; index < snapshot->observation_count; ++index) {
+        const system_health_observation_t *item = &snapshot->observations[index];
+        if (strcmp(item->metric, metric) == 0 &&
+            (!resource || strcmp(item->resource_id, resource) == 0))
+            return item;
+    }
+    return NULL;
+}
+
+static const system_health_observation_t *find_effective_health_observation(
+    const system_health_snapshot_t *snapshot, const char *container_metric,
+    const char *host_metric) {
+    const system_health_observation_t *item = find_health_observation(
+        snapshot, container_metric, NULL);
+    return item ? item : find_health_observation(snapshot, host_metric, NULL);
+}
+
+static bool health_observation_value(
+    const system_health_observation_t *observation, double *value) {
+    if (!observation || !observation->value_valid ||
+        observation->capability != SYSTEM_HEALTH_CAPABILITY_AVAILABLE)
+        return false;
+    *value = observation->value;
+    return true;
+}
+
+static void add_health_number(cJSON *object, const char *name,
+                              const system_health_observation_t *observation,
+                              double scale) {
+    double value;
+    if (health_observation_value(observation, &value))
+        cJSON_AddNumberToObject(object, name, value * scale);
+    else
+        cJSON_AddNullToObject(object, name);
+}
+
+static const char *health_capability(
+    const system_health_observation_t *observation) {
+    return observation
+        ? system_health_capability_name(observation->capability) : "error";
+}
+
+static void get_cached_recording_aggregates(int *count, int64_t *bytes) {
+    time_t now = time(NULL);
+    pthread_mutex_lock(&recording_aggregate_cache.mutex);
+    if (recording_aggregate_cache.refreshed_at == 0 ||
+        now - recording_aggregate_cache.refreshed_at >=
+            SYSTEM_RECORDING_AGGREGATE_TTL_SECONDS) {
+        int refreshed_count = get_recording_count(
+            0, 0, NULL, 0, NULL, -1, NULL, 0, NULL, NULL);
+        int64_t refreshed_bytes = get_stream_storage_bytes(NULL);
+        if (refreshed_count >= 0) recording_aggregate_cache.count = refreshed_count;
+        if (refreshed_bytes >= 0) recording_aggregate_cache.bytes = refreshed_bytes;
+        recording_aggregate_cache.refreshed_at = now;
+    }
+    *count = recording_aggregate_cache.count;
+    *bytes = recording_aggregate_cache.bytes;
+    pthread_mutex_unlock(&recording_aggregate_cache.mutex);
+}
 
 // Copies the src string after removing whitespace and single- or double-quotes.
 static void trim_copy_value(char *dest, size_t dest_size, const char *src) {
@@ -282,7 +371,8 @@ static void add_versions_to_json(cJSON *info) {
  * @brief Get memory usage of light-object-detect process
  *
  * @param memory_usage Pointer to store memory usage in bytes
- * @return true if successful, false otherwise (process not running)
+ * @return true when memory usage is known, including zero when the optional
+ *         detector is not running; false when usage could not be inspected
  */
 static bool get_detector_memory_usage(unsigned long long *memory_usage) {
     if (!memory_usage) {
@@ -331,8 +421,11 @@ static bool get_detector_memory_usage(unsigned long long *memory_usage) {
     closedir(proc_dir);
 
     if (pid <= 0) {
-        log_debug("No light-object-detect process found");
-        return false;
+        /* Object detection is optional.  An absent detector has a known RSS
+         * contribution of zero; reporting it as unavailable makes the System
+         * page imply that a healthy LightNVR installation is incomplete. */
+        log_debug("No light-object-detect process found; memory usage is zero");
+        return true;
     }
 
     // Get memory usage from /proc/{pid}/status
@@ -473,6 +566,7 @@ static int get_effective_cpu_cores(int *out_millicores) {
     return host_cores;
 }
 
+#if 0 /* Superseded by the background system-health sampler. */
 /**
  * Get the effective memory limit for this process (in bytes).
  *
@@ -689,6 +783,7 @@ static double get_effective_cpu_usage(void) {
     }
     return cpu_usage;
 }
+#endif
 
 /**
  * @brief Direct handler for GET /api/system/info
@@ -700,6 +795,35 @@ void handle_get_system_info(const http_request_t *req, http_response_t *res) {
     if (!httpd_authorize_global_action(req, res, AUTHZ_SYSTEM_ADMIN)) {
         return;  // Error response already set
     }
+
+    system_health_snapshot_t health_snapshot;
+    memset(&health_snapshot, 0, sizeof(health_snapshot));
+    bool health_snapshot_available =
+        system_health_snapshot_copy(&health_snapshot);
+    uint64_t health_sequence = health_snapshot_available
+        ? health_snapshot.sequence : 0U;
+
+    pthread_mutex_lock(&system_info_response_mutex);
+    time_t response_now = time(NULL);
+    if (system_info_response_json &&
+        system_info_response_snapshot_sequence == health_sequence &&
+        response_now - system_info_response_refreshed_at <
+            SYSTEM_INFO_RESPONSE_TTL_SECONDS) {
+        char *cached_json = strdup(system_info_response_json);
+        pthread_mutex_unlock(&system_info_response_mutex);
+        if (cached_json) {
+            http_response_set_json(res, 200, cached_json);
+            free(cached_json);
+            return;
+        }
+    } else {
+        pthread_mutex_unlock(&system_info_response_mutex);
+    }
+
+    int cached_recording_count = 0;
+    int64_t cached_recording_bytes = 0;
+    get_cached_recording_aggregates(&cached_recording_count,
+                                    &cached_recording_bytes);
 
     // Create JSON object
     cJSON *info = cJSON_CreateObject();
@@ -723,24 +847,64 @@ void handle_get_system_info(const http_request_t *req, http_response_t *res) {
         if (cpu) {
             cJSON_AddStringToObject(cpu, "model", system_info.machine);
 
-            // Get CPU cores (cgroup-aware: prefers container limit)
-            int millicores = 0;
-            int cores = get_effective_cpu_cores(&millicores);
+            // Prefer the effective quota already captured in this generation.
+            const system_health_observation_t *cpu_quota =
+                find_health_observation(&health_snapshot,
+                                        "container.cpu.quota_cores", NULL);
+            double quota_value = 0.0;
+            int cores = (int)sysconf(_SC_NPROCESSORS_ONLN);
+            if (health_observation_value(cpu_quota, &quota_value) &&
+                quota_value > 0.0) {
+                cores = (int)quota_value;
+                if ((double)cores < quota_value) cores++;
+                if (cores < 1) cores = 1;
+            }
             cJSON_AddNumberToObject(cpu, "cores", cores);
 
-            // Calculate CPU usage (cgroup-aware: prefers container-scoped stats)
-            double cpu_usage = get_effective_cpu_usage();
-            cJSON_AddNumberToObject(cpu, "usage", cpu_usage);
+            // Reuse the sampler's completed CPU delta. HTTP never establishes
+            // or advances the CPU baseline.
+            const system_health_observation_t *cpu_usage =
+                find_effective_health_observation(
+                    &health_snapshot, "container.cpu.usage_ratio",
+                    "host.cpu.busy_ratio");
+            add_health_number(cpu, "usage", cpu_usage, 100.0);
+            cJSON_AddStringToObject(cpu, "usageCapability",
+                                    health_capability(cpu_usage));
 
             // Add CPU object to info
             cJSON_AddItemToObject(info, "cpu", cpu);
         }
     }
 
-    // Get system-wide memory information first (cgroup-aware)
-    unsigned long long system_total = get_effective_memory_total();
-    unsigned long long system_used  = get_effective_memory_used();
-    unsigned long long system_free  = (system_total > system_used) ? (system_total - system_used) : 0;
+    // Select one effective memory scope from the same immutable snapshot used
+    // by the evaluator.
+    const system_health_observation_t *memory_total =
+        find_effective_health_observation(
+            &health_snapshot, "container.memory.limit_bytes",
+            "host.memory.total_bytes");
+    const system_health_observation_t *memory_free =
+        find_effective_health_observation(
+            &health_snapshot, "container.memory.available_bytes",
+            "host.memory.available_bytes");
+    const system_health_observation_t *memory_current =
+        find_health_observation(&health_snapshot,
+                                "container.memory.current_bytes", NULL);
+    double system_total_value = 0.0;
+    double system_free_value = 0.0;
+    double system_used_value = 0.0;
+    bool system_total_valid =
+        health_observation_value(memory_total, &system_total_value);
+    bool system_free_valid =
+        health_observation_value(memory_free, &system_free_value);
+    bool system_used_valid =
+        health_observation_value(memory_current, &system_used_value);
+    if (!system_used_valid && system_total_valid && system_free_valid) {
+        system_used_value = system_total_value > system_free_value
+            ? system_total_value - system_free_value : 0.0;
+        system_used_valid = true;
+    }
+    unsigned long long system_total = system_total_valid
+        ? (unsigned long long)system_total_value : 0U;
 
     // Get memory information for the LightNVR process
     // Compute the in-process LiteRT engine footprint once. It lives inside this
@@ -752,53 +916,51 @@ void handle_get_system_info(const http_request_t *req, http_response_t *res) {
     litert_used = (unsigned long long)litert_engine_registry_memory_bytes();
 #endif
 
+    // No resource filter: linux_process.c's collector stamps these
+    // observations with resource_id "lightnvr" (see prepare_observation()),
+    // not "process" -- passing "process" here made this lookup never match
+    // anything, unconditionally reporting process memory/thread count as
+    // unavailable. api_handlers_metrics.c looks up the same two metrics
+    // correctly with no resource filter at all (find_observation(..., NULL))
+    // -- matched that established, correct pattern instead of trying to
+    // guess the right resource string.
+    const system_health_observation_t *process_rss = find_health_observation(
+        &health_snapshot, "process.rss_bytes", NULL);
+    const system_health_observation_t *process_thread_observation =
+        find_health_observation(&health_snapshot, "process.threads", NULL);
+    double process_rss_value = 0.0;
+    double process_threads_value = 0.0;
+    bool process_rss_valid =
+        health_observation_value(process_rss, &process_rss_value);
+    bool process_threads_valid = health_observation_value(
+        process_thread_observation, &process_threads_value);
+
     cJSON *memory = cJSON_CreateObject();
-    unsigned long process_threads = 0;
     if (memory) {
-        // Get process memory usage and thread count using /proc/self/status
-        FILE *fp = fopen("/proc/self/status", "r");
-        unsigned long vm_rss = 0;
-
-        if (fp) {
-            char line[256];
-            while (fgets(line, sizeof(line), fp)) {
-                if (strncmp(line, "VmRSS:", 6) == 0) {
-                    // VmRSS is in kB - actual physical memory used
-                    char *endptr;
-                    vm_rss = strtoul(line + 6, &endptr, 10);
-                } else if (strncmp(line, "Threads:", 8) == 0) {
-                    char *endptr;
-                    process_threads = strtoul(line + 8, &endptr, 10);
-                }
-            }
-            fclose(fp);
-        }
-
-        // Convert kB to bytes
-        unsigned long long used = vm_rss * 1024;
-
-        // The in-process LiteRT detector is reported separately as
-        // detectorMemory; subtract it here so the process and detector
-        // figures (summed by the UI) don't double-count the same RSS.
-        used = (used > litert_used) ? (used - litert_used) : 0;
-
-        // Use the system total memory as the total for LightNVR as well
-        // This makes it simpler to understand the memory usage
-        unsigned long long total = system_total;
-
-        // Calculate free as the difference between total and used
-        unsigned long long free = (total > used) ? (total - used) : 0;
-
-        cJSON_AddNumberToObject(memory, "total", (double)total);
-        cJSON_AddNumberToObject(memory, "used", (double)used);
-        cJSON_AddNumberToObject(memory, "free", (double)free);
+        double used = process_rss_value > (double)litert_used
+            ? process_rss_value - (double)litert_used : 0.0;
+        add_health_number(memory, "total", memory_total, 1.0);
+        if (process_rss_valid)
+            cJSON_AddNumberToObject(memory, "used", used);
+        else
+            cJSON_AddNullToObject(memory, "used");
+        if (system_total_valid && process_rss_valid)
+            cJSON_AddNumberToObject(memory, "free",
+                system_total_value > used ? system_total_value - used : 0.0);
+        else
+            cJSON_AddNullToObject(memory, "free");
+        cJSON_AddStringToObject(memory, "capability",
+                                health_capability(process_rss));
 
         // Add memory object to info
         cJSON_AddItemToObject(info, "memory", memory);
     }
 
     // Add process thread count and web thread pool size
-    cJSON_AddNumberToObject(info, "threads", (double)process_threads);
+    if (process_threads_valid)
+        cJSON_AddNumberToObject(info, "threads", process_threads_value);
+    else
+        cJSON_AddNullToObject(info, "threads");
     cJSON_AddNumberToObject(info, "webThreadPoolSize", (double)g_config.web_thread_pool_size);
 
     // Get memory information for the go2rtc process
@@ -807,21 +969,25 @@ void handle_get_system_info(const http_request_t *req, http_response_t *res) {
         unsigned long long go2rtc_used = 0;
 
         // Try to get go2rtc memory usage
-        if (get_go2rtc_memory_usage(&go2rtc_used)) {
+        bool go2rtc_memory_valid = get_go2rtc_memory_usage(&go2rtc_used);
+        if (go2rtc_memory_valid) {
             log_debug("go2rtc memory usage: %llu bytes", go2rtc_used);
         } else {
-            log_warn("Failed to get go2rtc memory usage, using 0");
+            log_warn("Failed to get go2rtc memory usage");
         }
 
-        // Use the system total memory as the total for go2rtc as well
-        unsigned long long total = system_total;
-
-        // Calculate free as the difference between total and used
-        unsigned long long free = (total > go2rtc_used) ? (total - go2rtc_used) : 0;
-
-        cJSON_AddNumberToObject(go2rtc_memory, "total", (double)total);
-        cJSON_AddNumberToObject(go2rtc_memory, "used", (double)go2rtc_used);
-        cJSON_AddNumberToObject(go2rtc_memory, "free", (double)free);
+        add_health_number(go2rtc_memory, "total", memory_total, 1.0);
+        if (go2rtc_memory_valid)
+            cJSON_AddNumberToObject(go2rtc_memory, "used",
+                                    (double)go2rtc_used);
+        else
+            cJSON_AddNullToObject(go2rtc_memory, "used");
+        if (go2rtc_memory_valid && system_total_valid)
+            cJSON_AddNumberToObject(go2rtc_memory, "free",
+                system_total > go2rtc_used ? (double)(system_total - go2rtc_used)
+                                           : 0.0);
+        else
+            cJSON_AddNullToObject(go2rtc_memory, "free");
 
         // Add go2rtc memory object to info
         cJSON_AddItemToObject(info, "go2rtcMemory", go2rtc_memory);
@@ -832,11 +998,13 @@ void handle_get_system_info(const http_request_t *req, http_response_t *res) {
     if (detector_memory) {
         unsigned long long detector_used = 0;
 
-        // Try to get light-object-detect memory usage (returns false if not running)
-        if (get_detector_memory_usage(&detector_used)) {
+        // An optional detector that is not running contributes a known zero.
+        // False is reserved for failures that prevent memory inspection.
+        bool detector_memory_valid = get_detector_memory_usage(&detector_used);
+        if (detector_memory_valid) {
             log_debug("light-object-detect memory usage: %llu bytes", detector_used);
         } else {
-            log_debug("light-object-detect not running or memory unavailable, using 0");
+            log_debug("light-object-detect not running or memory unavailable");
         }
 
         // Add the in-process LiteRT engine footprint (computed above and
@@ -845,18 +1013,22 @@ void handle_get_system_info(const http_request_t *req, http_response_t *res) {
         // no separate detector process to scan for the LiteRT backend.
         if (litert_used > 0) {
             detector_used += litert_used;
+            detector_memory_valid = true;
             log_debug("in-process LiteRT engine memory: %llu bytes", litert_used);
         }
 
-        // Use the system total memory as the total for detector as well
-        unsigned long long total = system_total;
-
-        // Calculate free as the difference between total and used
-        unsigned long long free = (total > detector_used) ? (total - detector_used) : 0;
-
-        cJSON_AddNumberToObject(detector_memory, "total", (double)total);
-        cJSON_AddNumberToObject(detector_memory, "used", (double)detector_used);
-        cJSON_AddNumberToObject(detector_memory, "free", (double)free);
+        add_health_number(detector_memory, "total", memory_total, 1.0);
+        if (detector_memory_valid)
+            cJSON_AddNumberToObject(detector_memory, "used",
+                                    (double)detector_used);
+        else
+            cJSON_AddNullToObject(detector_memory, "used");
+        if (detector_memory_valid && system_total_valid)
+            cJSON_AddNumberToObject(detector_memory, "free",
+                system_total > detector_used ? (double)(system_total - detector_used)
+                                             : 0.0);
+        else
+            cJSON_AddNullToObject(detector_memory, "free");
 
         // Add detector memory object to info
         cJSON_AddItemToObject(info, "detectorMemory", detector_memory);
@@ -865,64 +1037,79 @@ void handle_get_system_info(const http_request_t *req, http_response_t *res) {
     // Get system-wide memory information
     cJSON *system_memory = cJSON_CreateObject();
     if (system_memory) {
-        cJSON_AddNumberToObject(system_memory, "total", (double)system_total);
-        cJSON_AddNumberToObject(system_memory, "used", (double)system_used);
-        cJSON_AddNumberToObject(system_memory, "free", (double)system_free);
+        add_health_number(system_memory, "total", memory_total, 1.0);
+        if (system_used_valid)
+            cJSON_AddNumberToObject(system_memory, "used", system_used_value);
+        else
+            cJSON_AddNullToObject(system_memory, "used");
+        add_health_number(system_memory, "free", memory_free, 1.0);
+        cJSON_AddStringToObject(system_memory, "capability",
+            system_total_valid && system_free_valid ? "available" :
+            health_capability(!system_total_valid ? memory_total : memory_free));
 
         // Add system memory object to info
         cJSON_AddItemToObject(info, "systemMemory", system_memory);
     }
 
-    /* Use the same startup timestamp as /api/health. Linux time namespaces can
-     * expose /proc/uptime and /proc/self/stat with different offsets, which
-     * previously produced values such as -34s in containers (#475). */
+    /* The System page describes this LightNVR instance, so its uptime follows
+     * the process/container lifecycle. Host uptime remains available through
+     * the system-health API and Prometheus metrics. Using the host observation
+     * here made freshly deployed pods appear as old as their Kubernetes node. */
     cJSON_AddNumberToObject(info, "uptime", get_process_uptime_seconds());
+    cJSON_AddStringToObject(
+        info, "uptimeCapability",
+        system_health_capability_name(SYSTEM_HEALTH_CAPABILITY_AVAILABLE));
 
-    // Get disk information for the configured storage path
-    struct statvfs disk_info;
-    if (statvfs(g_config.storage_path, &disk_info) == 0) {
-        // Create disk object for LightNVR storage
-        cJSON *disk = cJSON_CreateObject();
-        if (disk) {
-            // Calculate disk values in bytes for consistency
-            unsigned long long total = disk_info.f_blocks * disk_info.f_frsize;
-            unsigned long long free = disk_info.f_bfree * disk_info.f_frsize;
+    // Filesystem capacity comes from the completed sampler generation. The
+    // recording DB byte count retains the legacy meaning of disk.used.
+    const system_health_observation_t *recording_total =
+        find_health_observation(&health_snapshot, "filesystem.capacity_bytes",
+                                "recording");
+    const system_health_observation_t *recording_free =
+        find_health_observation(&health_snapshot, "filesystem.available_bytes",
+                                "recording");
+    if (!recording_total)
+        recording_total = find_health_observation(
+            &health_snapshot, "filesystem.capacity_bytes", "root");
+    if (!recording_free)
+        recording_free = find_health_observation(
+            &health_snapshot, "filesystem.available_bytes", "root");
+    cJSON *disk = cJSON_CreateObject();
+    if (disk) {
+        add_health_number(disk, "total", recording_total, 1.0);
+        cJSON_AddNumberToObject(disk, "used", (double)cached_recording_bytes);
+        add_health_number(disk, "free", recording_free, 1.0);
+        cJSON_AddStringToObject(disk, "capability",
+            health_capability(recording_total ? recording_total : recording_free));
+        cJSON_AddItemToObject(info, "disk", disk);
+    }
 
-            // Recording usage comes from the DB (SUM of completed recording
-            // sizes) — O(1) vs walking hundreds of thousands of files on HDD.
-            int64_t db_bytes = get_stream_storage_bytes(NULL);
-            unsigned long long used = (db_bytes > 0) ? (unsigned long long)db_bytes : 0;
-            if (used == 0) {
-                // Fallback to statvfs estimation when DB has no recordings yet
-                used = (disk_info.f_blocks - disk_info.f_bfree) * disk_info.f_frsize;
-            }
-
-            cJSON_AddNumberToObject(disk, "total", (double)total);
-            cJSON_AddNumberToObject(disk, "used", (double)used);
-            cJSON_AddNumberToObject(disk, "free", (double)free);
-
-            // Add disk object to info
-            cJSON_AddItemToObject(info, "disk", disk);
-        }
-
-        // Create system-wide disk object
-        cJSON *system_disk = cJSON_CreateObject();
-        if (system_disk) {
-            // Get system-wide disk information
-            struct statvfs root_disk_info;
-            if (statvfs("/", &root_disk_info) == 0) {
-                unsigned long long total = root_disk_info.f_blocks * root_disk_info.f_frsize;
-                unsigned long long free = root_disk_info.f_bfree * root_disk_info.f_frsize;
-                unsigned long long used = total - free;
-
-                cJSON_AddNumberToObject(system_disk, "total", (double)total);
-                cJSON_AddNumberToObject(system_disk, "used", (double)used);
-                cJSON_AddNumberToObject(system_disk, "free", (double)free);
-            }
-
-            // Add system disk object to info
-            cJSON_AddItemToObject(info, "systemDisk", system_disk);
-        }
+    const system_health_observation_t *root_total =
+        find_health_observation(&health_snapshot, "filesystem.capacity_bytes",
+                                "root");
+    const system_health_observation_t *root_free =
+        find_health_observation(&health_snapshot, "filesystem.available_bytes",
+                                "root");
+    double root_total_value = 0.0;
+    double root_free_value = 0.0;
+    bool root_total_valid = health_observation_value(root_total,
+                                                      &root_total_value);
+    bool root_free_valid = health_observation_value(root_free,
+                                                     &root_free_value);
+    cJSON *system_disk = cJSON_CreateObject();
+    if (system_disk) {
+        add_health_number(system_disk, "total", root_total, 1.0);
+        if (root_total_valid && root_free_valid)
+            cJSON_AddNumberToObject(system_disk, "used",
+                root_total_value > root_free_value
+                    ? root_total_value - root_free_value : 0.0);
+        else
+            cJSON_AddNullToObject(system_disk, "used");
+        add_health_number(system_disk, "free", root_free, 1.0);
+        cJSON_AddStringToObject(system_disk, "capability",
+            root_total_valid && root_free_valid ? "available" :
+            health_capability(!root_total_valid ? root_total : root_free));
+        cJSON_AddItemToObject(info, "systemDisk", system_disk);
     }
 
     // Add global storage policy settings so the frontend can display effective retention per stream
@@ -931,6 +1118,37 @@ void handle_get_system_info(const http_request_t *req, http_response_t *res) {
     // Add runtime software/library versions for vulnerability auditing and support
     add_versions_to_json(info);
 
+    // Preserve the legacy network/interfaces shape while sourcing carrier state
+    // from the privacy-safe logical interface IDs in the health snapshot.
+    cJSON *network = cJSON_CreateObject();
+    cJSON *interfaces = cJSON_CreateArray();
+    if (network && interfaces) {
+        for (size_t index = 0; index < health_snapshot.observation_count;
+             ++index) {
+            const system_health_observation_t *carrier =
+                &health_snapshot.observations[index];
+            if (strcmp(carrier->metric, "network.carrier") != 0) continue;
+            cJSON *iface = cJSON_CreateObject();
+            if (!iface) continue;
+            cJSON_AddStringToObject(iface, "name", carrier->resource_id);
+            cJSON_AddStringToObject(iface, "address", "Unavailable");
+            cJSON_AddStringToObject(iface, "mac", "Unavailable");
+            if (carrier->value_valid)
+                cJSON_AddBoolToObject(iface, "up", carrier->value != 0.0);
+            else
+                cJSON_AddNullToObject(iface, "up");
+            cJSON_AddStringToObject(iface, "capability",
+                                    health_capability(carrier));
+            cJSON_AddItemToArray(interfaces, iface);
+        }
+        cJSON_AddItemToObject(network, "interfaces", interfaces);
+        cJSON_AddItemToObject(info, "network", network);
+    } else {
+        cJSON_Delete(network);
+        cJSON_Delete(interfaces);
+    }
+
+#if 0 /* Replaced by the completed system-health snapshot above. */
     // Create network object
     cJSON *network = cJSON_CreateObject();
     if (network) {
@@ -1014,7 +1232,8 @@ void handle_get_system_info(const http_request_t *req, http_response_t *res) {
 
                     // Read interfaces
                     while (headers_read && fgets(line, sizeof(line), fp)) {
-                        char *name = strtok(line, ":");
+                        char *saveptr = NULL;
+                        char *name = strtok_r(line, ":", &saveptr);
                         if (name) {
                             // Trim whitespace
                             while (*name == ' ') name++;
@@ -1132,6 +1351,7 @@ void handle_get_system_info(const http_request_t *req, http_response_t *res) {
         cJSON_AddItemToObject(info, "network", network);
     }
 
+#endif
     // Create streams object
     cJSON *streams_obj = cJSON_CreateObject();
     if (streams_obj) {
@@ -1150,23 +1370,12 @@ void handle_get_system_info(const http_request_t *req, http_response_t *res) {
     cJSON *recordings = cJSON_CreateObject();
     if (recordings) {
         // Get recordings count from database using the db_recordings function
-        int recording_count = 0;
-
-        // Use the get_recording_count function from db_recordings.h
-        // Parameters: start_time, end_time, stream_name, has_detection
-        // Pass 0 for start_time and end_time to get all recordings
-        // Pass NULL for stream_name to get recordings from all streams
-        // Pass 0 for has_detection to get all recordings regardless of detection status
-        recording_count = get_recording_count(0, 0, NULL, 0, NULL, -1, NULL, 0, NULL, NULL);
-        if (recording_count < 0) {
-            recording_count = 0; // Reset if query fails
-            log_error("Failed to get recording count from database");
-        }
+        int recording_count = cached_recording_count;
 
         // Recordings size comes from the DB (SUM of completed recording sizes).
         // Avoids a full filesystem walk that could take many minutes on HDD
         // deployments with hundreds of thousands of segments (#368).
-        int64_t recording_size_db = get_stream_storage_bytes(NULL);
+        int64_t recording_size_db = cached_recording_bytes;
         unsigned long long recording_size =
             (recording_size_db > 0) ? (unsigned long long)recording_size_db : 0;
 
@@ -1190,6 +1399,15 @@ void handle_get_system_info(const http_request_t *req, http_response_t *res) {
     }
 
     // Send response
+    pthread_mutex_lock(&system_info_response_mutex);
+    char *cached_copy = strdup(json_str);
+    if (cached_copy) {
+        free(system_info_response_json);
+        system_info_response_json = cached_copy;
+        system_info_response_refreshed_at = time(NULL);
+        system_info_response_snapshot_sequence = health_sequence;
+    }
+    pthread_mutex_unlock(&system_info_response_mutex);
     http_response_set_json(res, 200, json_str);
 
     // Clean up
@@ -1320,14 +1538,28 @@ void handle_post_system_shutdown(const http_request_t *req, http_response_t *res
     log_info("Initiating shutdown through coordinator");
     initiate_shutdown();
 
-    // Schedule shutdown with a more robust approach for MIPS systems
-    extern volatile bool running;
+    extern _Atomic bool running;
     running = false;
+    // Let a long-running background operation (e.g. a scheduled DB backup)
+    // abort promptly instead of silently blocking this shutdown until it
+    // finishes -- mirrors request_restart()'s identical call for the
+    // restart path (main.c); see shutdown_coordinator.c's header comment
+    // for why this is a separate, lighter-weight flag from
+    // initiate_shutdown() above.
+    request_background_abort();
 
-    // Set an alarm to force exit if normal shutdown doesn't work
-    // This is especially important for Linux 4.4 embedded MIPS systems
-    log_info("Setting up fallback exit timer for Linux 4.4 compatibility");
-    alarm(15); // Force exit after 15 seconds if normal shutdown fails
+    // Deliberately no local alarm()-based force-exit timer here (this used
+    // to set one, framed as "more robust for Linux 4.4 embedded MIPS
+    // systems"): alarm() is a single process-wide timer, and it would race
+    // with the many short-lived, save/restore-disposition alarm() calls
+    // hls_unified_thread.c/hls_writer.c make elsewhere in the process --
+    // whichever fires first silently cancels whatever time was left on the
+    // other, since alarm() has no pause/resume. main()'s
+    // shutdown_watchdog_thread (a plain thread polling `running`, immune to
+    // that collision) already force-kills the process group process-wide if
+    // shutdown doesn't complete in time, covering this endpoint too -- see
+    // its comment in main.c for the full story, including the live gdb
+    // trace that first caught this exact collision on the restart path.
 
     // NOTE: We previously sent SIGTERM to self here, but this was causing system-wide shutdown
     // instead of just application shutdown. This has been removed to fix that issue.

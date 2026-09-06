@@ -6,6 +6,7 @@ import { showStatusMessage } from '../ToastContainer.jsx';
 import { formatUtils } from './formatUtils.js';
 import { urlUtils } from './urlUtils.js';
 import { fetchJSON, enhancedFetch } from '../../../fetch-utils.js';
+import { fetchAllStreamSummaries } from '../../../utils/stream-summaries.js';
 import {
   useQuery,
   useMutation,
@@ -24,7 +25,6 @@ const getRecordingStartTime = (recording) =>
 
 // Default timeout/retry configuration for recordings API calls
 const DEFAULT_TIMEOUT = 15000;       // 15 second timeout
-const DEFAULT_RETRIES = 2;           // Retry twice
 const DEFAULT_RETRY_DELAY = 1000;    // 1 second between retries
 
 // Batch delete specific configuration
@@ -175,10 +175,10 @@ export const recordingsAPI = {
      * @returns {Object} Query result
      */
     useStreams: () => {
-      return useQuery('streams', '/api/streams', {
-        timeout: 15000, // 15 second timeout
-        retries: 2,     // Retry twice
-        retryDelay: 1000 // 1 second between retries
+      return useQuery({
+        queryKey: ['streams', 'recordings-summary'],
+        queryFn: ({ signal }) => fetchAllStreamSummaries({ signal }),
+        staleTime: 30000,
       });
     },
 
@@ -284,11 +284,7 @@ export const recordingsAPI = {
    */
   loadStreams: async () => {
     try {
-      const data = await fetchJSON('/api/streams', {
-        timeout: DEFAULT_TIMEOUT,
-        retries: DEFAULT_RETRIES,
-        retryDelay: DEFAULT_RETRY_DELAY
-      });
+      const data = await fetchAllStreamSummaries();
 
       return data || [];
     } catch (error) {
@@ -749,7 +745,7 @@ export const recordingsAPI = {
    * Get all unique recording tags
    * @returns {Promise<string[]>} Array of unique tags
    */
-  getAllRecordingTags: async () => {
+  getAllRecordingTags: async ({ throwOnError = false } = {}) => {
     try {
       const data = await fetchJSON('/api/recordings/tags', {
         timeout: 10000,
@@ -759,6 +755,7 @@ export const recordingsAPI = {
       return data.tags || [];
     } catch (error) {
       console.error('Error fetching recording tags:', error);
+      if (throwOnError) throw error;
       return [];
     }
   },
@@ -767,7 +764,7 @@ export const recordingsAPI = {
    * Get all unique detection labels
    * @returns {Promise<string[]>} Array of unique detection labels
    */
-  getAllDetectionLabels: async () => {
+  getAllDetectionLabels: async ({ throwOnError = false } = {}) => {
     try {
       const data = await fetchJSON('/api/recordings/detection-labels', {
         timeout: 10000,
@@ -777,6 +774,7 @@ export const recordingsAPI = {
       return data.labels || [];
     } catch (error) {
       console.error('Error fetching detection labels:', error);
+      if (throwOnError) throw error;
       return [];
     }
   },

@@ -1,6 +1,16 @@
 export const MAX_INVESTIGATION_CAMERAS = 16;
 export const MAX_ACTIVE_INVESTIGATION_PLAYERS = 4;
 
+export function investigationPlayerAspectRatio(width, height) {
+  const normalizedWidth = Number(width);
+  const normalizedHeight = Number(height);
+  if (!Number.isFinite(normalizedWidth) || normalizedWidth <= 0 ||
+      !Number.isFinite(normalizedHeight) || normalizedHeight <= 0) {
+    return '16 / 9';
+  }
+  return `${normalizedWidth} / ${normalizedHeight}`;
+}
+
 const REGION_MATCHES = new Set(['center', 'intersects', 'minimum_intersection']);
 
 function roundedRegionValue(value) {
@@ -291,6 +301,11 @@ export function segmentTrackPosition(segment, startTime, endTime) {
     left: `${Math.max(0, ((clippedStart - startTime) / duration) * 100)}%`,
     width: `${Math.max(0.2, ((clippedEnd - clippedStart) / duration) * 100)}%`,
   };
+}
+
+export function histogramEventTime(bucket) {
+  return Number.isFinite(bucket?.event_time)
+    ? bucket.event_time : bucket?.start_time;
 }
 
 export function adjacentInvestigationResultIndex(results, selectedResultId, direction) {

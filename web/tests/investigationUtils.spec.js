@@ -5,6 +5,8 @@ import {
   buildInvestigationBookmarkPayload,
   findSegmentAt,
   formatDateTimeLocal,
+  histogramEventTime,
+  investigationPlayerAspectRatio,
   nextAvailableTimestamp,
   narrowThumbnailWindow,
   normalizedRegionRectangle,
@@ -71,6 +73,11 @@ test('segmentTrackPosition clips segments to the visible UTC window', () => {
   )).toEqual({ left: '0%', width: '20%' });
 });
 
+test('histogram bars seek to a matching event instead of the bucket boundary', () => {
+  expect(histogramEventTime({ start_time: 100, event_time: 137 })).toBe(137);
+  expect(histogramEventTime({ start_time: 100 })).toBe(100);
+});
+
 test('adjacent result navigation is stable by opaque result id', () => {
   const results = [
     { result_id: 'detection:9' },
@@ -131,6 +138,13 @@ test('videoContentBox accounts for letterboxing and pillarboxing', () => {
   expect(letterboxed.width).toBe(1);
   expect(letterboxed.top).toBeCloseTo(0.119047619);
   expect(letterboxed.height).toBeCloseTo(0.761904762);
+});
+
+test('investigation players adopt the loaded recording aspect ratio', () => {
+  expect(investigationPlayerAspectRatio(2560, 1920)).toBe('2560 / 1920');
+  expect(investigationPlayerAspectRatio(1920, 1080)).toBe('1920 / 1080');
+  expect(investigationPlayerAspectRatio(0, 0)).toBe('16 / 9');
+  expect(investigationPlayerAspectRatio('unknown', 1080)).toBe('16 / 9');
 });
 
 test('normalizedRegionRectangle supports reverse drag and clamps to the image', () => {

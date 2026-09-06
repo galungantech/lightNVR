@@ -1541,6 +1541,359 @@ static const char migration_0072_down[] =
     "DROP INDEX IF EXISTS idx_storage_policy_violations_active;\n"
     "DROP TABLE IF EXISTS storage_policy_violations;";
 
+static const char migration_0073_up[] =
+    "ALTER TABLE streams ADD COLUMN eptz_config TEXT NOT NULL DEFAULT '' "
+    "CHECK(length(eptz_config) <= 1023);";
+
+static const char migration_0073_down[] =
+    "-- SQLite cannot drop a column while retaining compatibility with older builds.";
+
+static const char migration_0074_up[] =
+    "CREATE TABLE user_workspace_preferences (\n"
+    "    owner_user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,\n"
+    "    workspace_key TEXT NOT NULL CHECK (workspace_key IN "
+    "('live.navigator','investigation')),\n"
+    "    is_visible INTEGER NOT NULL CHECK (is_visible IN (0, 1)),\n"
+    "    updated_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now'))\n"
+    ");\n"
+    "CREATE UNIQUE INDEX idx_user_workspace_preferences_owner_key "
+    "ON user_workspace_preferences(COALESCE(owner_user_id, 0), workspace_key);\n"
+    "CREATE TABLE camera_observations (\n"
+    "    camera_uuid TEXT PRIMARY KEY REFERENCES streams(camera_uuid) "
+    "ON DELETE CASCADE,\n"
+    "    first_video_at INTEGER NOT NULL DEFAULT 0,\n"
+    "    last_video_at INTEGER NOT NULL DEFAULT 0,\n"
+    "    last_recording_at INTEGER NOT NULL DEFAULT 0,\n"
+    "    updated_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now'))\n"
+    ");\n"
+    "CREATE INDEX idx_camera_observations_last_video "
+    "ON camera_observations(last_video_at DESC, camera_uuid);\n"
+    "INSERT INTO camera_observations(camera_uuid, first_video_at, "
+    "last_video_at, last_recording_at) "
+    "SELECT r.camera_uuid, MIN(r.start_time), "
+    "MAX(COALESCE(r.end_time, r.start_time)), "
+    "MAX(COALESCE(r.end_time, r.start_time)) "
+    "FROM recordings r JOIN streams s ON s.camera_uuid = r.camera_uuid "
+    "WHERE r.camera_uuid IS NOT NULL AND r.camera_uuid <> '' "
+    "AND r.is_complete = 1 GROUP BY r.camera_uuid;";
+
+static const char migration_0074_down[] =
+    "DROP INDEX IF EXISTS idx_camera_observations_last_video;\n"
+    "DROP TABLE IF EXISTS camera_observations;\n"
+    "DROP INDEX IF EXISTS idx_user_workspace_preferences_owner_key;\n"
+    "DROP TABLE IF EXISTS user_workspace_preferences;";
+
+static const char migration_0075_up[] =
+    "CREATE TABLE live_saved_layouts ("
+    "uuid TEXT PRIMARY KEY,"
+    "owner_user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,"
+    "name TEXT NOT NULL COLLATE NOCASE,"
+    "is_shared INTEGER NOT NULL DEFAULT 0 CHECK (is_shared IN (0,1)),"
+    "location_uuid TEXT REFERENCES camera_locations(uuid) ON DELETE SET NULL,"
+    "availability TEXT NOT NULL DEFAULT 'live' CHECK (availability IN "
+    "('all','live','offline','never_connected','disabled')),"
+    "columns INTEGER NOT NULL CHECK (columns BETWEEN 1 AND 9),"
+    "rows INTEGER NOT NULL CHECK (rows BETWEEN 1 AND 9),"
+    "camera_slots_json TEXT NOT NULL DEFAULT '[]',"
+    "revision INTEGER NOT NULL DEFAULT 1,"
+    "created_at INTEGER NOT NULL DEFAULT (strftime('%s','now')),"
+    "updated_at INTEGER NOT NULL DEFAULT (strftime('%s','now')),"
+    "CHECK (columns * rows <= 36));"
+    "CREATE UNIQUE INDEX idx_live_saved_layouts_owner_name ON "
+    "live_saved_layouts(COALESCE(owner_user_id,0),name COLLATE NOCASE);"
+    "CREATE INDEX idx_live_saved_layouts_visible ON "
+    "live_saved_layouts(is_shared,owner_user_id,name COLLATE NOCASE);";
+
+static const char migration_0075_down[] =
+    "DROP INDEX IF EXISTS idx_live_saved_layouts_visible;"
+    "DROP INDEX IF EXISTS idx_live_saved_layouts_owner_name;"
+    "DROP TABLE IF EXISTS live_saved_layouts;";
+
+static const char migration_0076_up[] =
+    "CREATE TABLE operator_floor_plans ("
+    "uuid TEXT PRIMARY KEY,"
+    "name TEXT NOT NULL COLLATE NOCASE,"
+    "location_uuid TEXT REFERENCES camera_locations(uuid) ON DELETE SET NULL,"
+    "parent_plan_uuid TEXT REFERENCES operator_floor_plans(uuid) ON DELETE SET NULL,"
+    "canvas_width INTEGER NOT NULL DEFAULT 1200 CHECK (canvas_width BETWEEN 400 AND 4000),"
+    "canvas_height INTEGER NOT NULL DEFAULT 800 CHECK (canvas_height BETWEEN 300 AND 4000),"
+    "revision INTEGER NOT NULL DEFAULT 1,"
+    "created_at INTEGER NOT NULL DEFAULT (strftime('%s','now')),"
+    "updated_at INTEGER NOT NULL DEFAULT (strftime('%s','now')));"
+    "CREATE UNIQUE INDEX idx_operator_floor_plans_name ON "
+    "operator_floor_plans(name COLLATE NOCASE);"
+    "CREATE INDEX idx_operator_floor_plans_location ON "
+    "operator_floor_plans(location_uuid,name COLLATE NOCASE);"
+    "CREATE TABLE operator_floor_plan_cameras ("
+    "plan_uuid TEXT NOT NULL REFERENCES operator_floor_plans(uuid) ON DELETE CASCADE,"
+    "camera_uuid TEXT NOT NULL REFERENCES streams(camera_uuid) ON DELETE CASCADE,"
+    "x REAL NOT NULL CHECK (x >= 0.0 AND x <= 1.0),"
+    "y REAL NOT NULL CHECK (y >= 0.0 AND y <= 1.0),"
+    "rotation REAL NOT NULL DEFAULT 0.0 CHECK (rotation >= -180.0 AND rotation <= 180.0),"
+    "fov REAL NOT NULL DEFAULT 65.0 CHECK (fov >= 1.0 AND fov <= 180.0),"
+    "PRIMARY KEY (plan_uuid,camera_uuid));"
+    "CREATE INDEX idx_operator_floor_plan_cameras_camera ON "
+    "operator_floor_plan_cameras(camera_uuid,plan_uuid);";
+
+static const char migration_0076_down[] =
+    "DROP INDEX IF EXISTS idx_operator_floor_plan_cameras_camera;"
+    "DROP TABLE IF EXISTS operator_floor_plan_cameras;"
+    "DROP INDEX IF EXISTS idx_operator_floor_plans_location;"
+    "DROP INDEX IF EXISTS idx_operator_floor_plans_name;"
+    "DROP TABLE IF EXISTS operator_floor_plans;";
+
+static const char migration_0077_up[] =
+    "CREATE TABLE stream_detection_engines("
+    "id INTEGER PRIMARY KEY AUTOINCREMENT,"
+    "stream_id INTEGER NOT NULL REFERENCES streams(id) ON DELETE CASCADE,"
+    "engine_key TEXT NOT NULL,"
+    "engine_type TEXT NOT NULL CHECK(engine_type IN('motion','object','onvif','api','external')),"
+    "model_path TEXT NOT NULL DEFAULT '',"
+    "enabled INTEGER NOT NULL DEFAULT 1 CHECK(enabled IN(0,1)),"
+    "threshold REAL NOT NULL DEFAULT 0.5 CHECK(threshold>=0.0 AND threshold<=1.0),"
+    "interval_seconds INTEGER NOT NULL DEFAULT 5 CHECK(interval_seconds BETWEEN 1 AND 86400),"
+    "sort_order INTEGER NOT NULL DEFAULT 0,"
+    "config_json TEXT NOT NULL DEFAULT '{}',"
+    "created_at INTEGER NOT NULL DEFAULT(strftime('%s','now')),"
+    "updated_at INTEGER NOT NULL DEFAULT(strftime('%s','now')),"
+    "UNIQUE(stream_id,engine_key));"
+    "CREATE INDEX idx_stream_detection_engines_stream_order ON "
+    "stream_detection_engines(stream_id,enabled DESC,sort_order,id);"
+    "INSERT INTO stream_detection_engines(stream_id,engine_key,engine_type,model_path,enabled,"
+    "threshold,interval_seconds,sort_order,config_json) "
+    "SELECT id,'legacy-primary',CASE WHEN detection_model='motion' THEN 'motion' "
+    "WHEN detection_model='onvif' THEN 'onvif' WHEN detection_model='api-detection' "
+    "OR detection_model LIKE 'http://%' OR detection_model LIKE 'https://%' THEN 'api' "
+    "ELSE 'object' END,detection_model,1,CASE WHEN detection_threshold BETWEEN 0.0 AND 1.0 "
+    "THEN detection_threshold ELSE 0.5 END,CASE WHEN detection_interval BETWEEN 1 AND 86400 "
+    "THEN detection_interval ELSE 5 END,0,'{}' FROM streams "
+    "WHERE detection_model IS NOT NULL AND trim(detection_model)<>'';"
+    "CREATE TRIGGER trg_stream_detection_engines_after_insert AFTER INSERT ON streams "
+    "WHEN NEW.detection_model IS NOT NULL AND trim(NEW.detection_model)<>'' BEGIN "
+    "INSERT INTO stream_detection_engines(stream_id,engine_key,engine_type,model_path,enabled,"
+    "threshold,interval_seconds,sort_order,config_json) VALUES(NEW.id,'legacy-primary',"
+    "CASE WHEN NEW.detection_model='motion' THEN 'motion' WHEN NEW.detection_model='onvif' "
+    "THEN 'onvif' WHEN NEW.detection_model='api-detection' OR NEW.detection_model LIKE 'http://%' "
+    "OR NEW.detection_model LIKE 'https://%' THEN 'api' ELSE 'object' END,NEW.detection_model,1,"
+    "CASE WHEN NEW.detection_threshold BETWEEN 0.0 AND 1.0 THEN NEW.detection_threshold ELSE 0.5 END,"
+    "CASE WHEN NEW.detection_interval BETWEEN 1 AND 86400 THEN NEW.detection_interval ELSE 5 END,0,'{}'); END;"
+    "CREATE TRIGGER trg_stream_detection_engines_after_update AFTER UPDATE OF detection_model,"
+    "detection_threshold,detection_interval ON streams BEGIN "
+    "DELETE FROM stream_detection_engines WHERE stream_id=NEW.id AND engine_key='legacy-primary' "
+    "AND(NEW.detection_model IS NULL OR trim(NEW.detection_model)='');"
+    "INSERT INTO stream_detection_engines(stream_id,engine_key,engine_type,model_path,enabled,"
+    "threshold,interval_seconds,sort_order,config_json) SELECT NEW.id,'legacy-primary',"
+    "CASE WHEN NEW.detection_model='motion' THEN 'motion' WHEN NEW.detection_model='onvif' THEN 'onvif' "
+    "WHEN NEW.detection_model='api-detection' OR NEW.detection_model LIKE 'http://%' "
+    "OR NEW.detection_model LIKE 'https://%' THEN 'api' ELSE 'object' END,NEW.detection_model,1,"
+    "CASE WHEN NEW.detection_threshold BETWEEN 0.0 AND 1.0 THEN NEW.detection_threshold ELSE 0.5 END,"
+    "CASE WHEN NEW.detection_interval BETWEEN 1 AND 86400 THEN NEW.detection_interval ELSE 5 END,0,'{}' "
+    "WHERE NEW.detection_model IS NOT NULL AND trim(NEW.detection_model)<>'' "
+    "ON CONFLICT(stream_id,engine_key) DO UPDATE SET engine_type=excluded.engine_type,"
+    "model_path=excluded.model_path,enabled=excluded.enabled,threshold=excluded.threshold,"
+    "interval_seconds=excluded.interval_seconds,updated_at=strftime('%s','now'); END;";
+
+static const char migration_0077_down[] =
+    "DROP TRIGGER IF EXISTS trg_stream_detection_engines_after_update;"
+    "DROP TRIGGER IF EXISTS trg_stream_detection_engines_after_insert;"
+    "DROP INDEX IF EXISTS idx_stream_detection_engines_stream_order;"
+    "DROP TABLE IF EXISTS stream_detection_engines;";
+
+static const char migration_0078_up[] =
+    "CREATE TABLE lpr_reads("
+    "uuid TEXT PRIMARY KEY,camera_uuid TEXT NOT NULL,stream_name TEXT NOT NULL,"
+    "observed_at_ms INTEGER NOT NULL,received_at_ms INTEGER NOT NULL,"
+    "source TEXT NOT NULL CHECK(source IN('onvif_profile_m','onvif_vendor','vendor_api','metadata_track')),"
+    "vendor_topic TEXT NOT NULL DEFAULT '',plate_nonce BLOB NOT NULL CHECK(length(plate_nonce)=12),"
+    "plate_ciphertext BLOB NOT NULL,plate_tag BLOB NOT NULL CHECK(length(plate_tag)=16),"
+    "plate_exact_hmac BLOB NOT NULL CHECK(length(plate_exact_hmac)=32),"
+    "dedupe_hmac BLOB NOT NULL CHECK(length(dedupe_hmac)=32),"
+    "confidence REAL CHECK(confidence IS NULL OR(confidence>=0.0 AND confidence<=1.0)),"
+    "country TEXT,region TEXT,plate_type TEXT,direction TEXT,lane TEXT,vehicle_type TEXT,"
+    "vehicle_color TEXT,object_id TEXT,correlation_id TEXT,bbox_left REAL,bbox_top REAL,"
+    "bbox_right REAL,bbox_bottom REAL,recording_id INTEGER REFERENCES recordings(id) ON DELETE SET NULL,"
+    "created_at INTEGER NOT NULL DEFAULT(strftime('%s','now')),UNIQUE(dedupe_hmac));"
+    "CREATE INDEX idx_lpr_reads_camera_time ON lpr_reads(camera_uuid,observed_at_ms DESC);"
+    "CREATE INDEX idx_lpr_reads_exact_time ON lpr_reads(plate_exact_hmac,observed_at_ms DESC);"
+    "CREATE INDEX idx_lpr_reads_retention ON lpr_reads(received_at_ms);"
+    "INSERT OR IGNORE INTO system_settings(key,value) VALUES('lpr_retention_days','30');"
+    "INSERT INTO authz_actions(action_key,category,description,camera_scoped,destructive,sort_order,bit_index) VALUES"
+    "('lpr.read','License plates','View protected plate values',1,0,160,15),"
+    "('lpr.search','License plates','Search protected plate reads',1,0,170,16),"
+    "('lpr.export','License plates','Export protected plate reads',1,0,180,17),"
+    "('lpr.delete','License plates','Permanently delete protected plate reads',1,1,190,18);"
+    "INSERT INTO authz_role_actions(role_uuid,action_key) SELECT "
+    "'00000000-0000-4000-8000-000000000001',action_key FROM authz_actions "
+    "WHERE action_key IN('lpr.read','lpr.search','lpr.export','lpr.delete');";
+
+static const char migration_0078_down[] =
+    "DELETE FROM authz_role_actions WHERE action_key IN('lpr.read','lpr.search','lpr.export','lpr.delete');"
+    "DELETE FROM authz_actions WHERE action_key IN('lpr.read','lpr.search','lpr.export','lpr.delete');"
+    "DELETE FROM system_settings WHERE key='lpr_retention_days';"
+    "DROP INDEX IF EXISTS idx_lpr_reads_retention;"
+    "DROP INDEX IF EXISTS idx_lpr_reads_exact_time;"
+    "DROP INDEX IF EXISTS idx_lpr_reads_camera_time;"
+    "DROP TABLE IF EXISTS lpr_reads;";
+
+static const char migration_0079_up[] =
+    "CREATE INDEX IF NOT EXISTS idx_detections_stream_label "
+    "ON detections(stream_name,label) "
+    "WHERE label IS NOT NULL AND TRIM(label)<>'';";
+
+static const char migration_0079_down[] =
+    "DROP INDEX IF EXISTS idx_detections_stream_label;";
+
+static const char migration_0080_up[] =
+    "ALTER TABLE operator_floor_plans ADD COLUMN background_mime TEXT "
+    "CHECK (background_mime IS NULL OR background_mime IN ('image/png', "
+    "'image/jpeg'));";
+
+static const char migration_0080_down[] =
+    "ALTER TABLE operator_floor_plans DROP COLUMN background_mime;";
+
+static const char migration_0081_up[] =
+    "CREATE TABLE system_health_process_runs (\n"
+    "    run_id TEXT PRIMARY KEY\n"
+    "        CHECK (length(run_id) = 36 AND substr(run_id, 9, 1) = '-'\n"
+    "            AND substr(run_id, 14, 1) = '-' AND substr(run_id, 19, 1) = '-'\n"
+    "            AND substr(run_id, 24, 1) = '-'),\n"
+    "    boot_id TEXT NOT NULL\n"
+    "        CHECK (length(boot_id) BETWEEN 1 AND 63\n"
+    "            AND boot_id NOT GLOB '*[^A-Za-z0-9_.:-]*'),\n"
+    "    started_at_ms INTEGER NOT NULL CHECK (started_at_ms > 0),\n"
+    "    closed_at_ms INTEGER CHECK (\n"
+    "        closed_at_ms IS NULL OR closed_at_ms >= started_at_ms),\n"
+    "    clean_close INTEGER NOT NULL DEFAULT 0 CHECK (clean_close IN (0, 1)),\n"
+    "    CHECK ((clean_close = 0 AND closed_at_ms IS NULL)\n"
+    "        OR (clean_close = 1 AND closed_at_ms IS NOT NULL))\n"
+    ");\n"
+    "\n"
+    "CREATE INDEX idx_system_health_runs_latest\n"
+    "ON system_health_process_runs(started_at_ms DESC, run_id DESC);\n"
+    "\n"
+    "CREATE TABLE system_health_incidents (\n"
+    "    uuid TEXT PRIMARY KEY\n"
+    "        CHECK (length(uuid) = 36 AND substr(uuid, 9, 1) = '-'\n"
+    "            AND substr(uuid, 14, 1) = '-' AND substr(uuid, 19, 1) = '-'\n"
+    "            AND substr(uuid, 24, 1) = '-'),\n"
+    "    condition_code TEXT NOT NULL CHECK (condition_code IN (\n"
+    "        'memory.available_low', 'memory.oom_kill', 'memory.swap_thrash',\n"
+    "        'cpu.saturation', 'cpu.throttled', 'io.pressure',\n"
+    "        'filesystem.bytes_low', 'filesystem.inodes_low',\n"
+    "        'filesystem.read_only', 'filesystem.write_failed', 'thermal.high',\n"
+    "        'network.link_down', 'network.error_rate',\n"
+    "        'clock.unsynchronized', 'clock.jump', 'process.fd_exhaustion',\n"
+    "        'process.pid_exhaustion', 'process.allocation_failed',\n"
+    "        'storage.device_prefail', 'storage.device_critical',\n"
+    "        'hardware.ecc_corrected', 'hardware.ecc_uncorrectable',\n"
+    "        'hardware.fan_failed', 'hardware.power_unstable',\n"
+    "        'health.collector_stale', 'system.unexpected_restart',\n"
+    "        'event.delivery_degraded')),\n"
+    "    subject TEXT NOT NULL CHECK (length(subject) BETWEEN 1 AND 63\n"
+    "        AND subject NOT GLOB '*[^A-Za-z0-9_.:-]*'),\n"
+    "    scope TEXT NOT NULL CHECK (\n"
+    "        scope IN ('process', 'container', 'host', 'filesystem', 'device')),\n"
+    "    state TEXT NOT NULL CHECK (state IN ('open', 'recovering', 'closed')),\n"
+    "    severity TEXT NOT NULL CHECK (severity IN ('warning', 'error', 'critical')),\n"
+    "    first_seen_at_ms INTEGER NOT NULL CHECK (first_seen_at_ms > 0),\n"
+    "    last_seen_at_ms INTEGER NOT NULL CHECK (last_seen_at_ms >= first_seen_at_ms),\n"
+    "    closed_at_ms INTEGER,\n"
+    "    last_observation_json TEXT NOT NULL\n"
+    "        CHECK (length(last_observation_json) BETWEEN 2 AND 2048),\n"
+    "    alert_event_id TEXT CHECK (alert_event_id IS NULL OR\n"
+    "        (length(alert_event_id) = 36 AND substr(alert_event_id, 9, 1) = '-'\n"
+    "            AND substr(alert_event_id, 14, 1) = '-'\n"
+    "            AND substr(alert_event_id, 19, 1) = '-'\n"
+    "            AND substr(alert_event_id, 24, 1) = '-')),\n"
+    "    recovery_event_id TEXT CHECK (recovery_event_id IS NULL OR\n"
+    "        (length(recovery_event_id) = 36 AND substr(recovery_event_id, 9, 1) = '-'\n"
+    "            AND substr(recovery_event_id, 14, 1) = '-'\n"
+    "            AND substr(recovery_event_id, 19, 1) = '-'\n"
+    "            AND substr(recovery_event_id, 24, 1) = '-')),\n"
+    "    reconciliation_state TEXT NOT NULL DEFAULT 'none' CHECK (\n"
+    "        reconciliation_state IN ('none', 'alert_pending', 'recovery_pending',\n"
+    "                                 'reconciled', 'delivery_failed')),\n"
+    "    boot_id TEXT NOT NULL CHECK (length(boot_id) BETWEEN 1 AND 63\n"
+    "        AND boot_id NOT GLOB '*[^A-Za-z0-9_.:-]*'),\n"
+    "    run_id TEXT NOT NULL CHECK (length(run_id) = 36\n"
+    "        AND substr(run_id, 9, 1) = '-' AND substr(run_id, 14, 1) = '-'\n"
+    "        AND substr(run_id, 19, 1) = '-' AND substr(run_id, 24, 1) = '-'),\n"
+    "    revision INTEGER NOT NULL DEFAULT 1 CHECK (revision >= 1),\n"
+    "    CHECK ((state = 'closed' AND closed_at_ms IS NOT NULL\n"
+    "            AND closed_at_ms >= last_seen_at_ms)\n"
+    "        OR (state <> 'closed' AND closed_at_ms IS NULL))\n"
+    ");\n"
+    "\n"
+    "CREATE UNIQUE INDEX idx_system_health_incidents_active\n"
+    "ON system_health_incidents(condition_code, subject)\n"
+    "WHERE state <> 'closed';\n"
+    "\n"
+    "CREATE INDEX idx_system_health_incidents_list\n"
+    "ON system_health_incidents(last_seen_at_ms DESC, uuid DESC);\n"
+    "\n"
+    "CREATE TABLE system_health_incident_transitions (\n"
+    "    id INTEGER PRIMARY KEY AUTOINCREMENT,\n"
+    "    transition_uuid TEXT NOT NULL UNIQUE CHECK (length(transition_uuid) = 36\n"
+    "        AND substr(transition_uuid, 9, 1) = '-'\n"
+    "        AND substr(transition_uuid, 14, 1) = '-'\n"
+    "        AND substr(transition_uuid, 19, 1) = '-'\n"
+    "        AND substr(transition_uuid, 24, 1) = '-'),\n"
+    "    incident_uuid TEXT NOT NULL REFERENCES system_health_incidents(uuid)\n"
+    "        ON DELETE CASCADE,\n"
+    "    kind TEXT NOT NULL CHECK (\n"
+    "        kind IN ('open', 'escalation', 'material_change', 'recovery', 'one_shot')),\n"
+    "    from_state TEXT CHECK (\n"
+    "        from_state IS NULL OR from_state IN ('open', 'recovering', 'closed')),\n"
+    "    to_state TEXT NOT NULL CHECK (to_state IN ('open', 'recovering', 'closed')),\n"
+    "    severity TEXT NOT NULL CHECK (severity IN ('warning', 'error', 'critical')),\n"
+    "    observed_at_ms INTEGER NOT NULL CHECK (observed_at_ms > 0),\n"
+    "    safe_observation_json TEXT NOT NULL\n"
+    "        CHECK (length(safe_observation_json) BETWEEN 2 AND 2048),\n"
+    "    event_id TEXT CHECK (event_id IS NULL OR (length(event_id) = 36\n"
+    "        AND substr(event_id, 9, 1) = '-' AND substr(event_id, 14, 1) = '-'\n"
+    "        AND substr(event_id, 19, 1) = '-' AND substr(event_id, 24, 1) = '-')),\n"
+    "    reconciliation_state TEXT NOT NULL CHECK (\n"
+    "        reconciliation_state IN ('none', 'alert_pending', 'recovery_pending',\n"
+    "                                 'reconciled', 'delivery_failed')),\n"
+    "    boot_id TEXT NOT NULL CHECK (length(boot_id) BETWEEN 1 AND 63\n"
+    "        AND boot_id NOT GLOB '*[^A-Za-z0-9_.:-]*'),\n"
+    "    run_id TEXT NOT NULL CHECK (length(run_id) = 36\n"
+    "        AND substr(run_id, 9, 1) = '-' AND substr(run_id, 14, 1) = '-'\n"
+    "        AND substr(run_id, 19, 1) = '-' AND substr(run_id, 24, 1) = '-')\n"
+    ");\n"
+    "\n"
+    "CREATE INDEX idx_system_health_transitions_incident\n"
+    "ON system_health_incident_transitions(\n"
+    "    incident_uuid, observed_at_ms DESC, id DESC);\n"
+    "\n"
+    "CREATE INDEX idx_system_health_transitions_retention\n"
+    "ON system_health_incident_transitions(observed_at_ms, id);";
+
+static const char migration_0081_down[] =
+    "DROP INDEX IF EXISTS idx_system_health_transitions_retention;\n"
+    "DROP INDEX IF EXISTS idx_system_health_transitions_incident;\n"
+    "DROP TABLE IF EXISTS system_health_incident_transitions;\n"
+    "DROP INDEX IF EXISTS idx_system_health_incidents_list;\n"
+    "DROP INDEX IF EXISTS idx_system_health_incidents_active;\n"
+    "DROP TABLE IF EXISTS system_health_incidents;\n"
+    "DROP INDEX IF EXISTS idx_system_health_runs_latest;\n"
+    "DROP TABLE IF EXISTS system_health_process_runs;";
+
+static const char migration_0082_up[] =
+    "ALTER TABLE event_destinations\n"
+    "ADD COLUMN status_topic_template TEXT NOT NULL DEFAULT '';";
+
+static const char migration_0082_down[] =
+    "ALTER TABLE event_destinations DROP COLUMN status_topic_template;";
+
+static const char migration_0083_up[] =
+    "CREATE INDEX IF NOT EXISTS idx_detections_open_external_motion\n"
+    "ON detections(id)\n"
+    "WHERE source = 'external_motion' AND event_end_time IS NULL;";
+
+static const char migration_0083_down[] =
+    "DROP INDEX IF EXISTS idx_detections_open_external_motion;";
+
 static const migration_t embedded_migrations_data[] = {
     {
         .version = "0001",
@@ -2046,8 +2399,85 @@ static const migration_t embedded_migrations_data[] = {
         .sql_down = migration_0072_down,
         .is_embedded = true
     },
+    {
+        .version = "0073",
+        .description = "add_stream_eptz_config",
+        .sql_up = migration_0073_up,
+        .sql_down = migration_0073_down,
+        .is_embedded = true
+    },
+    {
+        .version = "0074",
+        .description = "add_operator_workspace_foundations",
+        .sql_up = migration_0074_up,
+        .sql_down = migration_0074_down,
+        .is_embedded = true
+    },
+    {
+        .version = "0075",
+        .description = "add_live_saved_layouts",
+        .sql_up = migration_0075_up,
+        .sql_down = migration_0075_down,
+        .is_embedded = true
+    },
+    {
+        .version = "0076",
+        .description = "add_operator_floor_plans",
+        .sql_up = migration_0076_up,
+        .sql_down = migration_0076_down,
+        .is_embedded = true
+    },
+    {
+        .version = "0077",
+        .description = "add_stream_detection_engines",
+        .sql_up = migration_0077_up,
+        .sql_down = migration_0077_down,
+        .is_embedded = true
+    },
+    {
+        .version = "0078",
+        .description = "add_protected_lpr_reads",
+        .sql_up = migration_0078_up,
+        .sql_down = migration_0078_down,
+        .is_embedded = true
+    },
+    {
+        .version = "0079",
+        .description = "add_scoped_detection_label_index",
+        .sql_up = migration_0079_up,
+        .sql_down = migration_0079_down,
+        .is_embedded = true
+    },
+    {
+        .version = "0080",
+        .description = "add_floor_plan_background",
+        .sql_up = migration_0080_up,
+        .sql_down = migration_0080_down,
+        .is_embedded = true
+    },
+    {
+        .version = "0081",
+        .description = "add_system_health_incidents",
+        .sql_up = migration_0081_up,
+        .sql_down = migration_0081_down,
+        .is_embedded = true
+    },
+    {
+        .version = "0082",
+        .description = "add_event_destination_status_topic",
+        .sql_up = migration_0082_up,
+        .sql_down = migration_0082_down,
+        .is_embedded = true
+    },
+    {
+        .version = "0083",
+        .description = "index_open_external_motion",
+        .sql_up = migration_0083_up,
+        .sql_down = migration_0083_down,
+        .is_embedded = true
+    },
 };
 
-#define EMBEDDED_MIGRATIONS_COUNT 72
+#define EMBEDDED_MIGRATIONS_COUNT 83
 
 #endif /* DB_EMBEDDED_MIGRATIONS_H */

@@ -51,6 +51,8 @@ LightNVR provides a lightweight yet powerful solution for recording and managing
 - **Standard Formats**: Records in standard MP4/MKV containers with proper indexing
 - **Storage Management**: Automatic retention policies and disk space management
 - **Reliability**: Automatic recovery after power loss or system failure
+- **Operational Health**: Bounded OS/container/filesystem/hardware sampling,
+  durable incidents, Prometheus metrics, and MQTT loss-of-contact presence
 - **Resource Optimization**: Stream prioritization to manage limited RAM
 
 ## 🧱 Architecture Overview
@@ -510,6 +512,7 @@ getting-started path from install to first recording.
 - [MQTT Integration](docs/MQTT_INTEGRATION.md)
 - [Camera Compatibility](docs/CAMERAS.md)
 - [ONVIF Detection](docs/ONVIF_DETECTION.md)
+- [Multiple Detection Engines](docs/DETECTION_ENGINES.md)
 - [Motion Buffer System](docs/MOTION_BUFFER.md)
 - [SOD Integration](docs/SOD_INTEGRATION.md)
 

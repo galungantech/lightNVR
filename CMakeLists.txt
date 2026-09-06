@@ -7,7 +7,7 @@ if(CMAKE_VERSION VERSION_GREATER_EQUAL "4.0")
     set(CMAKE_POLICY_VERSION_MINIMUM 3.5 CACHE STRING "" FORCE)
 endif()
 
-project(LightNVR VERSION 0.40.1 LANGUAGES C CXX)
+project(LightNVR VERSION 0.41.11 LANGUAGES C CXX)
 
 # Set C/C++ standards
 set(CMAKE_C_STANDARD 11)
@@ -144,6 +144,7 @@ pkg_check_modules(FFMPEG REQUIRED
     libswresample>=5)
 pkg_check_modules(SQLITE REQUIRED sqlite3)
 pkg_check_modules(CURL REQUIRED libcurl)
+find_package(ZLIB REQUIRED)
 find_package(Threads REQUIRED)
 
 # libyaml (optional-but-preferred) — used for go2rtc override validation
@@ -176,9 +177,12 @@ macro(DETECT_MBEDTLS_ONCE)
         pkg_check_modules(MBEDTLS QUIET mbedtls mbedcrypto mbedx509)
         if (NOT MBEDTLS_FOUND)
             find_path(MBEDTLS_INCLUDE_DIRS "mbedtls/version.h" PATH_SUFFIXES "mbedtls" DOC "mbedtls include directory")
-            find_library(MBEDTLS_LIBRARY NAMES mbedtls REQUIRED)
-            find_library(MBEDCRYPTO_LIBRARY NAMES mbedcrypto REQUIRED)
-            find_library(MBEDX509_LIBRARY NAMES mbedx509 REQUIRED)
+            find_library(MBEDTLS_LIBRARY NAMES mbedtls)
+            find_library(MBEDCRYPTO_LIBRARY NAMES mbedcrypto)
+            find_library(MBEDX509_LIBRARY NAMES mbedx509)
+            if(NOT MBEDTLS_INCLUDE_DIRS OR NOT MBEDTLS_LIBRARY OR NOT MBEDCRYPTO_LIBRARY OR NOT MBEDX509_LIBRARY)
+                message(FATAL_ERROR "mbedTLS is required (for ONVIF/authentication and/or SSL with USE_MBEDTLS=ON) but was not found. Missing one or more of: headers (mbedtls/version.h), libmbedtls, libmbedcrypto, libmbedx509.")
+            endif()
             set(MBEDTLS_LIBRARIES ${MBEDTLS_LIBRARY} ${MBEDCRYPTO_LIBRARY} ${MBEDX509_LIBRARY})
         endif()
         set(MBEDTLS_DETECTION_DONE TRUE CACHE INTERNAL "mbedTLS detection has been performed")
@@ -217,39 +221,14 @@ list(APPEND SSL_LIBRARIES ${MBEDTLS_LIBRARIES})
 message(STATUS "ONVIF and authentication system enabled, linking with mbedTLS for cryptographic functions")
 
 # Explicitly add mbedcrypto to the link libraries
-set(COMMON_MBEDTLS_LIB_PATHS
-    /usr/lib
-    /usr/lib/x86_64-linux-gnu
-    /usr/lib/aarch64-linux-gnu
-    /usr/lib/arm-linux-gnueabihf
-    /lib
-    /lib/x86_64-linux-gnu
-    /lib/aarch64-linux-gnu
-    /lib/arm-linux-gnueabihf
-)
-
-find_library(MBEDCRYPTO_LIBRARY mbedcrypto
-    HINTS
-    ${COMMON_MBEDTLS_LIB_PATHS}
-)
+# Use CMake's standard library search paths for portability across distros/platforms.
+find_library(MBEDCRYPTO_LIBRARY NAMES mbedcrypto)
 
 if(MBEDCRYPTO_LIBRARY)
     message(STATUS "Found mbedcrypto library: ${MBEDCRYPTO_LIBRARY}")
     list(APPEND SSL_LIBRARIES ${MBEDCRYPTO_LIBRARY})
 else()
-    # Try to find by manually checking common locations
-    foreach(LIB_PATH ${COMMON_MBEDTLS_LIB_PATHS})
-        if(EXISTS "${LIB_PATH}/libmbedcrypto.so")
-            set(MBEDCRYPTO_LIBRARY "${LIB_PATH}/libmbedcrypto.so")
-            message(STATUS "Found mbedcrypto library through manual search: ${MBEDCRYPTO_LIBRARY}")
-            list(APPEND SSL_LIBRARIES ${MBEDCRYPTO_LIBRARY})
-            break()
-        endif()
-    endforeach()
-
-    if(NOT MBEDCRYPTO_LIBRARY)
-        message(FATAL_ERROR "mbedcrypto library not found. Please install libmbedtls-dev package.")
-    endif()
+    message(FATAL_ERROR "mbedcrypto library not found. Please install the mbedTLS development package.")
 endif()
 
 # Find cJSON (required dependency)
@@ -565,6 +544,8 @@ list(APPEND VIDEO_SOURCES ${FFMPEG_LEAK_DETECTOR_SOURCES})
 # Add HLS sources
 file(GLOB HLS_SOURCES "src/video/hls/*.c")
 file(GLOB TELEMETRY_SOURCES "src/telemetry/*.c")
+file(GLOB HEALTH_COLLECTOR_SOURCES "src/telemetry/collectors/*.c")
+file(GLOB HEALTH_PROVIDER_SOURCES "src/telemetry/providers/*.c")
 
 # Add unified HLS thread sources explicitly to ensure they're included
 set(HLS_UNIFIED_THREAD_SOURCES
@@ -596,6 +577,8 @@ set(SOURCES
         ${HLS_SOURCES}
         ${HLS_UNIFIED_THREAD_SOURCES}
         ${TELEMETRY_SOURCES}
+        ${HEALTH_COLLECTOR_SOURCES}
+        ${HEALTH_PROVIDER_SOURCES}
         ${EZXML_SOURCES}
         ${LITERT_ENGINE_SOURCES}
 )
@@ -626,6 +609,8 @@ target_link_libraries(lightnvr_lib PUBLIC
         ${FFMPEG_LIBRARIES}
         ${SQLITE_LIBRARIES}
         ${CURL_LIBRARIES}
+        ${CJSON_LIBRARIES}
+        ZLIB::ZLIB
         ${SSL_LIBRARIES}
         pthread
         dl
@@ -641,8 +626,11 @@ set(REBUILD_RECORDINGS_SOURCES
     src/core/config.c
     src/core/logger.c
     src/core/path_utils.c
+    src/core/shutdown_coordinator.c
     src/utils/strings.c
     src/utils/uuid.c
+    src/telemetry/system_health_policy.c
+    src/telemetry/system_health_types.c
     src/database/db_camera_tags.c
     src/database/db_core.c
     src/database/db_streams.c
@@ -673,6 +661,7 @@ target_link_libraries(lightnvr
         ${FFMPEG_LIBRARIES}
         ${SQLITE_LIBRARIES}
         ${CURL_LIBRARIES}
+        ZLIB::ZLIB
         ${SSL_LIBRARIES}
         atomic
         pthread
@@ -707,8 +696,11 @@ endif()
 
 # Link MQTT library if enabled
 if(ENABLE_MQTT AND MOSQUITTO_FOUND)
-    target_link_libraries(lightnvr ${MOSQUITTO_LIBRARIES})
-    target_include_directories(lightnvr PRIVATE ${MOSQUITTO_INCLUDE_DIRS})
+    if(MOSQUITTO_LIBRARY_DIRS)
+        target_link_directories(lightnvr_lib PUBLIC ${MOSQUITTO_LIBRARY_DIRS})
+    endif()
+    target_link_libraries(lightnvr_lib PUBLIC ${MOSQUITTO_LIBRARIES})
+    target_include_directories(lightnvr_lib PUBLIC ${MOSQUITTO_INCLUDE_DIRS})
 endif()
 
 # Link LiteRT if enabled

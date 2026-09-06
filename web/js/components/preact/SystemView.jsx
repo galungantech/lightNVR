@@ -16,6 +16,7 @@ import { MemoryStorage } from './system/MemoryStorage.jsx';
 import { StreamStorage } from './system/StreamStorage.jsx';
 import { StorageHealth } from './system/StorageHealth.jsx';
 import { NetworkInfo } from './system/NetworkInfo.jsx';
+import { SystemHealth } from './system/SystemHealth.jsx';
 import { StreamsInfo } from './system/StreamsInfo.jsx';
 import { WebServiceInfo } from './system/WebServiceInfo.jsx';
 import { VersionsTable } from './system/VersionsTable.jsx';
@@ -86,6 +87,8 @@ export function SystemView() {
 
   const roleLoading = userRole === null;
   const canControlSystem = !roleLoading && userRole === 'admin';
+  // Operational health endpoints require the same system-admin permission.
+  const canViewSystemHealth = canControlSystem;
 
   // Query Hook
   const { data: systemInfoData, isLoading } = useQuery(
@@ -324,25 +327,61 @@ export function SystemView() {
         onComponentLoad={(setModalState) => { setControlsModalRef.current = setModalState; }} // Ikat fungsi state di sini
       />
 
-      <input ref={fileInputRef} type="file" accept=".tar.gz" onChange={handleFileChange} style={{ display: 'none' }} />
-
-      <ContentLoader
-        isLoading={isLoading} hasData={hasData}
-        loadingMessage={t('system.loadingSystemInformation')} emptyMessage={t('system.systemInformationUnavailable')}
-      >
-        <div className="mb-4 border-b border-border" role="tablist">
+      <div className="mb-4 border-b border-border" role="tablist" aria-label={t('system.sections')}>
           <div className="flex gap-2">
-            <button type="button" className={`rounded-t-lg px-4 py-2 text-sm font-medium ${activeTab === 'system' ? 'bg-card border border-border border-b-0 -mb-px' : 'text-muted-foreground'}`} onClick={() => setActiveTab('system')}>
+            {canViewSystemHealth && (
+              <button
+                type="button"
+                id="health-tab"
+                role="tab"
+                data-testid="health-tab"
+                aria-selected={activeTab === 'health'}
+                aria-controls="health-panel"
+                className={`rounded-t-lg px-4 py-2 text-sm font-medium transition-colors ${
+                  activeTab === 'health'
+                    ? 'bg-card text-card-foreground border border-border border-b-0 -mb-px'
+                    : 'text-muted-foreground hover:text-foreground'
+                }`}
+                onClick={() => setActiveTab('health')}
+              >
+                {t('system.health.tab')}
+              </button>
+            )}
+            <button
+              type="button"
+              id="system-tab"
+              role="tab"
+              data-testid="system-tab"
+              aria-selected={activeTab === 'system'}
+              aria-controls="system-panel"
+              className={`rounded-t-lg px-4 py-2 text-sm font-medium transition-colors ${
+                activeTab === 'system'
+                  ? 'bg-card text-card-foreground border border-border border-b-0 -mb-px'
+                  : 'text-muted-foreground hover:text-foreground'
+              }`}
+              onClick={() => setActiveTab('system')}
+            >
               {t('system.system')}
             </button>
             <button type="button" className={`rounded-t-lg px-4 py-2 text-sm font-medium ${activeTab === 'versions' ? 'bg-card border border-border border-b-0 -mb-px' : 'text-muted-foreground'}`} onClick={() => setActiveTab('versions')}>
               {t('system.versions')}
             </button>
           </div>
-        </div>
+      </div>
 
-        {activeTab === 'system' ? (
-          <div>
+      {activeTab === 'health' && canViewSystemHealth ? (
+        <div role="tabpanel" id="health-panel" aria-labelledby="health-tab">
+          <SystemHealth />
+        </div>
+      ) : (
+        <ContentLoader
+          isLoading={isLoading}
+          hasData={hasData}
+          loadingMessage={t('system.loadingSystemInformation')}
+          emptyMessage={t('system.systemInformationUnavailable')}
+        >
+          {activeTab === 'system' ? (
+          <div role="tabpanel" id="system-panel" aria-labelledby="system-tab">
             <div className="grid grid-cols-1 md:grid-cols-2 gap-4 mb-4">
               <SystemInfo systemInfo={systemInfo} formatUptime={formatUptime} />
               <MemoryStorage systemInfo={systemInfo} formatBytes={formatBytes} />
@@ -362,9 +401,12 @@ export function SystemView() {
             <LogsPoller logLevel={logLevel} logCount={logCount} pollingInterval={pollingInterval} onLogsReceived={handleLogsReceived} />
           </div>
         ) : (
-          <VersionsTable versions={systemInfo.versions} />
-        )}
-      </ContentLoader>
+          <div role="tabpanel" id="versions-panel" aria-labelledby="versions-tab">
+            <VersionsTable versions={systemInfo.versions} />
+          </div>
+          )}
+        </ContentLoader>
+      )}
 
       <ClearLogsModal isOpen={showClearLogsModal} onClose={() => setShowClearLogsModal(false)} onConfirm={() => clearLogsMutation.mutate()} />
     </section>
