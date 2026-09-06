@@ -1235,7 +1235,7 @@ void *hls_unified_thread_func(void *arg) {
                 // Find video stream
                 video_stream_idx = find_video_stream_index(input_ctx);
                 if (video_stream_idx == -1) {
-                    log_error("No video stream found in %s", ctx->rtsp_url);
+                    log_error("No video stream found for stream %s", stream_name);
 
                     // MEMORY LEAK FIX: Use comprehensive cleanup instead of just avformat_close_input
                     comprehensive_ffmpeg_cleanup(&input_ctx, NULL, NULL, NULL);
@@ -1639,7 +1639,8 @@ void *hls_unified_thread_func(void *arg) {
                 // Find video stream
                 video_stream_idx = find_video_stream_index(input_ctx);
                 if (video_stream_idx == -1) {
-                    log_error("No video stream found in %s during reconnection", ctx->rtsp_url);
+                    log_error("No video stream found for stream %s during reconnection",
+                              stream_name);
 
                     // Close input context
                     avformat_close_input(&input_ctx);
@@ -2370,7 +2371,7 @@ int start_hls_unified_stream(const char *stream_name) {
         // to request only the video track. Without this, go2rtc defaults to
         // serving video+audio which triggers phantom audio track issues (FFmpeg
         // sub-processes trying to transcode Opus audio) that corrupt the stream.
-        if (rtsp_url_success && !config.record_audio) {
+        if (rtsp_url_success && (!config.record_audio || g_config.audio_disabled)) {
             size_t url_len = strlen(actual_url);
             const char *suffix = "?video";
             size_t suffix_len = strlen(suffix);

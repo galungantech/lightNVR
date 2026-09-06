@@ -65,6 +65,8 @@ typedef struct {
     time_t cursor_timestamp;
     uint64_t cursor_id;
     int limit;
+    bool include_results;
+    bool include_summary;
 } investigation_search_query_t;
 
 typedef struct {
@@ -120,6 +122,7 @@ typedef struct {
 typedef struct {
     time_t start_time;
     time_t end_time;
+    time_t event_time;
     int64_t count;
 } investigation_search_histogram_bucket_t;
 

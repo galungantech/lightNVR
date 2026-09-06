@@ -33,6 +33,7 @@
 #include "web/api_handlers_system.h"
 #include "web/api_handlers_setup.h"
 #include "web/request_response.h"
+#include "telemetry/system_health.h"
 #include "video/go2rtc/go2rtc_lifecycle.h"
 #include "video/stream_manager.h"
 #include "video/stream_state.h"
@@ -175,6 +176,39 @@ void test_handle_get_system_info_includes_versions_summary(void) {
     cJSON *uptime = cJSON_GetObjectItemCaseSensitive(root, "uptime");
     TEST_ASSERT_TRUE(cJSON_IsNumber(uptime));
     TEST_ASSERT_TRUE(uptime->valuedouble >= 0.0);
+    cJSON *uptime_capability = cJSON_GetObjectItemCaseSensitive(
+        root, "uptimeCapability");
+    TEST_ASSERT_TRUE(cJSON_IsString(uptime_capability));
+    TEST_ASSERT_EQUAL_STRING("available", uptime_capability->valuestring);
+    cJSON *cpu = cJSON_GetObjectItemCaseSensitive(root, "cpu");
+    cJSON *system_memory = cJSON_GetObjectItemCaseSensitive(root,
+                                                            "systemMemory");
+    cJSON *disk = cJSON_GetObjectItemCaseSensitive(root, "disk");
+    cJSON *network = cJSON_GetObjectItemCaseSensitive(root, "network");
+    TEST_ASSERT_TRUE(cJSON_IsObject(cpu));
+    TEST_ASSERT_NOT_NULL(cJSON_GetObjectItemCaseSensitive(cpu,
+                                                          "usageCapability"));
+    TEST_ASSERT_TRUE(cJSON_IsObject(system_memory));
+    TEST_ASSERT_NOT_NULL(cJSON_GetObjectItemCaseSensitive(system_memory,
+                                                          "capability"));
+    cJSON *detector_memory = cJSON_GetObjectItemCaseSensitive(root,
+                                                              "detectorMemory");
+    TEST_ASSERT_TRUE(cJSON_IsObject(detector_memory));
+    cJSON *go2rtc_memory = cJSON_GetObjectItemCaseSensitive(root,
+                                                            "go2rtcMemory");
+    TEST_ASSERT_TRUE(cJSON_IsObject(go2rtc_memory));
+    /* Optional processes contribute a known zero when inactive rather than
+     * making the process-memory aggregate unknown. */
+    TEST_ASSERT_TRUE(cJSON_IsNumber(cJSON_GetObjectItemCaseSensitive(
+        detector_memory, "used")));
+    TEST_ASSERT_TRUE(cJSON_IsNumber(cJSON_GetObjectItemCaseSensitive(
+        go2rtc_memory, "used")));
+    TEST_ASSERT_TRUE(cJSON_IsObject(disk));
+    TEST_ASSERT_NOT_NULL(cJSON_GetObjectItemCaseSensitive(disk,
+                                                          "capability"));
+    TEST_ASSERT_TRUE(cJSON_IsObject(network));
+    TEST_ASSERT_TRUE(cJSON_IsArray(cJSON_GetObjectItemCaseSensitive(
+        network, "interfaces")));
 
     cJSON_Delete(root);
     http_response_free(&res);
@@ -230,6 +264,93 @@ void test_handle_get_system_info_includes_empty_stream_storage_array(void) {
 
     cJSON_Delete(root);
     http_response_free(&res);
+}
+
+// Regression test: linux_process.c's real collector stamps process.rss_bytes
+// and process.threads observations with resource_id "lightnvr" (see its
+// prepare_observation()), but handle_get_system_info() looked them up with a
+// resource filter of "process" -- a string that never matches anything the
+// collector actually emits, so process memory/thread count silently and
+// permanently reported as unavailable on every real deployment, regardless
+// of the actual process's real RSS/thread count. This fixture mimics the
+// real collector's exact resource_id/scope/metric shape rather than using
+// register_builtin_collectors (which would pull in this test binary's own
+// real /proc data and make the assertion non-deterministic).
+static int collect_process_fixture(void *state,
+                                   const system_health_collect_context_t *context,
+                                   system_health_observation_sink_t *sink) {
+    (void)state;
+    system_health_observation_t observation;
+
+    memset(&observation, 0, sizeof(observation));
+    safe_strcpy(observation.metric, "process.rss_bytes",
+                sizeof(observation.metric), 0);
+    safe_strcpy(observation.resource_id, "lightnvr",
+                sizeof(observation.resource_id), 0);
+    observation.scope = SYSTEM_HEALTH_SCOPE_PROCESS;
+    observation.sampled_monotonic_ms = context->monotonic_ms;
+    observation.observed_wall_time_ms = context->wall_time_ms;
+    system_health_observation_set_available(&observation, 234881024.0,
+                                            SYSTEM_HEALTH_UNIT_BYTES);
+    TEST_ASSERT_TRUE(system_health_observation_sink_append(sink, &observation));
+
+    memset(&observation, 0, sizeof(observation));
+    safe_strcpy(observation.metric, "process.threads",
+                sizeof(observation.metric), 0);
+    safe_strcpy(observation.resource_id, "lightnvr",
+                sizeof(observation.resource_id), 0);
+    observation.scope = SYSTEM_HEALTH_SCOPE_PROCESS;
+    observation.sampled_monotonic_ms = context->monotonic_ms;
+    observation.observed_wall_time_ms = context->wall_time_ms;
+    system_health_observation_set_available(&observation, 17.0,
+                                            SYSTEM_HEALTH_UNIT_COUNT);
+    TEST_ASSERT_TRUE(system_health_observation_sink_append(sink, &observation));
+    return 0;
+}
+
+void test_handle_get_system_info_reports_process_memory_and_threads(void) {
+    system_health_options_t options;
+    system_health_options_defaults(&options);
+    options.register_builtin_collectors = false;
+    TEST_ASSERT_EQUAL_INT(0, system_health_init(&options));
+    system_health_collector_t collector = {
+        .name = "process_fixture",
+        .scope = SYSTEM_HEALTH_SCOPE_PROCESS,
+        .tier = SYSTEM_HEALTH_TIER_FAST,
+        .interval_seconds = 10,
+        .stale_after_seconds = 30,
+        .collect = collect_process_fixture,
+    };
+    TEST_ASSERT_TRUE(system_health_register_collector(&collector));
+    TEST_ASSERT_EQUAL_INT(0,
+        system_health_collect_tier(SYSTEM_HEALTH_TIER_FAST));
+
+    http_request_t req;
+    http_response_t res;
+    http_request_init(&req);
+    http_response_init(&res);
+
+    handle_get_system_info(&req, &res);
+
+    TEST_ASSERT_EQUAL_INT(200, res.status_code);
+
+    cJSON *root = parse_response_json(&res);
+    cJSON *memory = cJSON_GetObjectItemCaseSensitive(root, "memory");
+    TEST_ASSERT_TRUE(cJSON_IsObject(memory));
+    cJSON *used = cJSON_GetObjectItemCaseSensitive(memory, "used");
+    TEST_ASSERT_TRUE(cJSON_IsNumber(used));
+    TEST_ASSERT_EQUAL_INT(234881024, (int)used->valuedouble);
+    cJSON *capability = cJSON_GetObjectItemCaseSensitive(memory, "capability");
+    TEST_ASSERT_TRUE(cJSON_IsString(capability));
+    TEST_ASSERT_EQUAL_STRING("available", capability->valuestring);
+
+    cJSON *threads = cJSON_GetObjectItemCaseSensitive(root, "threads");
+    TEST_ASSERT_TRUE(cJSON_IsNumber(threads));
+    TEST_ASSERT_EQUAL_INT(17, (int)threads->valuedouble);
+
+    cJSON_Delete(root);
+    http_response_free(&res);
+    system_health_shutdown();
 }
 
 void test_get_json_logs_tail_owns_level_reference_nodes(void) {
@@ -295,6 +416,160 @@ void test_handle_get_streams_includes_motion_trigger_source(void) {
 
     cJSON_Delete(root);
     http_response_free(&res);
+    clear_db_streams();
+}
+
+void test_handle_get_stream_summaries_are_paginated_and_credential_free(void) {
+    clear_db_streams();
+    stream_config_t alpha = make_test_stream("Alpha");
+    stream_config_t bravo = make_test_stream("Bravo");
+    stream_config_t charlie = make_test_stream("Charlie");
+    safe_strcpy(alpha.url, "rtsp://admin:alpha-secret@example/stream",
+                sizeof(alpha.url), 0);
+    safe_strcpy(charlie.admin_url, "https://charlie.example/admin",
+                sizeof(charlie.admin_url), 0);
+    memset(alpha.recording_schedule, 1, sizeof(alpha.recording_schedule));
+    memset(alpha.detection_recording_schedule, 1,
+           sizeof(alpha.detection_recording_schedule));
+    TEST_ASSERT_GREATER_THAN(0, add_stream_config(&alpha));
+    TEST_ASSERT_GREATER_THAN(0, add_stream_config(&bravo));
+    TEST_ASSERT_GREATER_THAN(0, add_stream_config(&charlie));
+
+    http_request_t req;
+    http_response_t res;
+    http_request_init(&req);
+    http_response_init(&res);
+    safe_strcpy(req.query_string,
+                "summary=true&include_admin_url=true&page=2&page_size=2"
+                "&sort_by=name&sort_order=asc",
+                sizeof(req.query_string), 0);
+    handle_get_streams(&req, &res);
+
+    TEST_ASSERT_EQUAL_INT(200, res.status_code);
+    cJSON *root = parse_response_json(&res);
+    const cJSON *streams =
+        cJSON_GetObjectItemCaseSensitive(root, "streams");
+    TEST_ASSERT_TRUE(cJSON_IsArray(streams));
+    TEST_ASSERT_EQUAL_INT(1, cJSON_GetArraySize(streams));
+    TEST_ASSERT_EQUAL_INT(
+        3, cJSON_GetObjectItemCaseSensitive(root, "total")->valueint);
+    TEST_ASSERT_EQUAL_INT(
+        2, cJSON_GetObjectItemCaseSensitive(root, "total_pages")->valueint);
+    const cJSON *stream = cJSON_GetArrayItem(streams, 0);
+    TEST_ASSERT_EQUAL_STRING(
+        "Charlie",
+        cJSON_GetObjectItemCaseSensitive(stream, "name")->valuestring);
+    TEST_ASSERT_EQUAL_STRING(
+        "https://charlie.example/admin",
+        cJSON_GetObjectItemCaseSensitive(stream, "admin_url")->valuestring);
+    TEST_ASSERT_NULL(cJSON_GetObjectItemCaseSensitive(stream, "url"));
+    TEST_ASSERT_NULL(
+        cJSON_GetObjectItemCaseSensitive(stream, "onvif_password"));
+    TEST_ASSERT_NULL(
+        cJSON_GetObjectItemCaseSensitive(stream, "recording_schedule"));
+    TEST_ASSERT_NULL(cJSON_GetObjectItemCaseSensitive(
+        stream, "detection_recording_schedule"));
+
+    cJSON_Delete(root);
+    http_response_free(&res);
+    clear_db_streams();
+}
+
+void test_viewer_stream_summary_redacts_admin_url(void) {
+    clear_db_streams();
+
+    stream_config_t s = make_test_stream("summary_viewer_cam");
+    safe_strcpy(s.admin_url, "http://admin:secret@camera.local/",
+                sizeof(s.admin_url), 0);
+    TEST_ASSERT_GREATER_THAN(0, add_stream_config(&s));
+
+    http_request_t req;
+    http_response_t res;
+    http_request_init(&req);
+    http_response_init(&res);
+    safe_strcpy(req.query_string,
+                "summary=true&surface=admin&include_admin_url=true",
+                sizeof(req.query_string), 0);
+    int64_t viewer_id = add_api_key_user(&req, "summary_viewer_get",
+                                         USER_ROLE_VIEWER);
+    g_config.web_auth_enabled = true;
+
+    handle_get_streams(&req, &res);
+
+    TEST_ASSERT_EQUAL_INT(200, res.status_code);
+    cJSON *root = parse_response_json(&res);
+    const cJSON *streams = cJSON_GetObjectItemCaseSensitive(root, "streams");
+    TEST_ASSERT_TRUE(cJSON_IsArray(streams));
+    TEST_ASSERT_EQUAL_INT(1, cJSON_GetArraySize(streams));
+    const cJSON *stream = cJSON_GetArrayItem(streams, 0);
+    TEST_ASSERT_EQUAL_STRING(
+        "", cJSON_GetObjectItemCaseSensitive(stream, "admin_url")->valuestring);
+    TEST_ASSERT_TRUE(cJSON_IsFalse(
+        cJSON_GetObjectItemCaseSensitive(stream, "can_configure")));
+
+    cJSON_Delete(root);
+    http_response_free(&res);
+    g_config.web_auth_enabled = false;
+    TEST_ASSERT_EQUAL_INT(0, db_auth_delete_user(viewer_id));
+    clear_db_streams();
+}
+
+void test_stream_summary_contract_scales_to_1024_cameras(void) {
+    clear_db_streams();
+    sqlite3 *db = get_db_handle();
+    sqlite3_stmt *statement = NULL;
+    TEST_ASSERT_EQUAL_INT(SQLITE_OK, sqlite3_exec(
+        db, "BEGIN IMMEDIATE;", NULL, NULL, NULL));
+    TEST_ASSERT_EQUAL_INT(SQLITE_OK, sqlite3_prepare_v2(
+        db,
+        "INSERT INTO streams "
+        "(camera_uuid, name, url, enabled, streaming_enabled, width, height, "
+        " fps, codec, record, segment_duration) "
+        "VALUES (?, ?, 'rtsp://admin:secret@example/live', 1, 1, 1920, "
+        "1080, 25, 'h264', 1, 30);",
+        -1, &statement, NULL));
+    for (int index = 0; index < 1024; index++) {
+        char camera_uuid[CAMERA_UUID_STRING_SIZE];
+        char name[MAX_STREAM_NAME];
+        snprintf(camera_uuid, sizeof(camera_uuid),
+                 "00000000-0000-4000-8000-%012d", index);
+        snprintf(name, sizeof(name), "Camera %04d", index);
+        sqlite3_bind_text(statement, 1, camera_uuid, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(statement, 2, name, -1, SQLITE_TRANSIENT);
+        TEST_ASSERT_EQUAL_INT(SQLITE_DONE, sqlite3_step(statement));
+        TEST_ASSERT_EQUAL_INT(SQLITE_OK, sqlite3_reset(statement));
+        sqlite3_clear_bindings(statement);
+    }
+    sqlite3_finalize(statement);
+    TEST_ASSERT_EQUAL_INT(SQLITE_OK, sqlite3_exec(
+        db, "COMMIT;", NULL, NULL, NULL));
+
+    int previous_max_streams = g_config.max_streams;
+    g_config.max_streams = 1024;
+    http_request_t req;
+    http_response_t res;
+    http_request_init(&req);
+    http_response_init(&res);
+    safe_strcpy(req.query_string,
+                "summary=true&page=11&page_size=100&sort_by=name&sort_order=asc",
+                sizeof(req.query_string), 0);
+    handle_get_streams(&req, &res);
+
+    TEST_ASSERT_EQUAL_INT(200, res.status_code);
+    cJSON *root = parse_response_json(&res);
+    const cJSON *streams =
+        cJSON_GetObjectItemCaseSensitive(root, "streams");
+    TEST_ASSERT_EQUAL_INT(1024,
+        cJSON_GetObjectItemCaseSensitive(root, "total")->valueint);
+    TEST_ASSERT_EQUAL_INT(11,
+        cJSON_GetObjectItemCaseSensitive(root, "total_pages")->valueint);
+    TEST_ASSERT_EQUAL_INT(24, cJSON_GetArraySize(streams));
+    TEST_ASSERT_NULL(cJSON_GetObjectItemCaseSensitive(
+        cJSON_GetArrayItem(streams, 0), "url"));
+
+    cJSON_Delete(root);
+    http_response_free(&res);
+    g_config.max_streams = previous_max_streams;
     clear_db_streams();
 }
 
@@ -424,6 +699,78 @@ void test_handle_put_stream_parses_motion_trigger_source(void) {
 
     TEST_ASSERT_TRUE(res.status_code == 202 || res.status_code == 400 ||
                      res.status_code == 404 || res.status_code == 500);
+
+    http_response_free(&res);
+    shutdown_stream_manager();
+    shutdown_stream_state_manager();
+    clear_db_streams();
+}
+
+void test_handle_post_stream_normalizes_blank_go2rtc_override(void) {
+    clear_db_streams();
+
+    init_stream_state_manager(16);
+    init_stream_manager(16);
+
+    http_request_t req;
+    http_response_t res;
+    http_request_init(&req);
+    http_response_init(&res);
+
+    static const char json_body[] =
+        "{\"name\":\"cam_g2r_blank_post\","
+        "\"url\":\"rtsp://localhost/stream\","
+        "\"go2rtc_source_override\":\" \\t\\n\"}";
+    req.body = (uint8_t *)json_body;
+    req.body_len = sizeof(json_body) - 1;
+
+    handle_post_stream(&req, &res);
+
+    stream_config_t got;
+    TEST_ASSERT_EQUAL_INT(
+        0, get_stream_config_by_name("cam_g2r_blank_post", &got));
+    TEST_ASSERT_EQUAL_STRING("", got.go2rtc_source_override);
+
+    usleep(200000);
+    http_response_free(&res);
+    shutdown_stream_manager();
+    shutdown_stream_state_manager();
+    clear_db_streams();
+}
+
+void test_handle_put_stream_normalizes_blank_go2rtc_override(void) {
+    clear_db_streams();
+
+    stream_config_t s = make_test_stream("cam_g2r_blank_put");
+    safe_strcpy(s.go2rtc_source_override, "rtsp://old/stream",
+                sizeof(s.go2rtc_source_override), 0);
+    TEST_ASSERT_NOT_EQUAL(0, add_stream_config(&s));
+
+    init_stream_state_manager(16);
+    init_stream_manager(16);
+    add_stream(&s);
+
+    http_request_t req;
+    http_response_t res;
+    http_request_init(&req);
+    http_response_init(&res);
+    safe_strcpy(req.path, "/api/streams/cam_g2r_blank_put",
+                sizeof(req.path), 0);
+    static const char json_body[] =
+        "{\"go2rtc_source_override\":\" \\t\\n\"}";
+    req.body = (uint8_t *)json_body;
+    req.body_len = sizeof(json_body) - 1;
+
+    handle_put_stream(&req, &res);
+    /* Clearing an override restarts go2rtc and includes a 500 ms settling
+     * delay in the detached worker. Keep the stream manager alive until that
+     * worker has completed its restart/start path. */
+    usleep(1200000);
+
+    stream_config_t got;
+    TEST_ASSERT_EQUAL_INT(
+        0, get_stream_config_by_name("cam_g2r_blank_put", &got));
+    TEST_ASSERT_EQUAL_STRING("", got.go2rtc_source_override);
 
     http_response_free(&res);
     shutdown_stream_manager();
@@ -838,6 +1185,57 @@ void test_handle_post_stream_rejects_invalid_playback_transport(void) {
     http_response_free(&res);
 }
 
+void test_handle_post_stream_persists_valid_eptz_config(void) {
+    clear_db_streams();
+    init_stream_state_manager(16);
+    init_stream_manager(16);
+
+    http_request_t req;
+    http_response_t res;
+    http_request_init(&req);
+    http_response_init(&res);
+    static const char json_body[] =
+        "{\"name\":\"cam_eptz_post\",\"url\":\"rtsp://localhost/stream\","
+        "\"eptz_config\":\"{\\\"version\\\":1,\\\"projection\\\":\\\"equidistant\\\","
+        "\\\"mount\\\":\\\"ceiling\\\",\\\"centerX\\\":0.5,\\\"centerY\\\":0.5,"
+        "\\\"radius\\\":0.48,\\\"fov\\\":190,\\\"rotation\\\":0,"
+        "\\\"defaultYaw\\\":0,\\\"defaultTilt\\\":-45,\\\"defaultViewFov\\\":75}\"}";
+    req.body = (uint8_t *)json_body;
+    req.body_len = sizeof(json_body) - 1;
+
+    handle_post_stream(&req, &res);
+
+    stream_config_t got;
+    TEST_ASSERT_EQUAL_INT(0, get_stream_config_by_name("cam_eptz_post", &got));
+    TEST_ASSERT_NOT_NULL(strstr(got.eptz_config, "\"projection\":\"equidistant\""));
+
+    usleep(200000);
+    http_response_free(&res);
+    shutdown_stream_manager();
+    shutdown_stream_state_manager();
+    clear_db_streams();
+}
+
+void test_handle_post_stream_rejects_invalid_eptz_config(void) {
+    clear_db_streams();
+    http_request_t req;
+    http_response_t res;
+    http_request_init(&req);
+    http_response_init(&res);
+    static const char json_body[] =
+        "{\"name\":\"cam_eptz_bad\",\"url\":\"rtsp://localhost/stream\","
+        "\"eptz_config\":\"{\\\"version\\\":1,\\\"projection\\\":\\\"vendor-magic\\\"}\"}";
+    req.body = (uint8_t *)json_body;
+    req.body_len = sizeof(json_body) - 1;
+
+    handle_post_stream(&req, &res);
+
+    TEST_ASSERT_EQUAL_INT(400, res.status_code);
+    stream_config_t got;
+    TEST_ASSERT_NOT_EQUAL(0, get_stream_config_by_name("cam_eptz_bad", &got));
+    http_response_free(&res);
+}
+
 void test_get_onvif_devices_returns_persisted_inventory_metadata(void) {
     clear_onvif_inventory();
     onvif_device_info_t observed;
@@ -944,11 +1342,17 @@ int main(void) {
     RUN_TEST(test_handle_get_system_info_includes_versions_summary);
     RUN_TEST(test_handle_get_system_info_does_not_wait_for_go2rtc_lifecycle);
     RUN_TEST(test_handle_get_system_info_includes_empty_stream_storage_array);
+    RUN_TEST(test_handle_get_system_info_reports_process_memory_and_threads);
     RUN_TEST(test_get_json_logs_tail_owns_level_reference_nodes);
     RUN_TEST(test_handle_get_streams_includes_motion_trigger_source);
+    RUN_TEST(test_handle_get_stream_summaries_are_paginated_and_credential_free);
+    RUN_TEST(test_stream_summary_contract_scales_to_1024_cameras);
+    RUN_TEST(test_viewer_stream_summary_redacts_admin_url);
     RUN_TEST(test_viewer_stream_response_redacts_credentials);
     RUN_TEST(test_viewer_cannot_enable_stream_privacy_mode);
     RUN_TEST(test_handle_put_stream_parses_motion_trigger_source);
+    RUN_TEST(test_handle_post_stream_normalizes_blank_go2rtc_override);
+    RUN_TEST(test_handle_put_stream_normalizes_blank_go2rtc_override);
     RUN_TEST(test_handle_get_streams_includes_audio_voice_enhancement);
     RUN_TEST(test_handle_get_stream_by_name_includes_audio_voice_enhancement);
     RUN_TEST(test_handle_post_stream_persists_audio_voice_enhancement);
@@ -961,6 +1365,8 @@ int main(void) {
     RUN_TEST(test_stream_retention_routes_require_camera_configure);
     RUN_TEST(test_handle_post_stream_persists_playback_transport);
     RUN_TEST(test_handle_post_stream_rejects_invalid_playback_transport);
+    RUN_TEST(test_handle_post_stream_persists_valid_eptz_config);
+    RUN_TEST(test_handle_post_stream_rejects_invalid_eptz_config);
     RUN_TEST(test_get_onvif_devices_returns_persisted_inventory_metadata);
     RUN_TEST(test_claim_onvif_device_api_requires_existing_stream);
     int result = UNITY_END();

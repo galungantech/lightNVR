@@ -1,10 +1,11 @@
 /**
- * Sub-stream ↔ main-stream swap on per-cell fullscreen (#366)
+ * Sub-stream ↔ main-stream swap on per-cell fullscreen (#366, #578)
  *
- * When a stream is configured with sub_stream_url and rendered in a grid
- * (>1 cell), the video cell uses the `{name}_sub` go2rtc source. Entering
- * native fullscreen on that specific cell must swap it to the main stream
- * so the user sees full-resolution video, not the low-res dashboard feed.
+ * When a stream is configured with sub_stream_url and rendered on the
+ * dashboard grids with multiple cells use the `{name}_sub` go2rtc source.
+ * A 1×1 dashboard uses the main stream directly, avoiding a second producer
+ * for cameras that cannot serve main and sub-stream sessions concurrently.
+ * Entering native fullscreen swaps a multi-cell tile to the main stream.
  *
  * We assert this via the `data-sub-stream` attribute on each `.video-cell`,
  * which mirrors the `useSubStream` prop resolved by LiveView / WebRTCView.
@@ -27,14 +28,14 @@ test.describe('Sub-stream swap on per-cell fullscreen @ui @liveview', () => {
   ];
 
   /**
-   * Produce a stream-details object that satisfies LiveView's filter:
-   * enabled + streaming_enabled + not soft-deleted, with sub_stream_url set.
+   * Produce a paginated stream-summary row that satisfies LiveView's filter
+   * and advertises the configured sub-stream without exposing its URL.
    */
-  function fullStreamDetails(name: string, subUrl: string) {
+  function streamSummary(name: string) {
     return {
+      camera_uuid: name,
       name,
       url: `rtsp://192.168.1.100/${name}`,
-      sub_stream_url: subUrl,
       enabled: true,
       streaming_enabled: true,
       is_deleted: false,
@@ -48,7 +49,9 @@ test.describe('Sub-stream swap on per-cell fullscreen @ui @liveview', () => {
       segment_duration: 30,
       record: false,
       record_audio: false,
+      has_sub_stream: true,
       go2rtc_hls_available: false,
+      availability: 'live',
     };
   }
 
@@ -60,16 +63,12 @@ test.describe('Sub-stream swap on per-cell fullscreen @ui @liveview', () => {
     });
 
     // List endpoint
-    await page.route('**/api/streams', route => route.fulfill({
-      json: STREAMS.map(s => ({ name: s.name, enabled: true, streaming_enabled: true })),
+    await page.route(/\/api\/streams(?:\?.*)?$/, route => route.fulfill({
+      json: {
+        streams: STREAMS.map(s => streamSummary(s.name)),
+        total_pages: 1,
+      },
     }));
-
-    // Per-stream details endpoint (called by LiveView for each listed stream)
-    for (const s of STREAMS) {
-      await page.route(`**/api/streams/${s.name}`, route => route.fulfill({
-        json: fullStreamDetails(s.name, s.sub_stream_url),
-      }));
-    }
 
     // Stub HLS / go2rtc endpoints so the video cells don't spam 404s.
     await page.route('**/hls/**', route => route.fulfill({ status: 204, body: '' }));
@@ -121,13 +120,26 @@ test.describe('Sub-stream swap on per-cell fullscreen @ui @liveview', () => {
     await expect(cellB).toHaveAttribute('data-sub-stream', 'true');
   });
 
-  test('single-stream layout never uses sub-stream', async ({ page }) => {
+  test('single-stream layout reuses the main stream producer', async ({ page }) => {
     await page.goto('/index.html?cols=1&rows=1&stream=cam_a', { waitUntil: 'domcontentloaded' });
 
     const cellA = page.locator('.video-cell[data-stream-name="cam_a"]').first();
     await expect(cellA).toBeVisible({ timeout: 15000 });
 
-    // 1×1 layout always shows the main stream (full-screen/recording quality).
+    // The main producer is already used by recording. Reusing it here avoids
+    // opening the camera's main and sub-stream sessions concurrently (#579).
+    await expect(cellA).toHaveAttribute('data-sub-stream', 'false');
+
+    await page.evaluate(() => {
+      const target = document.querySelector('.video-cell[data-stream-name="cam_a"]');
+      Object.defineProperty(document, 'fullscreenElement', {
+        configurable: true,
+        get: () => target,
+      });
+      document.dispatchEvent(new Event('fullscreenchange'));
+    });
+
+    // Fullscreen keeps the already-selected main producer.
     await expect(cellA).toHaveAttribute('data-sub-stream', 'false');
   });
 });

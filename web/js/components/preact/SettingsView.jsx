@@ -31,6 +31,14 @@ import { MqttTab } from './settings/MqttTab.jsx';
 import { AuthTab } from './settings/AuthTab.jsx';
 import { AppearanceTab } from './settings/AppearanceTab.jsx';
 import { AdvancedTab } from './settings/AdvancedTab.jsx';
+import { WorkspacesTab } from './settings/WorkspacesTab.jsx';
+import {
+  HealthTab,
+  HEALTH_SETTINGS_DEFAULTS,
+  healthSettingsFromResponse,
+  healthSettingsToPayload,
+  validateHealthSettings,
+} from './settings/HealthTab.jsx';
 
 /**
  * Tab definitions. `id` is the URL hash fragment ("#general", "#go2rtc", …).
@@ -44,8 +52,10 @@ const TAB_DEFS = [
   { id: 'detection', labelKey: 'settings.tab.detection',      labelFallback: 'Detection' },
   { id: 'go2rtc',    labelKey: 'settings.tab.go2rtc',         labelFallback: 'go2rtc' },
   { id: 'mqtt',      labelKey: 'settings.tab.mqtt',           labelFallback: 'MQTT' },
+  { id: 'health',    labelKey: 'settings.tab.health',         labelFallback: 'Health' },
   { id: 'auth',      labelKey: 'settings.tab.auth',           labelFallback: 'Auth / Security' },
   { id: 'appearance', labelKey: 'settings.tab.appearance',    labelFallback: 'Appearance' },
+  { id: 'workspaces', labelKey: 'settings.tab.workspaces',    labelFallback: 'Workspaces' },
   { id: 'advanced',  labelKey: 'settings.tab.advanced',       labelFallback: 'Advanced' },
 ];
 
@@ -92,6 +102,8 @@ export function SettingsView() {
     maxStreamsCeiling: 1024,
     authEnabled: true,
     demoMode: false,
+    audioDisabled: false,
+    autoDisabled: false,
     webrtcDisabled: false,
     hlsDisabled: false,
     mseDisabled: false,
@@ -153,7 +165,10 @@ export function SettingsView() {
     turnPassword: '',
     onvifDiscoveryEnabled: false,
     onvifDiscoveryInterval: '300',
-    onvifDiscoveryNetwork: 'auto'
+    onvifDiscoveryNetwork: 'auto',
+    ...HEALTH_SETTINGS_DEFAULTS,
+    healthConditionOverrides: { version: 1, conditions: [] },
+    healthEffectivePolicy: { conditions: [] },
   });
 
   // Baseline snapshot of the last-loaded/saved settings, used for dirty detection.
@@ -319,8 +334,8 @@ export function SettingsView() {
       generateThumbnails: settingsData.generate_thumbnails !== false,
       thumbnailsPerRecording: settingsData.thumbnails_per_recording === 1 ? 1 : 3,
       dbPath: settingsData.db_path || '',
-      dbBackupIntervalMinutes: settingsData.db_backup_interval_minutes?.toString() || '60',
-      dbBackupRetentionCount: settingsData.db_backup_retention_count?.toString() || '24',
+      dbBackupIntervalMinutes: settingsData.db_backup_interval_minutes?.toString() || '0',
+      dbBackupRetentionCount: settingsData.db_backup_retention_count?.toString() || '6',
       dbPostBackupScript: settingsData.db_post_backup_script || '',
       webPort: settingsData.web_port?.toString() || '',
       webBindIp: settingsData.web_bind_ip?.toString() || '0.0.0.0',
@@ -329,6 +344,8 @@ export function SettingsView() {
       maxStreamsCeiling: settingsData.max_streams_ceiling ?? 1024,
       authEnabled: settingsData.web_auth_enabled || false,
       demoMode: settingsData.demo_mode || false,
+      audioDisabled:  settingsData.audio_disabled  || false,
+      autoDisabled:   settingsData.auto_disabled   || false,
       webrtcDisabled: settingsData.webrtc_disabled || false,
       hlsDisabled:    settingsData.hls_disabled    || false,
       mseDisabled:    settingsData.mse_disabled    || false,
@@ -391,7 +408,8 @@ export function SettingsView() {
       turnPassword: settingsData.turn_password || '',
       onvifDiscoveryEnabled: settingsData.onvif_discovery_enabled || false,
       onvifDiscoveryInterval: settingsData.onvif_discovery_interval?.toString() || '300',
-      onvifDiscoveryNetwork: settingsData.onvif_discovery_network || 'auto'
+      onvifDiscoveryNetwork: settingsData.onvif_discovery_network || 'auto',
+      ...healthSettingsFromResponse(settingsData),
     };
     setSettings(prev => {
       const merged = { ...prev, ...mappedData };
@@ -418,10 +436,19 @@ export function SettingsView() {
     setIsDirty(dirty);
   }, [settings]);
 
+  const healthValidationErrors = useMemo(
+    () => validateHealthSettings(settings),
+    [settings]
+  );
+
   // Save.
   // Returns a promise so <AsyncButton> can track pending state and guard
   // against rapid-tap double-submits (#399 / PRD UXD_01 §5.1).
   const saveSettings = () => {
+    if (healthValidationErrors.length > 0) {
+      showStatusMessage(t(`settings.health.validation.${healthValidationErrors[0]}`), 'error');
+      return Promise.resolve();
+    }
     const webThreadPoolSize = parseInt(settings.webThreadPoolSize, 10);
     const parsedMaxStreams = parseInt(settings.maxStreams, 10);
     const parsedDbBackupIntervalMinutes = parseInt(settings.dbBackupIntervalMinutes, 10);
@@ -454,6 +481,8 @@ export function SettingsView() {
       max_streams: Number.isNaN(parsedMaxStreams) ? 32 : parsedMaxStreams,
       web_auth_enabled: settings.authEnabled,
       demo_mode: settings.demoMode,
+      audio_disabled:  settings.audioDisabled,
+      auto_disabled:   settings.autoDisabled,
       webrtc_disabled: settings.webrtcDisabled,
       hls_disabled:    settings.hlsDisabled,
       mse_disabled:    settings.mseDisabled,
@@ -513,7 +542,8 @@ export function SettingsView() {
       turn_password: settings.turnPassword,
       onvif_discovery_enabled: settings.onvifDiscoveryEnabled,
       onvif_discovery_interval: parseInt(settings.onvifDiscoveryInterval, 10),
-      onvif_discovery_network: settings.onvifDiscoveryNetwork
+      onvif_discovery_network: settings.onvifDiscoveryNetwork,
+      ...healthSettingsToPayload(settings),
     };
     return saveSettingsMutation.mutateAsync(mappedSettings);
   };
@@ -649,6 +679,8 @@ export function SettingsView() {
             t={t}
           />
 
+          <WorkspacesTab t={t} />
+
           <div class="settings-group bg-card text-card-foreground rounded-lg shadow p-4">
             <p class="text-muted-foreground">
               {t('settings.adminOnly')}
@@ -726,6 +758,17 @@ export function SettingsView() {
             t={t}
           />
         )}
+        {tab.id === 'health' && (
+          <HealthTab
+            settings={settings}
+            setSettings={setSettings}
+            handleInputChange={handleInputChange}
+            canModifySettings={canModifySettings}
+            validationErrors={healthValidationErrors}
+            serverError={saveSettingsMutation.error?.message || ''}
+            t={t}
+          />
+        )}
         {tab.id === 'auth' && (
           <AuthTab
             settings={settings}
@@ -752,6 +795,7 @@ export function SettingsView() {
             t={t}
           />
         )}
+        {tab.id === 'workspaces' && <WorkspacesTab t={t} />}
         {tab.id === 'advanced' && (
           <AdvancedTab
             settings={settings}
@@ -881,7 +925,7 @@ export function SettingsView() {
                 id="save-settings-btn"
                 class="px-6 py-2 bg-primary text-primary-foreground rounded hover:bg-primary/90 transition-colors focus:outline-none focus:ring-2 focus:ring-primary focus:ring-offset-2 min-h-11 disabled:opacity-60 disabled:cursor-not-allowed"
                 onClick={saveSettings}
-                disabled={!isDirty}
+                disabled={!isDirty || healthValidationErrors.length > 0}
               >
                 {t('settings.saveSettings')}
               </AsyncButton>

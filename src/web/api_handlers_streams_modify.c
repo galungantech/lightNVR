@@ -490,6 +490,66 @@ static bool is_allowed_publish_url(const char *u) {
     return strncasecmp(u, "rtmp://", 7) == 0 || strncasecmp(u, "rtmps://", 8) == 0;
 }
 
+static bool eptz_number_in_range(cJSON *root, const char *name,
+                                 double minimum, double maximum) {
+    cJSON *value = cJSON_GetObjectItemCaseSensitive(root, name);
+    return cJSON_IsNumber(value) && value->valuedouble >= minimum &&
+           value->valuedouble <= maximum;
+}
+
+/* Validate the version-1 browser dewarping document before it reaches the DB.
+ * Empty is the canonical disabled value. Keeping this document opaque to the
+ * recorder lets later projection versions evolve without touching media code. */
+static bool copy_valid_eptz_config(cJSON *value, char *destination,
+                                   size_t destination_size,
+                                   char *error, size_t error_size) {
+    if (!value || !destination || destination_size == 0) return false;
+    if (!cJSON_IsString(value) || !value->valuestring) {
+        snprintf(error, error_size, "eptz_config must be a JSON string");
+        return false;
+    }
+
+    const char *text = value->valuestring;
+    if (text[0] == '\0') {
+        destination[0] = '\0';
+        return true;
+    }
+    if (strlen(text) >= destination_size) {
+        snprintf(error, error_size, "eptz_config exceeds size limit");
+        return false;
+    }
+
+    cJSON *root = cJSON_Parse(text);
+    cJSON *version = root
+        ? cJSON_GetObjectItemCaseSensitive(root, "version") : NULL;
+    cJSON *projection = root
+        ? cJSON_GetObjectItemCaseSensitive(root, "projection") : NULL;
+    cJSON *mount = root
+        ? cJSON_GetObjectItemCaseSensitive(root, "mount") : NULL;
+    bool valid = cJSON_IsObject(root) && cJSON_IsNumber(version) &&
+        version->valuedouble == 1.0 && cJSON_IsString(projection) &&
+        strcmp(projection->valuestring, "equidistant") == 0 &&
+        cJSON_IsString(mount) && strcmp(mount->valuestring, "ceiling") == 0 &&
+        eptz_number_in_range(root, "centerX", 0.0, 1.0) &&
+        eptz_number_in_range(root, "centerY", 0.0, 1.0) &&
+        eptz_number_in_range(root, "radius", 0.05, 1.0) &&
+        eptz_number_in_range(root, "fov", 160.0, 360.0) &&
+        eptz_number_in_range(root, "rotation", -360.0, 360.0) &&
+        eptz_number_in_range(root, "defaultYaw", -360.0, 360.0) &&
+        eptz_number_in_range(root, "defaultTilt", -90.0, 30.0) &&
+        eptz_number_in_range(root, "defaultViewFov", 20.0, 120.0);
+    cJSON_Delete(root);
+
+    if (!valid) {
+        snprintf(error, error_size,
+                 "eptz_config is not a supported version-1 equidistant ceiling configuration");
+        return false;
+    }
+
+    safe_strcpy(destination, text, destination_size, 0);
+    return true;
+}
+
 /**
  * @brief Direct handler for POST /api/streams
  */
@@ -603,6 +663,18 @@ void handle_post_stream(const http_request_t *req, http_response_t *res) {
         }
         safe_strcpy(config.playback_transport, playback_transport->valuestring,
                     sizeof(config.playback_transport), 0);
+    }
+
+    cJSON *eptz_config = cJSON_GetObjectItem(stream_json, "eptz_config");
+    if (eptz_config) {
+        char eptz_error[160];
+        if (!copy_valid_eptz_config(eptz_config, config.eptz_config,
+                                    sizeof(config.eptz_config), eptz_error,
+                                    sizeof(eptz_error))) {
+            cJSON_Delete(stream_json);
+            http_response_set_json_error(res, 400, eptz_error);
+            return;
+        }
     }
 
     // Note: width, height, fps, and codec are auto-detected from the stream
@@ -848,49 +920,57 @@ void handle_post_stream(const http_request_t *req, http_response_t *res) {
     cJSON *go2rtc_source_override_post = cJSON_GetObjectItem(stream_json, "go2rtc_source_override");
     if (go2rtc_source_override_post && cJSON_IsString(go2rtc_source_override_post)) {
         const char *src = go2rtc_source_override_post->valuestring;
-        size_t src_len = strlen(src);
 
-        if (src_len >= sizeof(config.go2rtc_source_override)) {
-            log_error("go2rtc_source_override too long (%zu bytes, max %zu)",
-                      src_len, sizeof(config.go2rtc_source_override) - 1);
-            cJSON_Delete(stream_json);
-            http_response_set_json_error(res, 413,
-                "go2rtc_source_override exceeds size limit");
-            return;
-        }
+        // Code editors commonly retain a final newline after their visible
+        // content is deleted. Whitespace-only input means "clear override";
+        // preserving it would generate a stream key with no producers.
+        if (!string_has_non_whitespace(src)) {
+            config.go2rtc_source_override[0] = '\0';
+        } else {
+            size_t src_len = strlen(src);
 
-        if (strchr(src, '\n') != NULL) {
-            char err[256] = {0};
-            int rc = yaml_validate_str(src, src_len, err, sizeof(err));
-            if (rc < 0) {
-                log_warn("Rejecting go2rtc_source_override: %s", err);
+            if (src_len >= sizeof(config.go2rtc_source_override)) {
+                log_error("go2rtc_source_override too long (%zu bytes, max %zu)",
+                          src_len, sizeof(config.go2rtc_source_override) - 1);
                 cJSON_Delete(stream_json);
-                /* Build a structured 400 response with line/column when
-                 * the validator surfaced them in `err`. */
-                cJSON *response = cJSON_CreateObject();
-                if (response) {
-                    cJSON_AddBoolToObject(response, "valid", false);
-                    cJSON *errobj = cJSON_CreateObject();
-                    if (errobj) {
-                        cJSON_AddStringToObject(errobj, "message", err);
-                        cJSON_AddItemToObject(response, "error", errobj);
-                    }
-                    char *body = cJSON_PrintUnformatted(response);
-                    cJSON_Delete(response);
-                    if (body) {
-                        http_response_set_json(res, 400, body);
-                        free(body);
-                        return;
-                    }
-                }
-                http_response_set_json_error(res, 400,
-                    "go2rtc_source_override is not valid YAML");
+                http_response_set_json_error(res, 413,
+                    "go2rtc_source_override exceeds size limit");
                 return;
             }
-        }
 
-        safe_strcpy(config.go2rtc_source_override, src,
-                sizeof(config.go2rtc_source_override), 0);
+            if (strchr(src, '\n') != NULL) {
+                char err[256] = {0};
+                int rc = yaml_validate_str(src, src_len, err, sizeof(err));
+                if (rc < 0) {
+                    log_warn("Rejecting go2rtc_source_override: %s", err);
+                    cJSON_Delete(stream_json);
+                    /* Build a structured 400 response with line/column when
+                     * the validator surfaced them in `err`. */
+                    cJSON *response = cJSON_CreateObject();
+                    if (response) {
+                        cJSON_AddBoolToObject(response, "valid", false);
+                        cJSON *errobj = cJSON_CreateObject();
+                        if (errobj) {
+                            cJSON_AddStringToObject(errobj, "message", err);
+                            cJSON_AddItemToObject(response, "error", errobj);
+                        }
+                        char *body = cJSON_PrintUnformatted(response);
+                        cJSON_Delete(response);
+                        if (body) {
+                            http_response_set_json(res, 400, body);
+                            free(body);
+                            return;
+                        }
+                    }
+                    http_response_set_json_error(res, 400,
+                        "go2rtc_source_override is not valid YAML");
+                    return;
+                }
+            }
+
+            safe_strcpy(config.go2rtc_source_override, src,
+                    sizeof(config.go2rtc_source_override), 0);
+        }
     } else {
         config.go2rtc_source_override[0] = '\0';
     }
@@ -1261,6 +1341,24 @@ void handle_put_stream(const http_request_t *req, http_response_t *res) {
             safe_strcpy(config.playback_transport,
                         playback_transport->valuestring,
                         sizeof(config.playback_transport), 0);
+            config_changed = true;
+        }
+    }
+
+    cJSON *eptz_config = cJSON_GetObjectItem(stream_json, "eptz_config");
+    if (eptz_config) {
+        char parsed_eptz_config[EPTZ_CONFIG_MAX];
+        char eptz_error[160];
+        if (!copy_valid_eptz_config(eptz_config, parsed_eptz_config,
+                                    sizeof(parsed_eptz_config), eptz_error,
+                                    sizeof(eptz_error))) {
+            cJSON_Delete(stream_json);
+            http_response_set_json_error(res, 400, eptz_error);
+            return;
+        }
+        if (strcmp(config.eptz_config, parsed_eptz_config) != 0) {
+            safe_strcpy(config.eptz_config, parsed_eptz_config,
+                        sizeof(config.eptz_config), 0);
             config_changed = true;
         }
     }
@@ -1688,9 +1786,14 @@ void handle_put_stream(const http_request_t *req, http_response_t *res) {
     // Parse go2rtc source override
     cJSON *go2rtc_source_override_put = cJSON_GetObjectItem(stream_json, "go2rtc_source_override");
     if (go2rtc_source_override_put && cJSON_IsString(go2rtc_source_override_put)) {
-        if (strncmp(config.go2rtc_source_override, go2rtc_source_override_put->valuestring,
+        const char *src = go2rtc_source_override_put->valuestring;
+        if (!string_has_non_whitespace(src)) {
+            src = "";
+        }
+
+        if (strncmp(config.go2rtc_source_override, src,
                     sizeof(config.go2rtc_source_override) - 1) != 0) {
-            safe_strcpy(config.go2rtc_source_override, go2rtc_source_override_put->valuestring,
+            safe_strcpy(config.go2rtc_source_override, src,
                     sizeof(config.go2rtc_source_override), 0);
             config_changed = true;
             requires_restart = true;

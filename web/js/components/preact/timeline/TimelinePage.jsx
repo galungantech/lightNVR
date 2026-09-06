@@ -16,6 +16,7 @@ import { LoadingIndicator } from '../LoadingIndicator.jsx';
 import { useQuery } from '../../../query-client.js';
 import { useI18n } from '../../../i18n.js';
 import { isReduceMotionActive } from '../../../utils/reduceMotion.js';
+import { fetchAllStreamSummaries } from '../../../utils/stream-summaries.js';
 import {
   currentDateInputValue,
   formatDateForInput,
@@ -1039,10 +1040,12 @@ export function TimelinePage() {
   const {
     data: streamsData,
     error: streamsError
-  } = useQuery('streams', '/api/streams', {
-    timeout: 15000, // 15 second timeout
-    retries: 2,     // Retry twice
-    retryDelay: 1000 // 1 second between retries
+  } = useQuery({
+    queryKey: ['streams', 'timeline-summary', 'live'],
+    // Historical playback needs the browser-side fisheye calibration, which
+    // is intentionally included only in the playback-oriented summary shape.
+    queryFn: ({ signal }) => fetchAllStreamSummaries({ surface: 'live', signal }),
+    staleTime: 30000,
   });
 
   // Handle initial data load when streams are available
@@ -1411,7 +1414,12 @@ export function TimelinePage() {
     return (
       <>
         {/* Video player */}
-        <TimelinePlayer videoElementRef={videoElementRef} autoFullscreen={urlParams.fullscreen} />
+        <TimelinePlayer
+          videoElementRef={videoElementRef}
+          autoFullscreen={urlParams.fullscreen}
+          streamConfig={streamsList.find((stream) => stream.name === selectedStream) || null}
+          streamConfigs={streamsList}
+        />
 
         {/* Playback controls (includes time display) */}
         <TimelineControls />

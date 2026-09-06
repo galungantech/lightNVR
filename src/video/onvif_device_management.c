@@ -62,14 +62,20 @@ static char* send_soap_request(const char *device_url, const char *soap_action, 
         return NULL;
     }
     
-    // Log the request details
-    log_info("Sending SOAP request to: %s", device_url);
-    log_info("Request body: %s", request_body);
+    // Log only operation-level state; SOAP bodies and identities may contain
+    // credentials or sensitive device metadata.
+    char safe_device_url[MAX_URL_LENGTH];
+    if (url_redact_for_logging(device_url, safe_device_url,
+                               sizeof(safe_device_url)) != 0) {
+        safe_strcpy(safe_device_url, "[invalid-url]",
+                    sizeof(safe_device_url), 0);
+    }
+    log_info("Sending SOAP request to: %s", safe_device_url);
     
     // Create security header if authentication is required
     if (username && password && strlen(username) > 0 && strlen(password) > 0) {
         security_header = onvif_create_security_header(username, password);
-        log_info("Using authentication with username: %s", username);
+        log_info("Using ONVIF authentication");
     } else {
         security_header = strdup("");
         log_info("No authentication credentials provided");
@@ -97,7 +103,8 @@ static char* send_soap_request(const char *device_url, const char *soap_action, 
         headers = curl_slist_append(headers, soap_action_header);
     }
     
-    // Set up CURL options with more verbose debugging
+    // Set up CURL options.  Do not enable libcurl's wire logging here: the
+    // outgoing SOAP envelope can contain a WS-Security credential header.
     curl_easy_setopt(curl, CURLOPT_URL, device_url);
     curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
     curl_easy_setopt(curl, CURLOPT_POSTFIELDS, soap_envelope);
@@ -106,7 +113,7 @@ static char* send_soap_request(const char *device_url, const char *soap_action, 
     curl_easy_setopt(curl, CURLOPT_TIMEOUT, 10L);
     curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 0L);
     curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, 0L);
-    curl_easy_setopt(curl, CURLOPT_VERBOSE, 1L); // Enable verbose output
+    curl_easy_setopt(curl, CURLOPT_VERBOSE, 0L);
     
     // Perform the request
     res = curl_easy_perform(curl);
@@ -167,12 +174,9 @@ static char* send_soap_request(const char *device_url, const char *soap_action, 
         }
     }
 
-    // Log response if available
     if (response) {
-        // Log first 200 characters of response for debugging
-        char debug_response[201];
-        safe_strcpy(debug_response, response, 201, 0);
-        log_info("Response (first 200 chars): %s", debug_response);
+        log_debug("Received ONVIF device management response (%zu bytes)",
+                  strlen(response));
     }
     
     // Clean up
@@ -481,6 +485,20 @@ int get_onvif_device_profiles(const char *device_url, const char *username,
                             sizeof(profiles[i].video_source_token), 0);
             }
         }
+
+        /* A PTZConfiguration attached to the selected media profile is the
+         * capability signal needed to expose mechanical PTZ controls. */
+        ezxml_t ptz_config = find_child(profile, "tt:PTZConfiguration");
+        if (!ptz_config) {
+            ptz_config = find_child_local(profile, "PTZConfiguration");
+        }
+        if (ptz_config) {
+            const char *ptz_token = ezxml_attr(ptz_config, "token");
+            if (ptz_token) {
+                safe_strcpy(profiles[i].ptz_configuration_token, ptz_token,
+                            sizeof(profiles[i].ptz_configuration_token), 0);
+            }
+        }
         
         // Get video encoder configuration
         ezxml_t video_encoder = find_child(profile, "tt:VideoEncoderConfiguration");
@@ -757,13 +775,13 @@ int add_onvif_device_as_stream(const onvif_device_info_t *device_info,
     
     // Set ONVIF flag
     config.is_onvif = true;
+    config.ptz_enabled = profile->ptz_configuration_token[0] != '\0';
     
     // Set ONVIF-specific fields
     if (username) {
         safe_strcpy(config.onvif_username, username, sizeof(config.onvif_username), 0);
         
-        // For onvif_simple_server compatibility, log the username
-        log_info("Setting ONVIF username for stream %s: %s", stream_name, username);
+        log_info("Setting ONVIF authentication identity for stream %s", stream_name);
     }
     
     if (password) {

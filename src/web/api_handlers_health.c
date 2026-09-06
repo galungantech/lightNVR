@@ -23,13 +23,17 @@
 #include "web/api_handlers.h"
 #include "web/api_handlers_health.h"
 #include "web/http_server.h"
+#include "web/httpd_utils.h"
 #include "web/request_response.h"
+#include "core/authorization.h"
+#include "database/db_fleet_query.h"
 #include "telemetry/stream_metrics.h"
 #include "storage/storage_manager.h"
 #define LOG_COMPONENT "HealthCheck"
 #include "core/logger.h"
 #include "core/config.h"
 #include "utils/interruptible_sleep.h"
+#include "video/unified_detection_thread.h"
 
 // Forward declarations for functions defined later in this file
 static bool is_web_server_thread_running(void);
@@ -167,6 +171,58 @@ static bool perform_health_check(void) {
     return success;
 }
 
+/*
+ * /api/health doubles as the unauthenticated process-liveness endpoint, so it
+ * cannot reject the self-probe when web authentication is enabled.  It must,
+ * however, apply the same live.view camera scope as every other camera list.
+ * An unauthenticated probe therefore receives liveness/storage data with an
+ * empty camera inventory; authenticated callers receive only authorized
+ * camera metrics.
+ */
+static int filter_authorized_stream_metrics(const http_request_t *req,
+                                            stream_metrics_t *snapshots,
+                                            int *count) {
+    if (!req || !count || *count <= 0 || !g_config.web_auth_enabled) return 0;
+
+    user_t user;
+    memset(&user, 0, sizeof(user));
+    if (!httpd_check_action_access(req, &user)) {
+        *count = 0;
+        return 0;
+    }
+
+    fleet_camera_t *cameras = NULL;
+    int camera_count = 0;
+    if (db_fleet_camera_load(&cameras, &camera_count) != 0) return -1;
+    if (authorization_filter_visible_cameras(&user, cameras,
+                                             &camera_count) != 0) {
+        free(cameras);
+        return -1;
+    }
+
+    int visible_count = 0;
+    for (int snapshot_index = 0; snapshot_index < *count; snapshot_index++) {
+        bool visible = false;
+        for (int camera_index = 0; camera_index < camera_count;
+             camera_index++) {
+            if (strcmp(snapshots[snapshot_index].stream_name,
+                       cameras[camera_index].name) == 0) {
+                visible = true;
+                break;
+            }
+        }
+        if (!visible) continue;
+        if (visible_count != snapshot_index) {
+            snapshots[visible_count] = snapshots[snapshot_index];
+        }
+        visible_count++;
+    }
+
+    free(cameras);
+    *count = visible_count;
+    return 0;
+}
+
 
 /**
  * @brief Backend-agnostic handler for GET /api/health
@@ -182,6 +238,13 @@ void handle_get_health(const http_request_t *req, http_response_t *res) {
     bool include_sparklines = false;
     if (http_request_get_query_param(req, "sparklines", sparklines_param, sizeof(sparklines_param)) > 0) {
         include_sparklines = (strcmp(sparklines_param, "true") == 0 || strcmp(sparklines_param, "1") == 0);
+    }
+    char history_param[8] = {0};
+    bool history_only = false;
+    if (http_request_get_query_param(req, "history_only", history_param,
+                                     sizeof(history_param)) > 0) {
+        history_only = strcmp(history_param, "true") == 0 ||
+                       strcmp(history_param, "1") == 0;
     }
 
     // Create JSON object
@@ -216,6 +279,62 @@ void handle_get_health(const http_request_t *req, http_response_t *res) {
             count = metrics_snapshot_all(snaps, max_streams);
         }
     }
+    if (filter_authorized_stream_metrics(req, snaps, &count) != 0) {
+        free(snaps);
+        cJSON_Delete(health);
+        http_response_set_json_error(
+            res, 500, "Authorization policy evaluation failed");
+        return;
+    }
+
+    if (history_only) {
+        cJSON *detail_arr = cJSON_CreateArray();
+        if (!detail_arr) {
+            free(snaps);
+            cJSON_Delete(health);
+            http_response_set_json_error(res, 500,
+                                         "Failed to create health history");
+            return;
+        }
+        for (int i = 0; i < count; i++) {
+            cJSON *sd = cJSON_CreateObject();
+            cJSON *fps_arr = cJSON_CreateArray();
+            cJSON *bitrate_arr = cJSON_CreateArray();
+            if (!sd || !fps_arr || !bitrate_arr) {
+                cJSON_Delete(sd);
+                cJSON_Delete(fps_arr);
+                cJSON_Delete(bitrate_arr);
+                continue;
+            }
+            cJSON_AddStringToObject(sd, "name", snaps[i].stream_name);
+            metrics_ring_sample_t ring_data[60];
+            int ring_count = metrics_get_ring_data(
+                snaps[i].stream_name, ring_data, 60);
+            for (int j = 0; j < ring_count; j++) {
+                cJSON_AddItemToArray(
+                    fps_arr, cJSON_CreateNumber(ring_data[j].fps));
+                cJSON_AddItemToArray(
+                    bitrate_arr,
+                    cJSON_CreateNumber(ring_data[j].bitrate_kbps));
+            }
+            cJSON_AddItemToObject(sd, "sparkline_fps", fps_arr);
+            cJSON_AddItemToObject(sd, "sparkline_bitrate", bitrate_arr);
+            cJSON_AddItemToArray(detail_arr, sd);
+        }
+        cJSON_AddItemToObject(health, "streams_detail", detail_arr);
+        free(snaps);
+        char *history_json = cJSON_PrintUnformatted(health);
+        if (!history_json) {
+            cJSON_Delete(health);
+            http_response_set_json_error(res, 500,
+                                         "Failed to encode health history");
+            return;
+        }
+        http_response_set_json(res, 200, history_json);
+        free(history_json);
+        cJSON_Delete(health);
+        return;
+    }
 
     int streams_up = 0, streams_degraded = 0, streams_down = 0;
     for (int i = 0; i < count; i++) {
@@ -230,6 +349,8 @@ void handle_get_health(const http_request_t *req, http_response_t *res) {
     const char *overall_status = "healthy";
     if (streams_down > 0) overall_status = "critical";
     else if (streams_degraded > 0) overall_status = "degraded";
+    cJSON_ReplaceItemInObjectCaseSensitive(
+        health, "healthy", cJSON_CreateBool(strcmp(overall_status, "healthy") == 0));
     cJSON_AddStringToObject(health, "status", overall_status);
 
     // Streams summary object
@@ -262,6 +383,7 @@ void handle_get_health(const http_request_t *req, http_response_t *res) {
         }
         cJSON_AddStringToObject(sd, "status", status_str);
         cJSON_AddNumberToObject(sd, "observed_fps", snaps[i].current_fps);
+        cJSON_AddNumberToObject(sd, "current_fps", snaps[i].current_fps);
         cJSON_AddNumberToObject(sd, "expected_fps", snaps[i].configured_fps);
         /* Backward-compatible names for existing API consumers. */
         cJSON_AddNumberToObject(sd, "fps", snaps[i].current_fps);
@@ -269,11 +391,40 @@ void handle_get_health(const http_request_t *req, http_response_t *res) {
         cJSON_AddNumberToObject(sd, "bitrate_bps", snaps[i].current_bitrate_bps);
         cJSON_AddNumberToObject(sd, "uptime_seconds", (double)snaps[i].uptime_seconds);
         cJSON_AddNumberToObject(sd, "reconnects", (double)snaps[i].reconnects_total);
+        cJSON_AddNumberToObject(sd, "last_packet_ts",
+                                (double)snaps[i].last_packet_ts);
         cJSON_AddNumberToObject(sd, "last_frame_ts", (double)snaps[i].last_frame_ts);
+        cJSON_AddNumberToObject(sd, "last_completed_segment_ts",
+                                (double)snaps[i].last_completed_segment_ts);
         cJSON_AddNumberToObject(sd, "frames_total", (double)snaps[i].frames_total);
         cJSON_AddNumberToObject(sd, "frames_dropped", (double)snaps[i].frames_dropped);
         cJSON_AddNumberToObject(sd, "connection_latency_ms", snaps[i].connection_latency_ms);
-        cJSON_AddBoolToObject(sd, "recording_active", snaps[i].recording_active != 0);
+        double packet_age = snaps[i].last_packet_ts > 0
+            ? difftime(now, (time_t)snaps[i].last_packet_ts) : 1e9;
+        double frame_age = snaps[i].last_frame_ts > 0
+            ? difftime(now, (time_t)snaps[i].last_frame_ts) : 1e9;
+        int expected_segment = snaps[i].expected_segment_duration > 0
+            ? snaps[i].expected_segment_duration : 30;
+        int recorder_window = expected_segment * 2 + 30;
+        if (recorder_window < 90) recorder_window = 90;
+        double segment_age = snaps[i].last_completed_segment_ts > 0
+            ? difftime(now, (time_t)snaps[i].last_completed_segment_ts) : 1e9;
+        bool source_connected = packet_age <= STREAM_HEALTH_FRAME_TIMEOUT_DOWN;
+        bool video_advancing = frame_age <= STREAM_HEALTH_FRAME_TIMEOUT_UP;
+        bool recorder_writing = segment_age <= recorder_window;
+        unified_detection_state_t detector_state =
+            get_unified_detection_state(snaps[i].stream_name);
+        bool detector_operating = video_advancing &&
+            (detector_state == UDT_STATE_BUFFERING ||
+             detector_state == UDT_STATE_RECORDING ||
+             detector_state == UDT_STATE_POST_BUFFER);
+        cJSON_AddBoolToObject(sd, "source_connected", source_connected);
+        cJSON_AddBoolToObject(sd, "video_advancing", video_advancing);
+        cJSON_AddBoolToObject(sd, "recorder_writing", recorder_writing);
+        cJSON_AddBoolToObject(sd, "detector_operating", detector_operating);
+        cJSON_AddBoolToObject(sd, "recorder_session_active",
+                              snaps[i].recording_active != 0);
+        cJSON_AddBoolToObject(sd, "recording_active", recorder_writing);
         cJSON_AddNumberToObject(sd, "recording_gaps", (double)snaps[i].recording_gaps_total);
 
         // Sparkline data (last 60 samples = 5 minutes at 5s intervals)

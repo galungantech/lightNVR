@@ -4,6 +4,8 @@
 #include <stdint.h>
 #include <stdbool.h>
 
+#include "telemetry/system_health_policy.h"
+
 // Maximum length for path strings
 #define MAX_PATH_LENGTH 512
 // Maximum length for stream names
@@ -25,12 +27,10 @@
 // Consistency check run against an existing database at startup.
 //
 // FULL is `PRAGMA integrity_check`, which cross-verifies every index against
-// its table. That cost scales with total index size, not row count, so on a
-// database carrying many secondary indexes it can take minutes -- minutes with
-// no HTTP listener bound, which reads to a proxy as a gateway error. QUICK is
-// `PRAGMA quick_check`: same page-level structural validation, without the
-// index cross-check, and the corruption modes actually seen in the field
-// (truncated writes, torn pages) show up in both.
+// its table. QUICK is `PRAGMA quick_check`, which performs page-level
+// structural validation without the index cross-check. Both scan the database
+// before the HTTP listener binds, so they are opt-in boot diagnostics rather
+// than the default; run integrity checks during a maintenance window instead.
 #define DB_STARTUP_CHECK_OFF   0
 #define DB_STARTUP_CHECK_QUICK 1
 #define DB_STARTUP_CHECK_FULL  2
@@ -42,6 +42,7 @@ typedef enum {
 } stream_protocol_t;
 
 #define PLAYBACK_TRANSPORT_MAX 24
+#define EPTZ_CONFIG_MAX 1024
 
 /** Return true when value is one of the persisted playback transport values. */
 bool playback_transport_is_valid(const char *value);
@@ -155,6 +156,9 @@ typedef struct {
     char detection_url[MAX_URL_LENGTH];
     char publish_url[MAX_URL_LENGTH];        // RTMP/RTMPS restream (publish) destination, e.g. YouTube Live ingest URL
     char playback_transport[PLAYBACK_TRANSPORT_MAX]; // auto, *_only, or an ordered fallback pair
+    // Versioned JSON for browser-side fisheye dewarping. Empty disables ePTZ.
+    // The source stream and recordings always remain untouched.
+    char eptz_config[EPTZ_CONFIG_MAX];
 } stream_config_t;
 
 // Size of recording schedule text buffer: 168 values + 167 commas + null terminator
@@ -239,6 +243,8 @@ typedef struct {
     bool web_auth_enabled;
     char web_username[32];
     char web_password[32]; // Stored as hash in actual implementation
+    bool audio_disabled;   // Instance policy: no audio playback, recording, or talk
+    bool auto_disabled;    // Hide Auto view and select an explicit transport
     bool webrtc_disabled;  // Hide WebRTC view on the dashboard (#397)
     bool hls_disabled;     // Hide HLS view on the dashboard (#397)
     bool mse_disabled;     // Hide MSE view on the dashboard (#397)
@@ -329,6 +335,10 @@ typedef struct {
     bool mqtt_ha_discovery;               // Enable HA MQTT auto-discovery (default: false)
     char mqtt_ha_discovery_prefix[128];   // HA discovery topic prefix (default: "homeassistant")
     int mqtt_ha_snapshot_interval;        // Snapshot publish interval in seconds (default: 30, 0=disabled)
+
+    // Host and hardware health. Structured condition overrides live in the
+    // system_settings table; only these non-sensitive scalars are in the INI.
+    system_health_policy_settings_t health;
 
     // In-process LiteRT (TFLite) detection engine.
     // Runtime knobs only; per-model state (path, labels) lives elsewhere.

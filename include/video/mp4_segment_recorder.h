@@ -34,6 +34,22 @@ typedef void (*record_segment_started_cb)(void *user_ctx);
 typedef void (*record_segment_activity_cb)(void *user_ctx);
 
 /**
+ * Convert packet timestamps from an input stream time base to the time base
+ * selected by the output muxer. MP4 muxers may change AVStream.time_base when
+ * the header is written, so packets must be converted immediately before they
+ * are submitted to the muxer.
+ */
+void mp4_segment_rescale_packet_ts(AVPacket *pkt,
+                                   const AVStream *input_stream,
+                                   const AVStream *output_stream);
+
+/**
+ * Return true when an audio mux failure invalidates the long-lived input
+ * context. A fresh RTSP probe is required before audio recording is retried.
+ */
+bool mp4_segment_audio_error_requires_input_refresh(int error);
+
+/**
  * Record an RTSP stream to an MP4 file for a specified duration
  *
  * This function handles the actual recording of an RTSP stream to an MP4 file.

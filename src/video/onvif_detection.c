@@ -1,14 +1,19 @@
+#define _GNU_SOURCE
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>   /* strncasecmp / strcasecmp for case-insensitive class matching */
 #include <stdbool.h>
+#include <ctype.h>
 #include <errno.h>
 #include <unistd.h>
 #include <sys/stat.h>
 #include <curl/curl.h>
 #include <cjson/cJSON.h>
 #include <pthread.h>
+#include <stdatomic.h>
+#include <stdint.h>
 #include <time.h>
 
 #include "core/logger.h"
@@ -18,11 +23,16 @@
 #include "core/event_producers.h"
 #include "utils/strings.h"
 #include "video/onvif_detection.h"
+#include "video/onvif_event.h"
 #include "video/onvif_soap.h"
 #include "video/detection_result.h"
 #include "video/cross_stream_motion_trigger.h"
+#include "video/mp4_recording.h"
 #include "video/zone_filter.h"
 #include "database/db_detections.h"
+#include "database/db_lpr_reads.h"
+#include "database/db_streams.h"
+#include "utils/lpr_crypto.h"
 #include "ezxml.h"
 
 /* WS-Addressing action URIs for the ONVIF operations this file emits.
@@ -32,6 +42,22 @@
 #define ONVIF_ACTION_GET_SERVICES        "http://www.onvif.org/ver10/device/wsdl/GetServices"
 #define ONVIF_ACTION_CREATE_PULLPOINT    "http://www.onvif.org/ver10/events/wsdl/EventPortType/CreatePullPointSubscriptionRequest"
 #define ONVIF_ACTION_PULL_MESSAGES       "http://www.onvif.org/ver10/events/wsdl/PullPointSubscription/PullMessagesRequest"
+#define ONVIF_ACTION_RENEW               "http://docs.oasis-open.org/wsn/bw-2/SubscriptionManager/RenewRequest"
+#define ONVIF_ACTION_UNSUBSCRIBE         "http://docs.oasis-open.org/wsn/bw-2/SubscriptionManager/UnsubscribeRequest"
+
+/* Tapo cameras accept a ten-minute PullPoint lease and reject both the old
+ * one-hour request and a request with no InitialTerminationTime (#567).
+ * Renew at 80% of the camera-reported lease so normal polling jitter cannot
+ * push us beyond the actual expiry. */
+#define ONVIF_SUBSCRIPTION_LEASE_SECONDS 600
+#define ONVIF_RENEW_NUMERATOR 4
+#define ONVIF_RENEW_DENOMINATOR 5
+
+/* Tapo event services can drop individual PullMessages connections while the
+ * underlying PullPoint remains valid. Keep retrying the same subscription and
+ * only refresh it after a sustained outage (#567). */
+#define ONVIF_PULL_FAILURE_WARN_COUNT 3
+#define ONVIF_PULL_FAILURE_REFRESH_SECONDS 120
 
 /* External UUID generator (used for wsa:MessageID). */
 extern void generate_uuid(char *uuid, size_t size);
@@ -47,6 +73,13 @@ typedef struct {
     size_t size;
 } memory_struct_t;
 
+#define ONVIF_RESPONSE_MAX_BYTES (4U * 1024U * 1024U)
+
+static void secure_clear(void *data, size_t size) {
+    volatile unsigned char *bytes = data;
+    while (bytes && size-- > 0) *bytes++ = 0;
+}
+
 // Structure to hold ONVIF subscription information
 typedef struct {
     char camera_url[512];           // URL of the camera (used as the key for lookup)
@@ -54,7 +87,10 @@ typedef struct {
     char username[64];              // Username for authentication
     char password[64];              // Password for authentication
     time_t creation_time;
+    time_t renewal_time;
     time_t expiration_time;
+    time_t first_pull_failure_time;
+    int consecutive_pull_failures;
     bool active;
 } onvif_subscription_t;
 
@@ -63,11 +99,19 @@ typedef struct {
 static onvif_subscription_t subscriptions[MAX_SUBSCRIPTIONS];
 static int subscription_count = 0;
 static pthread_mutex_t subscription_mutex = PTHREAD_MUTEX_INITIALIZER;
+static bool subscriptions_shutting_down = false;
 
 // Callback function for curl to write data
 static size_t write_memory_callback(void *contents, size_t size, size_t nmemb, void *userp) {
+    if (size != 0 && nmemb > SIZE_MAX / size) return 0;
     size_t realsize = size * nmemb;
     memory_struct_t *mem = (memory_struct_t *)userp;
+
+    if (mem->size > ONVIF_RESPONSE_MAX_BYTES ||
+        realsize > ONVIF_RESPONSE_MAX_BYTES - mem->size) {
+        log_warn("Rejected oversized ONVIF response");
+        return 0;
+    }
 
     char *ptr = realloc(mem->memory, mem->size + realsize + 1);
     if (!ptr) {
@@ -305,6 +349,180 @@ static ezxml_t child_by_local_name(ezxml_t parent, const char *local) {
     return NULL;
 }
 
+/* Find the first descendant with the given local name. */
+static ezxml_t descendant_by_local_name(ezxml_t node, const char *local) {
+    if (!node || !local) return NULL;
+    if (strcmp(local_name(node), local) == 0) return node;
+    for (ezxml_t child = node->child; child; child = child->ordered) {
+        ezxml_t match = descendant_by_local_name(child, local);
+        if (match) return match;
+    }
+    return NULL;
+}
+
+/* Parse the UTC/offset xsd:dateTime values returned by ONVIF cameras. */
+static bool parse_xsd_datetime(const char *text, time_t *timestamp) {
+    if (!text || !timestamp) return false;
+
+    struct tm parsed;
+    memset(&parsed, 0, sizeof(parsed));
+    char *suffix = strptime(text, "%Y-%m-%dT%H:%M:%S", &parsed);
+    if (!suffix) return false;
+
+    /* Fractional seconds do not affect subscription scheduling. */
+    if (*suffix == '.') {
+        suffix++;
+        while (isdigit((unsigned char)*suffix)) suffix++;
+    }
+
+    int offset_seconds = 0;
+    if (*suffix == 'Z' || *suffix == 'z') {
+        suffix++;
+    } else if (*suffix == '+' || *suffix == '-') {
+        int sign = (*suffix++ == '+') ? 1 : -1;
+        if (strlen(suffix) < 5 ||
+            !isdigit((unsigned char)suffix[0]) ||
+            !isdigit((unsigned char)suffix[1]) || suffix[2] != ':' ||
+            !isdigit((unsigned char)suffix[3]) ||
+            !isdigit((unsigned char)suffix[4])) {
+            return false;
+        }
+        int hours = 0;
+        int minutes = 0;
+        if (sscanf(suffix, "%2d:%2d", &hours, &minutes) != 2 ||
+            hours > 23 || minutes > 59) {
+            return false;
+        }
+        offset_seconds = sign * (hours * 3600 + minutes * 60);
+        suffix += 5;
+    }
+
+    while (isspace((unsigned char)*suffix)) suffix++;
+    if (*suffix != '\0') return false;
+
+    time_t utc = timegm(&parsed);
+    if (utc == (time_t)-1) return false;
+    *timestamp = utc - offset_seconds;
+    return true;
+}
+
+/* Prefer the duration between the camera's CurrentTime and TerminationTime,
+ * avoiding any error from a camera clock that differs from the recorder. */
+static int subscription_lease_seconds(const char *response) {
+    int lease = ONVIF_SUBSCRIPTION_LEASE_SECONDS;
+    if (!response) return lease;
+
+    char *copy = strdup(response);
+    if (!copy) return lease;
+
+    ezxml_t xml = ezxml_parse_str(copy, strlen(copy));
+    if (xml) {
+        ezxml_t current_node = descendant_by_local_name(xml, "CurrentTime");
+        ezxml_t termination_node = descendant_by_local_name(xml, "TerminationTime");
+        time_t current_time;
+        time_t termination_time;
+        bool have_current = current_node &&
+            parse_xsd_datetime(ezxml_txt(current_node), &current_time);
+        bool have_termination = termination_node &&
+            parse_xsd_datetime(ezxml_txt(termination_node), &termination_time);
+
+        time_t duration = 0;
+        if (have_current && have_termination) {
+            duration = termination_time - current_time;
+        } else if (have_termination) {
+            duration = termination_time - time(NULL);
+        }
+
+        /* Reject obviously broken timestamps. The requested ten-minute lease
+         * remains the safe fallback for cameras that omit or mangle them. */
+        if (duration > 0 && duration <= 7 * 24 * 60 * 60) {
+            lease = (int)duration;
+        }
+        ezxml_free(xml);
+    }
+
+    free(copy);
+    return lease;
+}
+
+static void apply_subscription_lease(onvif_subscription_t *subscription,
+                                     int lease_seconds) {
+    if (!subscription) return;
+    if (lease_seconds <= 0) lease_seconds = ONVIF_SUBSCRIPTION_LEASE_SECONDS;
+
+    time(&subscription->creation_time);
+    subscription->expiration_time = subscription->creation_time + lease_seconds;
+
+    int renewal_delay =
+        (lease_seconds * ONVIF_RENEW_NUMERATOR) / ONVIF_RENEW_DENOMINATOR;
+    if (renewal_delay <= 0) renewal_delay = 1;
+    if (renewal_delay >= lease_seconds && lease_seconds > 1) {
+        renewal_delay = lease_seconds - 1;
+    }
+    subscription->renewal_time = subscription->creation_time + renewal_delay;
+}
+
+static char *send_subscription_request(const onvif_subscription_t *subscription,
+                                       const char *request_body,
+                                       const char *action) {
+    if (!subscription || !request_body || !action) return NULL;
+
+    if (strncmp(subscription->subscription_address, "http://", 7) == 0 ||
+        strncmp(subscription->subscription_address, "https://", 8) == 0) {
+        return send_onvif_request_to_url(subscription->subscription_address,
+                                         subscription->username,
+                                         subscription->password,
+                                         request_body, action);
+    }
+
+    const char *last_slash = strrchr(subscription->subscription_address, '/');
+    if (!last_slash || last_slash[1] == '\0') return NULL;
+    return send_onvif_request(subscription->camera_url,
+                              subscription->username,
+                              subscription->password,
+                              request_body, last_slash + 1, action);
+}
+
+/* subscription_mutex must be held by the caller. */
+static bool renew_subscription_locked(onvif_subscription_t *subscription) {
+    const char *request_body =
+        "<Renew xmlns=\"http://docs.oasis-open.org/wsn/b-2\">"
+        "<TerminationTime>PT600S</TerminationTime>"
+        "</Renew>";
+
+    char *response = send_subscription_request(subscription, request_body,
+                                               ONVIF_ACTION_RENEW);
+    if (!response) return false;
+
+    int lease_seconds = subscription_lease_seconds(response);
+    free(response);
+    apply_subscription_lease(subscription, lease_seconds);
+    log_debug("Renewed ONVIF subscription for %s for %d seconds",
+              subscription->camera_url, lease_seconds);
+    return true;
+}
+
+/* Best-effort cleanup. subscription_mutex must be held by the caller. */
+static void unsubscribe_subscription_locked(onvif_subscription_t *subscription) {
+    if (!subscription || !subscription->active ||
+        subscription->subscription_address[0] == '\0') {
+        return;
+    }
+
+    const char *request_body =
+        "<Unsubscribe xmlns=\"http://docs.oasis-open.org/wsn/b-2\"/>";
+    char *response = send_subscription_request(subscription, request_body,
+                                               ONVIF_ACTION_UNSUBSCRIBE);
+    if (response) {
+        free(response);
+        log_debug("Unsubscribed ONVIF PullPoint for %s", subscription->camera_url);
+    } else {
+        log_warn("Unable to unsubscribe ONVIF PullPoint for %s",
+                 subscription->camera_url);
+    }
+    subscription->active = false;
+}
+
 /*
  * Query GetServices and return the event service URL, or NULL if not found.
  * The returned string is heap-allocated; caller must free() it.
@@ -393,6 +611,11 @@ static char *discover_event_service_url(const char *url, const char *username, c
 static onvif_subscription_t *get_subscription(const char *url, const char *username, const char *password) {
     pthread_mutex_lock(&subscription_mutex);
 
+    if (subscriptions_shutting_down) {
+        pthread_mutex_unlock(&subscription_mutex);
+        return NULL;
+    }
+
     // Check if we already have a subscription for this URL
     for (int i = 0; i < subscription_count; i++) {
         if (strcmp(subscriptions[i].camera_url, url) == 0) {
@@ -401,13 +624,27 @@ static onvif_subscription_t *get_subscription(const char *url, const char *usern
             time(&now);
             
             if (subscriptions[i].active && now < subscriptions[i].expiration_time) {
+                if (now >= subscriptions[i].renewal_time) {
+                    log_debug("Renewing ONVIF subscription for %s", url);
+                    if (!renew_subscription_locked(&subscriptions[i])) {
+                        log_warn("ONVIF subscription renewal failed for %s; recreating it", url);
+                        unsubscribe_subscription_locked(&subscriptions[i]);
+                        break;
+                    }
+                }
+
                 log_debug("Reusing existing ONVIF subscription for %s", url);
                 pthread_mutex_unlock(&subscription_mutex);
                 return &subscriptions[i];
+            } else if (!subscriptions[i].active) {
+                log_info("ONVIF subscription for %s is inactive, creating new one", url);
+                break;
             } else {
-                // Subscription expired, remove it
-                log_info("ONVIF subscription for %s expired, creating new one", url);
-                subscriptions[i].active = false;
+                /* We missed the renewal window. Best-effort Unsubscribe avoids
+                 * consuming another slot if the camera granted a longer lease
+                 * than the timestamps indicated. */
+                log_info("ONVIF subscription for %s expired, replacing it", url);
+                unsubscribe_subscription_locked(&subscriptions[i]);
                 break;
             }
         }
@@ -415,19 +652,23 @@ static onvif_subscription_t *get_subscription(const char *url, const char *usern
 
     log_info("Creating new ONVIF subscription for %s", url);
 
-    // Create a new subscription
+    /* Tapo accepts a ten-minute lease but rejects both PT1H and an omitted
+     * InitialTerminationTime with ter:InvalidArgVal (#567). */
     const char *request_body =
-        "<CreatePullPointSubscription xmlns=\"http://www.onvif.org/ver10/events/wsdl\">\n"
-        "  <InitialTerminationTime>PT1H</InitialTerminationTime>\n"
+        "<CreatePullPointSubscription xmlns=\"http://www.onvif.org/ver10/events/wsdl\">"
+        "<InitialTerminationTime>PT600S</InitialTerminationTime>"
         "</CreatePullPointSubscription>";
 
     // Dynamically discover the correct event service URL via GetServices.
     // Different vendors use different paths (e.g. Tapo uses "service", Lorex uses "event_service").
     char *discovered_url = discover_event_service_url(url, username, password);
     char *response = NULL;
+    char attempted_event_url[512] = {0};
 
     if (discovered_url) {
         log_info("ONVIF: Sending CreatePullPointSubscription to discovered URL: %s", discovered_url);
+        safe_strcpy(attempted_event_url, discovered_url,
+                    sizeof(attempted_event_url), 0);
         response = send_onvif_request_to_url(discovered_url, username, password, request_body,
                                               ONVIF_ACTION_CREATE_PULLPOINT);
         free(discovered_url);
@@ -437,6 +678,18 @@ static onvif_subscription_t *get_subscription(const char *url, const char *usern
         // Fall back through common event service path suffixes
         const char *fallback_services[] = {"service", "event_service", "Events", NULL};
         for (int i = 0; fallback_services[i] && !response; i++) {
+            char fallback_url[512];
+            int written = snprintf(fallback_url, sizeof(fallback_url),
+                                   "%s/onvif/%s", url, fallback_services[i]);
+            if (written < 0 || (size_t)written >= sizeof(fallback_url)) {
+                continue;
+            }
+            if (attempted_event_url[0] != '\0' &&
+                strcmp(attempted_event_url, fallback_url) == 0) {
+                log_debug("ONVIF: Skipping already-tried event endpoint: %s",
+                          fallback_url);
+                continue;
+            }
             log_info("ONVIF: Trying fallback event endpoint: onvif/%s", fallback_services[i]);
             response = send_onvif_request(url, username, password, request_body,
                                           fallback_services[i], ONVIF_ACTION_CREATE_PULLPOINT);
@@ -450,6 +703,7 @@ static onvif_subscription_t *get_subscription(const char *url, const char *usern
     }
 
     char *subscription_address = extract_subscription_address(response);
+    int lease_seconds = subscription_lease_seconds(response);
     free(response);
 
     if (!subscription_address) {
@@ -474,6 +728,10 @@ static onvif_subscription_t *get_subscription(const char *url, const char *usern
 
     // If we found a slot, use it
     if (slot >= 0) {
+        /* An inactive slot can contain failure state and an old subscription
+         * address. Start the replacement with a completely clean record. */
+        memset(&subscriptions[slot], 0, sizeof(subscriptions[slot]));
+
         // Store camera URL, username, and password
         safe_strcpy(subscriptions[slot].camera_url, url, sizeof(subscriptions[slot].camera_url), 0);
         
@@ -485,12 +743,12 @@ static onvif_subscription_t *get_subscription(const char *url, const char *usern
         safe_strcpy(subscriptions[slot].subscription_address, subscription_address, 
                 sizeof(subscriptions[slot].subscription_address), 0);
         
-        // Set timestamps
-        time(&subscriptions[slot].creation_time);
-        subscriptions[slot].expiration_time = subscriptions[slot].creation_time + 3600; // 1 hour
+        // Schedule renewal from the lease the camera actually granted.
+        apply_subscription_lease(&subscriptions[slot], lease_seconds);
         subscriptions[slot].active = true;
         
-        log_info("Successfully created ONVIF subscription for %s", url);
+        log_info("Successfully created ONVIF subscription for %s (lease: %d seconds)",
+                 url, lease_seconds);
         free(subscription_address);
         pthread_mutex_unlock(&subscription_mutex);
         return &subscriptions[slot];
@@ -500,6 +758,63 @@ static onvif_subscription_t *get_subscription(const char *url, const char *usern
     free(subscription_address);
     pthread_mutex_unlock(&subscription_mutex);
     return NULL;
+}
+
+/* Record a failed PullMessages call without immediately discarding the
+ * camera-side PullPoint. A transient HTTP disconnect does not invalidate the
+ * subscription and recreating on each disconnect exhausts Tapo's low limit. */
+static void note_pull_failure(const char *camera_url) {
+    pthread_mutex_lock(&subscription_mutex);
+    for (int i = 0; i < subscription_count; i++) {
+        onvif_subscription_t *subscription = &subscriptions[i];
+        if (strcmp(subscription->camera_url, camera_url) != 0 ||
+            !subscription->active) {
+            continue;
+        }
+
+        time_t now = time(NULL);
+        if (subscription->consecutive_pull_failures == 0) {
+            subscription->first_pull_failure_time = now;
+        }
+        subscription->consecutive_pull_failures++;
+
+        if (subscription->consecutive_pull_failures ==
+            ONVIF_PULL_FAILURE_WARN_COUNT) {
+            log_warn("ONVIF PullPoint for %s has failed %d consecutive pulls; "
+                     "retaining the same subscription",
+                     camera_url, subscription->consecutive_pull_failures);
+        }
+
+        if (subscription->consecutive_pull_failures >=
+                ONVIF_PULL_FAILURE_WARN_COUNT &&
+            now - subscription->first_pull_failure_time >=
+                ONVIF_PULL_FAILURE_REFRESH_SECONDS) {
+            log_warn("ONVIF PullPoint for %s has not completed a pull for %d "
+                     "seconds; unsubscribing before refresh",
+                     camera_url, ONVIF_PULL_FAILURE_REFRESH_SECONDS);
+            unsubscribe_subscription_locked(subscription);
+        }
+        break;
+    }
+    pthread_mutex_unlock(&subscription_mutex);
+}
+
+static void note_pull_success(const char *camera_url) {
+    pthread_mutex_lock(&subscription_mutex);
+    for (int i = 0; i < subscription_count; i++) {
+        onvif_subscription_t *subscription = &subscriptions[i];
+        if (strcmp(subscription->camera_url, camera_url) != 0) continue;
+
+        if (subscription->consecutive_pull_failures >=
+            ONVIF_PULL_FAILURE_WARN_COUNT) {
+            log_info("ONVIF PullPoint for %s recovered after %d failed pulls",
+                     camera_url, subscription->consecutive_pull_failures);
+        }
+        subscription->consecutive_pull_failures = 0;
+        subscription->first_pull_failure_time = 0;
+        break;
+    }
+    pthread_mutex_unlock(&subscription_mutex);
 }
 
 // Extract service name from subscription address
@@ -529,6 +844,7 @@ static bool topic_is_motion(const char *topic_text) {
            strstr(topic_text, "VideoAnalytics/Motion") != NULL ||
            strstr(topic_text, "MotionAlarm") != NULL ||
            strstr(topic_text, "PeopleDetector") != NULL ||
+           strstr(topic_text, "TPSmartEventDetector") != NULL ||
            strstr(topic_text, "SmartMotion")   != NULL ||
            strstr(topic_text, "ObjectDetect")  != NULL ||
            strstr(topic_text, "HumanDetect")   != NULL ||
@@ -583,8 +899,8 @@ static const char *normalize_object_class(const char *raw) {
 
 /* Recursively search a NotificationMessage for a SimpleItem that names an
  * object class inside a Data element, returning the normalized class (or NULL).
- * Values that don't name a recognized class are skipped so a real ObjectType
- * later in the payload still wins. */
+ * Alongside ObjectType-style values, Tapo reports asserted class flags such as
+ * Name="IsVehicle" Value="true" on TPSmartEventDetector topics (#567). */
 static const char *find_object_class(ezxml_t node, bool in_data) {
     for (ezxml_t c = node ? node->child : NULL; c; c = c->ordered) {
         bool inside = in_data || strcmp(local_name(c), "Data") == 0;
@@ -594,6 +910,12 @@ static const char *find_object_class(ezxml_t node, bool in_data) {
                          strcasecmp(name, "ObjectClass") == 0 ||
                          strcasecmp(name, "Type") == 0)) {
                 const char *cls = normalize_object_class(ezxml_attr(c, "Value"));
+                if (cls) return cls;
+            }
+            const char *value = ezxml_attr(c, "Value");
+            if (name && value &&
+                (strcasecmp(value, "true") == 0 || strcmp(value, "1") == 0)) {
+                const char *cls = normalize_object_class(name);
                 if (cls) return cls;
             }
         }
@@ -718,6 +1040,69 @@ static bool has_motion_event(const char *response, char *label, size_t label_sz)
     return motion;
 }
 
+/* Parse and persist LPR reads before the legacy motion parser reduces the
+ * PullMessages envelope to detection_result_t. Plate values are never logged
+ * or placed on the general detection/event path. */
+static void store_lpr_notifications(const char *response, const char *stream_name) {
+    if (!response || !stream_name || !stream_name[0]) return;
+
+    onvif_lpr_event_t events[16] = {0};
+    int count = onvif_parse_lpr_events(response, events,
+                                       sizeof(events) / sizeof(events[0]));
+    if (count <= 0) {
+        secure_clear(events, sizeof(events));
+        return;
+    }
+
+    if (!lpr_crypto_key_available()) {
+        static atomic_bool warned_missing_key = false;
+        if (!atomic_exchange(&warned_missing_key, true)) {
+            log_warn("LPR reads are available but protected storage is disabled: "
+                     "LIGHTNVR_LPR_MASTER_KEY_HEX is not configured");
+        }
+        secure_clear(events, sizeof(events));
+        return;
+    }
+
+    stream_config_t stream;
+    if (get_stream_config_by_name(stream_name, &stream) != 0 ||
+        !stream.camera_uuid[0]) {
+        log_warn("Cannot associate ONVIF LPR notifications with stream identity");
+        secure_clear(events, sizeof(events));
+        return;
+    }
+
+    uint64_t recording_id = get_current_recording_id_for_stream(stream_name);
+    for (int i = 0; i < count; ++i) {
+        lpr_read_input_t input = {0};
+        if (db_lpr_read_from_onvif(stream.camera_uuid, stream_name,
+                                   &events[i], &input) != 0) {
+            log_debug("Ignored incomplete ONVIF LPR notification for %s", stream_name);
+            secure_clear(&input, sizeof(input));
+            continue;
+        }
+        input.recording_id = recording_id;
+        char read_uuid[LPR_READ_UUID_SIZE] = {0};
+        int stored = db_lpr_read_insert(&input, read_uuid);
+        if (stored < 0) {
+            log_warn("Failed to persist protected ONVIF LPR read for %s", stream_name);
+        } else if (stored == 0) {
+            log_debug("Stored protected ONVIF LPR read for %s", stream_name);
+            char event_error[256] = {0};
+            if (event_producer_publish_lpr_read(
+                    stream.camera_uuid, stream_name, read_uuid, input.source,
+                    (time_t)(input.observed_at_ms / 1000), event_error,
+                    sizeof(event_error)) != 0) {
+                log_debug("Protected LPR event enqueue failed for %s: %s",
+                          stream_name, event_error);
+            }
+        }
+        secure_clear(&input, sizeof(input));
+        secure_clear(read_uuid, sizeof(read_uuid));
+    }
+    secure_clear(events, sizeof(events));
+}
+
 /**
  * Initialize the ONVIF detection system
  */
@@ -756,6 +1141,7 @@ int init_onvif_detection_system(void) {
     pthread_mutex_lock(&subscription_mutex);
     subscription_count = 0;
     memset(subscriptions, 0, sizeof(subscriptions));
+    subscriptions_shutting_down = false;
     pthread_mutex_unlock(&subscription_mutex);
 
     initialized = true;
@@ -768,9 +1154,24 @@ int init_onvif_detection_system(void) {
  * Shutdown the ONVIF detection system
  */
 void shutdown_onvif_detection_system(void) {
-    pthread_mutex_lock(&curl_mutex);
     log_info("Shutting down ONVIF detection system (initialized: %s, curl_handle: %p)",
              initialized ? "yes" : "no", (void*)curl_handle);
+
+    /* Stop new lookups and release active camera-side PullPoints while the
+     * shared CURL handle is still usable. The normal shutdown sequence has
+     * already joined detection threads before reaching this function. */
+    pthread_mutex_lock(&subscription_mutex);
+    subscriptions_shutting_down = true;
+    if (initialized && curl_handle) {
+        for (int i = 0; i < subscription_count; i++) {
+            unsubscribe_subscription_locked(&subscriptions[i]);
+        }
+    }
+    subscription_count = 0;
+    memset(subscriptions, 0, sizeof(subscriptions));
+    pthread_mutex_unlock(&subscription_mutex);
+
+    pthread_mutex_lock(&curl_mutex);
 
     // Cleanup curl handle if it exists
     if (curl_handle) {
@@ -822,7 +1223,7 @@ int detect_motion_onvif(const char *onvif_url, const char *username, const char 
     if (strlen(username) == 0 || strlen(password) == 0) {
         log_debug("ONVIF Detection: Using camera without authentication (empty credentials)");
     } else {
-        log_debug("ONVIF Detection: Using camera with authentication (username: %s)", username);
+        log_debug("ONVIF Detection: Using camera with authentication");
     }
 
     log_debug("ONVIF Detection: Starting detection with URL: %s", onvif_url);
@@ -877,25 +1278,18 @@ int detect_motion_onvif(const char *onvif_url, const char *username, const char 
 
     if (!response) {
         log_error("Failed to pull messages from subscription");
-
-        // If pulling messages fails, the subscription might be invalid.
-        // Re-lookup by URL while holding the mutex to avoid stale pointer use.
-        pthread_mutex_lock(&subscription_mutex);
-        for (int i = 0; i < subscription_count; i++) {
-            if (strcmp(subscriptions[i].camera_url, onvif_url) == 0) {
-                subscriptions[i].active = false;
-                break;
-            }
-        }
-        pthread_mutex_unlock(&subscription_mutex);
-
+        note_pull_failure(onvif_url);
         return -1;
     }
+
+    note_pull_success(onvif_url);
 
     // Check for motion events, capturing the object class (person/vehicle/…)
     // when the camera reports a smart detection rather than plain motion.
     char event_label[MAX_LABEL_LENGTH] = {0};
+    store_lpr_notifications(response, stream_name);
     bool motion_detected = has_motion_event(response, event_label, sizeof(event_label));
+    secure_clear(response, strlen(response));
     free(response);
 
     if (motion_detected) {
@@ -919,8 +1313,17 @@ int detect_motion_onvif(const char *onvif_url, const char *username, const char 
                 log_warn("Failed to filter detections by zones, storing all detections");
             }
 
-            // Store the detection in the database (no recording_id linkage for ONVIF)
-            store_detections_in_db(stream_name, result, event_timestamp, 0);
+            /* ONVIF detections are produced by this polling thread rather than
+             * report_detections(), so they must resolve annotation-mode linkage
+             * here. Passing 0 unconditionally left every ONVIF detection with a
+             * NULL recording_id even while a continuous segment was active
+             * (issue #547). A segment-close backfill in db_recordings covers the
+             * narrow rotation window where the writer has not published its new
+             * recording ID yet. */
+            uint64_t recording_id =
+                get_current_recording_id_for_stream(stream_name);
+            store_detections_in_db(stream_name, result, event_timestamp,
+                                   recording_id);
 
             // Enqueue the event and trigger recording if detections remain.
             if (result->count > 0) {

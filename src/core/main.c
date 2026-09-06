@@ -17,6 +17,9 @@
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <limits.h>
+#include <pthread.h>
+#include <time.h>
+#include <stdatomic.h>
 
 #include "core/version.h"
 #include "core/config.h"
@@ -52,6 +55,8 @@
 #include "video/cross_stream_motion_trigger.h"
 #include "telemetry/stream_metrics.h"
 #include "telemetry/player_telemetry.h"
+#include "telemetry/system_health.h"
+#include "telemetry/system_health_evaluator.h"
 
 // Include go2rtc headers if USE_GO2RTC is defined
 #ifdef USE_GO2RTC
@@ -68,6 +73,7 @@ void init_recordings_system(void);
 #include "database/db_authorization.h"
 #include "database/db_storage_targets.h"
 #include "database/db_recordings_sync.h"
+#include "database/db_system_settings.h"
 #include <sqlite3.h>
 #include "web/http_server.h"
 #include "web/libuv_server.h"
@@ -81,7 +87,16 @@ void init_recordings_system(void);
 #include <fcntl.h>
 
 // Global flag for graceful shutdown
-volatile bool running = true;
+// _Atomic (not just volatile) because it's read from multiple real threads
+// now: the main loop, signal handlers, and shutdown_watchdog_thread_func()
+// below. `volatile` alone gives no atomicity or cross-thread ordering
+// guarantee in C11 -- it only prevents the compiler from caching a value in
+// a register, which is enough for the old signal-handler-only usage but not
+// for a second thread genuinely polling it concurrently. Plain `= true` /
+// `while (running)` / `running = false` usage elsewhere is unchanged and
+// still correct: C11 makes direct assignment/read of an _Atomic-qualified
+// object an implicit sequentially-consistent atomic store/load.
+_Atomic bool running = true;
 
 // Global flag for restart request (set by API handler)
 volatile bool restart_requested = false;
@@ -160,43 +175,119 @@ static void signal_handler(int sig) {
     // This is safe because running is declared as volatile bool
     running = false;
 
-    // For Linux 4.4 embedded systems, we need a more robust approach
-    // Set an alarm to force exit if normal shutdown doesn't work
-    // Increased from 10 to 20 seconds to give more time for graceful shutdown
-    alarm(20);
+    // Also wake up any long-running background operation (e.g. a scheduled
+    // DB backup) that isn't polling `running` itself, so it aborts promptly
+    // instead of blocking this shutdown until it finishes on its own.
+    // request_background_abort() is async-signal-safe (atomic store only).
+    request_background_abort();
+
+    // Deliberately NOT using alarm() here as a "force exit if shutdown
+    // hangs" watchdog anymore -- see start_shutdown_watchdog_thread()'s
+    // comment for why: alarm() is a single process-wide timer, and this
+    // codebase's HLS writer/context-close code (hls_unified_thread.c,
+    // hls_writer.c) uses alarm() extensively as a short per-operation
+    // timeout (save disposition, alarm(N), do the call, alarm(0), restore
+    // disposition). Any one of those firing during shutdown would silently
+    // discard whatever time was left on an alarm set here, since alarm()
+    // has no pause/resume -- confirmed live via gdb: a shutdown that should
+    // have had ~570s left was killed at 45s by one of those unrelated
+    // short-lived alarms. A dedicated watchdog thread can't be clobbered
+    // this way. This handler now only sets flags and closes the listening
+    // socket, both async-signal-safe.
+    if (web_server_socket >= 0) {
+        close(web_server_socket);
+        web_server_socket = -1;
+    }
 }
 
-// Atomic flag to track emergency shutdown phase - must be volatile sig_atomic_t for signal safety
-static volatile sig_atomic_t emergency_shutdown_phase = 0;
-
-// Alarm signal handler for forced exit - MUST ONLY use async-signal-safe functions
-// NOTE: pthread_mutex_lock, log_*, malloc, etc. are NOT async-signal-safe and must NOT be used here
+// Alarm signal handler -- MUST ONLY use async-signal-safe functions.
+//
+// No longer the shutdown watchdog (see start_shutdown_watchdog_thread()).
+// Kept registered, and deliberately harmless, purely so SIGALRM has a
+// caught (non-terminating) disposition as a safety net: the many
+// hls_unified_thread.c/hls_writer.c call sites that use alarm() for their
+// own short per-operation timeouts save whatever handler is installed here
+// before temporarily switching it to SIG_IGN, and restore it afterward. If
+// this weren't registered, SIGALRM's default disposition (process
+// termination) would apply during any brief window where none of those
+// local overrides happen to be active.
 static void alarm_handler(int sig) {
-    (void)sig; // Suppress unused parameter warning
+    (void)sig;
+    signal_safe_write("[SIGNAL] Stray SIGALRM caught at top level (harmless, ignored)\n");
+}
 
-    // Increment the emergency phase atomically
-    emergency_shutdown_phase++;
+// How long a graceful shutdown gets before the watchdog force-kills the
+// process group. Must outlast the deliberate, non-abortable final backup
+// shutdown_database() takes before exiting -- on a multi-gigabyte database
+// this has been observed to take up to ~9-10 minutes in production. A
+// systemd unit wrapping this service in production MUST set TimeoutStopSec
+// comfortably above this value, or systemd will SIGKILL the process before
+// this watchdog ever gets a chance to run -- defeating the point of having
+// it. (An earlier value of 570s here was too tight: a live test showed both
+// watchdogs firing correctly right at 570s, but that was genuinely not
+// enough margin above the observed backup duration -- the collision/timing
+// bugs this file fixes were confirmed fixed, it just needed more headroom.)
+#define SHUTDOWN_WATCHDOG_TIMEOUT_SECONDS 900
 
-    if (emergency_shutdown_phase == 1) {
-        // Phase 1: Close the web server socket (close() is async-signal-safe)
-        if (web_server_socket >= 0) {
-            close(web_server_socket);
-            web_server_socket = -1;
+// Runs for the lifetime of the process, polling `running` once a second.
+// Once it goes false, starts counting down SHUTDOWN_WATCHDOG_TIMEOUT_SECONDS
+// and force-kills the process group if the process hasn't exited on its own
+// by the time that elapses (this thread simply vanishes along with every
+// other thread on a normal exit, so it never fires in the common case).
+//
+// Deliberately NOT alarm()-based: alarm() is a single process-wide timer,
+// and hls_unified_thread.c/hls_writer.c use it extensively as a short
+// per-operation timeout (save disposition, alarm(N), do the call, alarm(0),
+// restore disposition) around individual writer/context close calls. Any
+// one of those firing during shutdown discards whatever time was left on an
+// outer alarm, since alarm() has no pause/resume -- confirmed live via gdb:
+// a shutdown that should have had ~570s left was killed at 45s by one of
+// those unrelated short-lived alarms. This thread runs independently of
+// SIGALRM entirely, so none of that matters here. Unlike a signal handler,
+// this runs in normal thread context, so log_error() and kill() are both
+// safe to call directly.
+static void *shutdown_watchdog_thread_func(void *arg) {
+    (void)arg;
+    bool shutdown_started = false;
+    struct timespec shutdown_started_at = {0};
+
+    while (1) {
+        sleep(1);
+
+        if (!running) {
+            struct timespec now;
+            // CLOCK_MONOTONIC, not time(NULL)/CLOCK_REALTIME: this watchdog's
+            // whole job is to fire after a fixed amount of elapsed time, and
+            // the wall clock can jump (NTP sync, manual change) mid-shutdown.
+            // A backward jump against a CLOCK_REALTIME timestamp could make
+            // the elapsed-time computation go negative and never reach the
+            // timeout, silently disabling the one thing this thread exists
+            // to guarantee.
+            clock_gettime(CLOCK_MONOTONIC, &now);
+            if (!shutdown_started) {
+                shutdown_started_at = now;
+                shutdown_started = true;
+            } else if (now.tv_sec - shutdown_started_at.tv_sec >= SHUTDOWN_WATCHDOG_TIMEOUT_SECONDS) {
+                log_error("Shutdown watchdog: graceful shutdown did not complete within %d seconds, "
+                          "force-killing process group", SHUTDOWN_WATCHDOG_TIMEOUT_SECONDS);
+                kill(0, SIGKILL);
+                _exit(EXIT_FAILURE);
+            }
         }
-
-        // Set another alarm for phase 2 (alarm() is async-signal-safe)
-        alarm(15);
-        return;
     }
 
-    if (emergency_shutdown_phase == 2) {
-        // Phase 2: Give it one more chance
-        alarm(10);
-        return;
-    }
+    return NULL;
+}
 
-    // Phase 3+: Force exit immediately (_exit is async-signal-safe)
-    _exit(EXIT_SUCCESS);
+static void start_shutdown_watchdog_thread(void) {
+    pthread_t thread;
+    pthread_attr_t attr;
+    pthread_attr_init(&attr);
+    pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+    if (pthread_create(&thread, &attr, shutdown_watchdog_thread_func, NULL) != 0) {
+        log_error("Failed to start shutdown watchdog thread: %s", strerror(errno));
+    }
+    pthread_attr_destroy(&attr);
 }
 
 // Function to initialize signal handlers with improved signal handling
@@ -486,6 +577,10 @@ void request_restart(void) {
     log_info("request_restart() called - setting restart_requested=true and running=false");
     restart_requested = true;
     running = false;
+    // See signal_handler()'s call to the same function: this lets a
+    // long-running background operation (e.g. a scheduled DB backup) abort
+    // promptly instead of silently blocking this restart until it finishes.
+    request_background_abort();
     log_info("request_restart() completed - restart_requested=%d, running=%d", restart_requested, running);
 }
 
@@ -688,6 +783,11 @@ int main(int argc, char *argv[]) {
         }
     }
 
+    // Must start after daemonize(): daemonize() calls fork(), and fork()
+    // only duplicates the calling thread -- a thread started earlier would
+    // simply not exist in the daemonized child process.
+    start_shutdown_watchdog_thread();
+
     // Detect if we're running in a container
     container_mode = detect_container_mode();
     if (container_mode) {
@@ -775,6 +875,39 @@ int main(int argc, char *argv[]) {
     (void)storage_target_refresh_health_and_publish();
     log_info("Storage manager initialized");
 
+    // Build the immutable health policy only after database and storage
+    // prerequisites are live. Collector registration is complete before any
+    // evaluator or sampler worker can observe a partial startup state.
+    char *health_overrides = NULL;
+    size_t health_overrides_length = 0U;
+    int health_overrides_result = db_get_system_setting_alloc(
+        SYSTEM_HEALTH_OVERRIDES_SETTING_KEY, &health_overrides,
+        &health_overrides_length);
+    (void)health_overrides_length;
+    system_health_policy_t health_policy;
+    char health_policy_error[SYSTEM_HEALTH_POLICY_ERROR_LENGTH];
+    if (health_overrides_result < 0 || system_health_policy_build(
+            &g_config.health,
+            health_overrides_result == 0 ? health_overrides : NULL,
+            &health_policy, NULL, 0U, health_policy_error) != 0) {
+        log_warn("Host health policy unavailable: %s",
+                 health_overrides_result < 0 ? "stored overrides could not be read"
+                                             : health_policy_error);
+    } else if (system_health_policy_replace(&health_policy,
+                                            health_policy_error) != 0) {
+        log_warn("Host health policy could not be activated: %s",
+                 health_policy_error);
+    }
+    free(health_overrides);
+
+    system_health_options_t health_options;
+    if (system_health_options_from_policy(&g_config.health,
+                                          default_recording_root,
+                                          &health_options) != 0 ||
+        system_health_init(&health_options) != 0) {
+        log_warn("Host health sampler could not be initialized");
+    }
+
     // Start recording sync thread to ensure database file sizes are accurate
     log_info("Starting recording sync thread...");
     if (start_recording_sync_thread(60) != 0) {
@@ -803,7 +936,7 @@ int main(int argc, char *argv[]) {
             // Create the directory in our storage path
             if (mkdir_recursive(storage_web_path)) {
                 log_error("Failed to create web root in storage path: %s", strerror(errno));
-                return EXIT_FAILURE;
+                goto cleanup;
             }
 
             // Create parent directory for symlink if needed
@@ -826,11 +959,20 @@ int main(int argc, char *argv[]) {
             // Try to create it directly
             if (mkdir_recursive(config.web_root)) {
                 log_error("Failed to create web root directory");
-                return EXIT_FAILURE;
+                goto cleanup;
             }
 
             log_info("Created web root directory: %s", config.web_root);
         }
+    }
+
+    if (system_health_evaluator_service_start() != 0) {
+        log_warn("Host health evaluator could not be started");
+    }
+    if (system_health_start() != 0) {
+        log_warn("Host health sampler workers could not be started");
+    } else if (g_config.health.enabled) {
+        log_info("Host health sampler started");
     }
 
     // Initialize stream state manager (use runtime max from config)
@@ -1259,24 +1401,6 @@ int main(int argc, char *argv[]) {
 
     log_info("Shutting down LightNVR... (running=%d, restart_requested=%d)", running, restart_requested);
 
-    // CRITICAL: Stop the web server IMMEDIATELY to prevent serving requests during shutdown
-    // This must happen before any cleanup operations to ensure no new requests are processed
-    log_info("Stopping web server to prevent requests during shutdown...");
-    if (http_server) {
-        http_server_stop(http_server);
-        http_server_destroy(http_server);
-        http_server = NULL;
-    }
-
-    // Stop health check system to prevent it from trying to restart the web server
-    log_info("Stopping health check system...");
-    cleanup_health_check_system();
-
-    // Shutdown telemetry subsystem
-    log_info("Shutting down telemetry...");
-    metrics_shutdown();
-    player_telemetry_shutdown();
-
     // Now that we're in the main thread (not signal handler), we can safely
     // call initiate_shutdown() which uses mutexes and logging
     initiate_shutdown();
@@ -1284,6 +1408,17 @@ int main(int argc, char *argv[]) {
     // Cleanup
 cleanup:
     log_info("Starting cleanup process...");
+
+    // Stop request producers before any state they can inspect is dismantled.
+    // Keeping this at the shared cleanup label also covers partial startup.
+    log_info("Stopping web server to prevent requests during shutdown...");
+    if (http_server) {
+        http_server_stop(http_server);
+        http_server_destroy(http_server);
+        http_server = NULL;
+    }
+    log_info("Stopping health check system...");
+    cleanup_health_check_system();
 
     // Cancel any pending alarm from signal_handler to prevent interference with cleanup
     // alarm(0) cancels any previously set alarm - this is async-signal-safe
@@ -1329,13 +1464,25 @@ cleanup:
         // Save the parent PID before it gets killed
         pid_t parent_pid = getppid();
 
-        sleep(30);  // 30 seconds for first phase timeout
-        log_error("Cleanup process phase 1 timed out after 30 seconds");
+        // Phase 1 must outlast the deliberate, non-abortable final backup
+        // shutdown_database() takes before exiting (observed up to ~9
+        // minutes on this box's 2.6GB+ database) -- same reasoning as
+        // SHUTDOWN_WATCHDOG_TIMEOUT_SECONDS and the alarm() values in
+        // daemon.c/signal_handler(). This watchdog is fork+sleep()-based
+        // rather than alarm()-based, so unlike those it was never actually
+        // affected by the alarm()/SIGALRM collision with
+        // hls_unified_thread.c/hls_writer.c's per-operation timeouts --
+        // it was simply always too short (30s) on its own, and was in fact
+        // the one actually killing every real shutdown after those other
+        // fixes landed, confirmed via its distinct "phase 1/2 timed out"
+        // log lines.
+        sleep(SHUTDOWN_WATCHDOG_TIMEOUT_SECONDS);
+        log_error("Cleanup process phase 1 timed out after %d seconds", SHUTDOWN_WATCHDOG_TIMEOUT_SECONDS);
         kill(parent_pid, SIGUSR1);  // Send USR1 to parent to trigger emergency cleanup
 
-        // Wait another 15 seconds for emergency cleanup
+        // Wait a bit longer for emergency cleanup before giving up entirely
         sleep(15);
-        log_error("Cleanup process phase 2 timed out after 15 seconds, forcing exit");
+        log_error("Cleanup process phase 2 timed out after 15 more seconds, forcing exit");
         kill(parent_pid, SIGKILL);  // Force kill the parent process
 
         // If restart was requested, handle it here since the parent was killed
@@ -1391,8 +1538,15 @@ cleanup:
         sa_usr1.sa_handler = alarm_handler;  // Reuse the alarm handler for USR1
         sigaction(SIGUSR1, &sa_usr1, NULL);
 
-        // Note: Web server and health check system were already stopped before the fork
-        // to prevent serving requests during shutdown
+        // Probe collection may block in a kernel filesystem call, so stop and
+        // join host-health workers only after the cleanup watchdog is active.
+        // The evaluator is stopped next while persistence is still available;
+        // general telemetry follows, exactly once.
+        log_info("Shutting down host health and telemetry...");
+        system_health_shutdown();
+        system_health_evaluator_service_shutdown(true);
+        metrics_shutdown();
+        player_telemetry_shutdown();
 
         // Clean up go2rtc integration (inside watchdog-protected block)
         // This includes stopping the health monitor thread which can block
@@ -1630,6 +1784,12 @@ cleanup:
         // Fork failed
         log_error("Failed to create watchdog process for cleanup timeout");
 
+        log_info("Shutting down host health and telemetry...");
+        system_health_shutdown();
+        system_health_evaluator_service_shutdown(true);
+        metrics_shutdown();
+        player_telemetry_shutdown();
+
         // Note: Health check system and web server were already stopped before the fork attempt
         // to prevent serving requests during shutdown
 
@@ -1767,7 +1927,19 @@ cleanup:
 static void check_and_ensure_services(void) {
     // CRITICAL FIX: Skip starting new services during shutdown
     // This prevents memory leaks caused by starting new threads during shutdown
-    if (is_shutdown_initiated()) {
+    //
+    // is_shutdown_initiated() only flips once the main loop has already
+    // exited and begun its teardown sequence -- it's still false in the gap
+    // between a restart/shutdown being requested and the main loop next
+    // checking `running`, which is exactly the gap this function can be
+    // called in. is_background_abort_requested() flips the instant a
+    // restart or shutdown is requested (see request_restart() and
+    // signal_handler()), so check it too: this loop can iterate every
+    // configured stream with a deliberate 3s stagger sleep between
+    // recording starts, which measured in production as long enough to
+    // silently absorb a "Restart LightNVR" click for the same reason the
+    // scheduled DB backup once did.
+    if (is_shutdown_initiated() || is_background_abort_requested()) {
         log_debug("Skipping service check during shutdown");
         return;
     }
@@ -1792,6 +1964,15 @@ static void check_and_ensure_services(void) {
     int recordings_started = 0;
 
     for (int i = 0; i < g_config.max_streams; i++) {
+        // Re-check between streams: this loop's per-stream stagger sleep and
+        // connection-establishment calls mean a restart/shutdown requested
+        // partway through could otherwise still wait out every remaining
+        // stream before the main loop gets a chance to notice.
+        if (is_background_abort_requested()) {
+            log_debug("Aborting periodic service check early: restart/shutdown requested");
+            return;
+        }
+
         // Log the record flag for debugging
         if (current_config->streams[i].name[0] != '\0') {
             log_info("Service check for stream %s: enabled=%d, record=%d, streaming_enabled=%d",

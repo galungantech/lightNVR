@@ -38,6 +38,15 @@ static cJSON *detection_fixture(void) {
     return data;
 }
 
+static cJSON *lpr_read_fixture(void) {
+    cJSON *data = cJSON_CreateObject();
+    cJSON_AddStringToObject(data, "read_id",
+                            "44444444-4444-4444-8444-444444444444");
+    cJSON_AddStringToObject(data, "stream_name", "north-drive");
+    cJSON_AddStringToObject(data, "source", "onvif_profile_m");
+    return data;
+}
+
 static cJSON *camera_offline_fixture(void) {
     cJSON *data = cJSON_CreateObject();
     cJSON_AddStringToObject(data, "reason", "connection_timeout");
@@ -112,11 +121,30 @@ static cJSON *storage_target_recovered_fixture(void) {
     return data;
 }
 
+static cJSON *health_alert_fixture(const char *severity) {
+    cJSON *data = cJSON_CreateObject();
+    cJSON_AddStringToObject(data, "incident_id",
+                            "44444444-4444-4444-8444-444444444444");
+    cJSON_AddStringToObject(data, "code", "memory.available_low");
+    cJSON_AddStringToObject(data, "scope", "container");
+    cJSON_AddStringToObject(data, "resource", "memory");
+    cJSON_AddStringToObject(data, "state", "open");
+    cJSON_AddStringToObject(data, "severity", severity);
+    cJSON *observed = cJSON_AddObjectToObject(data, "observed");
+    cJSON_AddNumberToObject(observed, "value", 0.07);
+    cJSON_AddStringToObject(observed, "unit", "ratio");
+    cJSON *threshold = cJSON_AddObjectToObject(data, "threshold");
+    cJSON_AddStringToObject(threshold, "operator", "lt");
+    cJSON_AddNumberToObject(threshold, "value", 0.08);
+    cJSON_AddNumberToObject(threshold, "for_ms", 30000);
+    return data;
+}
+
 void test_registry_is_stable_and_versioned(void) {
     int count = 0;
     const event_type_definition_t *registry = event_registry_all(&count);
     TEST_ASSERT_NOT_NULL(registry);
-    TEST_ASSERT_EQUAL_INT(10, count);
+    TEST_ASSERT_EQUAL_INT(13, count);
     for (int index = 0; index < count; index++) {
         TEST_ASSERT_NOT_NULL(strstr(registry[index].type, "io.lightnvr."));
         size_t length = strlen(registry[index].type);
@@ -138,6 +166,53 @@ void test_registry_is_stable_and_versioned(void) {
     TEST_ASSERT_NULL(event_registry_find("io.lightnvr.unknown.v1"));
 }
 
+void test_system_severity_range_subjects_and_persisted_identity(void) {
+    cJSON *data = health_alert_fixture("critical");
+    event_envelope_t event;
+    char error[256];
+    const char *persisted = "55555555-5555-4555-8555-555555555555";
+    TEST_ASSERT_EQUAL_INT(0, event_envelope_create_with_severity_and_id(
+        &event, "io.lightnvr.system.health_alert.v1", INSTALLATION_SOURCE,
+        "system/container", 1787466600, data, EVENT_SEVERITY_CRITICAL,
+        persisted, error, sizeof(error)));
+    TEST_ASSERT_EQUAL_STRING(persisted, event.id);
+    TEST_ASSERT_EQUAL(EVENT_SEVERITY_CRITICAL, event.severity);
+
+    event_envelope_t clone;
+    TEST_ASSERT_EQUAL_INT(0, event_envelope_clone(
+        &clone, &event, error, sizeof(error)));
+    TEST_ASSERT_EQUAL(EVENT_SEVERITY_CRITICAL, clone.severity);
+    char *serialized = event_envelope_serialize(&clone, error, sizeof(error));
+    TEST_ASSERT_NOT_NULL(serialized);
+    TEST_ASSERT_NOT_NULL(strstr(serialized, "\"severity\":\"critical\""));
+    free(serialized);
+    event_envelope_clear(&clone);
+    event_envelope_clear(&event);
+
+    TEST_ASSERT_EQUAL_INT(-1, event_envelope_create_with_severity_and_id(
+        &event, "io.lightnvr.system.health_alert.v1", INSTALLATION_SOURCE,
+        "system/container", 1787466600, data, EVENT_SEVERITY_INFO,
+        NULL, error, sizeof(error)));
+    TEST_ASSERT_NOT_NULL(strstr(error, "severity"));
+    TEST_ASSERT_EQUAL_INT(-1, event_envelope_create_with_severity_and_id(
+        &event, "io.lightnvr.system.health_alert.v1", INSTALLATION_SOURCE,
+        "system/unknown", 1787466600, data, EVENT_SEVERITY_CRITICAL,
+        NULL, error, sizeof(error)));
+    cJSON_Delete(data);
+}
+
+void test_system_payload_severity_must_match_envelope(void) {
+    cJSON *data = health_alert_fixture("warning");
+    event_envelope_t event;
+    char error[256];
+    TEST_ASSERT_EQUAL_INT(-1, event_envelope_create_with_severity_and_id(
+        &event, "io.lightnvr.system.health_alert.v1", INSTALLATION_SOURCE,
+        "system/container", 1787466600, data, EVENT_SEVERITY_ERROR,
+        NULL, error, sizeof(error)));
+    TEST_ASSERT_NOT_NULL(strstr(error, "severity"));
+    cJSON_Delete(data);
+}
+
 void test_required_fixtures_create_and_validate(void) {
     struct {
         const char *type;
@@ -146,6 +221,8 @@ void test_required_fixtures_create_and_validate(void) {
     } cases[] = {
         {"io.lightnvr.detection.object.v1", CAMERA_SUBJECT,
          detection_fixture},
+        {"io.lightnvr.recognition.license_plate.v1", CAMERA_SUBJECT,
+         lpr_read_fixture},
         {"io.lightnvr.camera.offline.v1", CAMERA_SUBJECT,
          camera_offline_fixture},
         {"io.lightnvr.camera.recovered.v1", CAMERA_SUBJECT,
@@ -307,6 +384,15 @@ void test_sensitive_and_filesystem_fields_are_rejected_recursively(void) {
     TEST_ASSERT_NOT_NULL(strstr(error, "sensitive or filesystem"));
 
     cJSON_DeleteItemFromObjectCaseSensitive(data, "context");
+    cJSON_AddStringToObject(data, "license_plate", "TEST123");
+    TEST_ASSERT_EQUAL_INT(
+        -1, event_envelope_create(&event,
+                                  "io.lightnvr.detection.object.v1",
+                                  INSTALLATION_SOURCE, CAMERA_SUBJECT, 0, data,
+                                  error, sizeof(error)));
+    TEST_ASSERT_NOT_NULL(strstr(error, "sensitive or filesystem"));
+
+    cJSON_DeleteItemFromObjectCaseSensitive(data, "license_plate");
     cJSON_AddStringToObject(data, "snapshot_path",
                             "/var/lib/lightnvr/snapshot.jpg");
     TEST_ASSERT_EQUAL_INT(
@@ -327,6 +413,32 @@ void test_sensitive_and_filesystem_fields_are_rejected_recursively(void) {
     cJSON_Delete(data);
 }
 
+void test_lpr_notification_is_restricted_and_plate_free(void) {
+    cJSON *data = lpr_read_fixture();
+    event_envelope_t event;
+    char error[256] = {0};
+    TEST_ASSERT_EQUAL_INT(
+        0, event_envelope_create(
+               &event, "io.lightnvr.recognition.license_plate.v1",
+               INSTALLATION_SOURCE, CAMERA_SUBJECT, 1787466600, data,
+               error, sizeof(error)));
+    char *serialized = event_envelope_serialize(&event, error, sizeof(error));
+    TEST_ASSERT_NOT_NULL(serialized);
+    TEST_ASSERT_NOT_NULL(strstr(serialized, "\"sensitivity\":\"restricted\""));
+    TEST_ASSERT_NULL(strstr(serialized, "TEST123"));
+    TEST_ASSERT_NULL(strstr(serialized, "\"plate\":"));
+    free(serialized);
+    event_envelope_clear(&event);
+
+    cJSON_AddStringToObject(data, "plate", "TEST123");
+    TEST_ASSERT_EQUAL_INT(
+        -1, event_envelope_create(
+                &event, "io.lightnvr.recognition.license_plate.v1",
+                INSTALLATION_SOURCE, CAMERA_SUBJECT, 1787466600, data,
+                error, sizeof(error)));
+    cJSON_Delete(data);
+}
+
 int main(void) {
     UNITY_BEGIN();
     RUN_TEST(test_registry_is_stable_and_versioned);
@@ -336,5 +448,8 @@ int main(void) {
     RUN_TEST(test_subject_and_per_type_schema_fail_closed);
     RUN_TEST(test_detection_bounding_box_is_optional_but_atomic);
     RUN_TEST(test_sensitive_and_filesystem_fields_are_rejected_recursively);
+    RUN_TEST(test_lpr_notification_is_restricted_and_plate_free);
+    RUN_TEST(test_system_severity_range_subjects_and_persisted_identity);
+    RUN_TEST(test_system_payload_severity_must_match_envelope);
     return UNITY_END();
 }

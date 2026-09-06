@@ -115,7 +115,7 @@ function Pagination({ state, total, totalPages, onChange, t }) {
   );
 }
 
-export function FleetView() {
+export function FleetView({ onEditCamera }) {
   const { t, locale } = useI18n();
   const [state, setState] = useState(() => readFleetUrlState(typeof window === 'undefined' ? '' : window.location.search));
   const [isAdmin, setIsAdmin] = useState(false);
@@ -126,7 +126,7 @@ export function FleetView() {
   const debouncedSearch = useDebouncedValue(state.search, 300);
   const requestBody = useMemo(
     () => buildFleetQueryRequest(state, debouncedSearch),
-    [state.locationUuid, state.collectionUuid, state.tagUuids, state.health, state.enabled, state.recordingModes, state.page, state.pageSize, state.sortBy, state.sortOrder, debouncedSearch]
+    [state.locationUuid, state.collectionUuid, state.tagUuids, state.health, state.enabled, state.availability, state.recordingModes, state.page, state.pageSize, state.sortBy, state.sortOrder, debouncedSearch]
   );
 
   const { data, error, isLoading, isFetching, refetch } = useQuery({
@@ -376,6 +376,7 @@ export function FleetView() {
                 selectedIds={new Set(selectedCameras.keys())}
                 onToggleCamera={toggleCamera}
                 onTogglePage={togglePage}
+                onEditCamera={onEditCamera}
               />
               <Pagination state={state} total={total} totalPages={data.total_pages || 0} onChange={updateState} t={t} />
             </>

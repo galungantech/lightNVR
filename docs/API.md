@@ -1676,6 +1676,8 @@ GET /api/settings
 Requires effective `system.admin` and returns the full system configuration.
 Viewer/player bootstrap code must not use this endpoint.
 
+The `audio_disabled` boolean is the instance-wide audio compliance policy.
+
 The storage fields include `mp4_directory_format`, one of `flat`,
 `year_month`, or `year_month_day`.
 
@@ -1687,7 +1689,8 @@ GET /api/client-config
 
 Requires authentication but no global administrative action. Returns only the
 browser runtime contract: authentication/demo flags, go2rtc readiness and safe
-player flags/port/timeouts, plus thumbnail controls. It intentionally omits
+player flags/port/timeouts (including `audio_disabled` so Live View can remove
+audio controls), plus thumbnail controls. It intentionally omits
 paths, credentials, integration settings, and go2rtc stream inventory.
 
 #### Update Settings
@@ -1697,6 +1700,9 @@ POST /api/settings
 ```
 
 Updates system configuration settings.
+
+Setting `audio_disabled` to `true` suppresses live listening, talkback, and
+audio in newly written recordings. Existing recording files are unchanged.
 
 `mp4_directory_format` accepts only the three safe presets returned by the
 GET endpoint; arbitrary `strftime` templates are rejected with HTTP 400.
@@ -1975,6 +1981,36 @@ GET /api/detection/models
 ```
 
 Returns available detection models.
+
+#### Multiple Detection Engines
+
+```
+GET /api/streams/{stream_name}/detection-engines
+PUT /api/streams/{stream_name}/detection-engines
+```
+
+Requires camera-scoped `camera.configure`. `PUT` atomically replaces custom
+engines while preserving the compatibility `legacy-primary` engine and returns
+`restart_required: true`. Motion and local object engines can run together with
+the current `any_of` trigger policy. See
+[Multiple Detection Engines](DETECTION_ENGINES.md) for the request shape and
+runtime boundaries.
+
+#### Protected License-Plate Reads
+
+```
+POST   /api/lpr/search
+POST   /api/lpr/export
+DELETE /api/lpr/reads/{read_uuid}
+```
+
+Search/export bodies require `camera_uuid`, Unix-millisecond `start_at` and
+`end_at`, and optionally `match` (`exact` or `partial`), `plate`, and `limit`.
+Plate criteria are never accepted in URLs. Search is capped at 100 rows; export
+is a synchronous JSON download capped at 1,000. The endpoints enforce the
+camera-scoped `lpr.read`, `lpr.search`, `lpr.export`, and `lpr.delete` actions as
+applicable and write value-free audit records. Details, key provisioning, and
+retention behavior are in [ONVIF Detection](ONVIF_DETECTION.md).
 
 ### Motion Recording
 

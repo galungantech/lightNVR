@@ -1,3 +1,5 @@
+#define _POSIX_C_SOURCE 200809L
+
 /**
  * MP4 Segment Recorder
  *
@@ -19,6 +21,7 @@
 #include <pthread.h>
 #include <sys/stat.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <libgen.h>
 
 #include <libavformat/avformat.h>
@@ -27,12 +30,17 @@
 #include <libavutil/time.h>
 #include <libavutil/mathematics.h>
 
+#include "core/config.h"
 #include "core/logger.h"
+#include "core/url_utils.h"
 #include "core/shutdown_coordinator.h"
+#include "utils/memory.h"
+#include "utils/strings.h"
 #include "video/mp4_writer.h"
 #include "video/mp4_writer_internal.h"
 #include "video/mp4_segment_recorder.h"
 #include "telemetry/stream_metrics.h"
+#include "telemetry/recording_io_metrics.h"
 
 // DTS/PTS limits for MP4 format handling
 // MP4 containers use a signed 32-bit time scale; exceeding this can cause failures.
@@ -65,6 +73,12 @@
 // normal operation.
 #define SHUTDOWN_KEYFRAME_WAIT_TIMEOUT_S 1
 #define KEYFRAME_WAIT_TIMEOUT_S          5
+
+/* Continuous recordings default to 15-minute segments. With several cameras,
+ * waiting for segment close before releasing clean output pages can charge
+ * gigabytes of page cache to a memory-limited container. Flush and evict in
+ * bounded increments instead. */
+#define RECORDING_CACHE_RELEASE_INTERVAL_BYTES (32LL * 1024LL * 1024LL)
 
 // Small fixed offset used to maintain timestamp continuity between segments.
 // Expressed in stream time_base units; currently set to 1 (minimum positive
@@ -109,6 +123,70 @@ static int64_t calculate_frame_duration_from_stream(const AVStream *stream) {
     }
 
     return 1;
+}
+
+static void maybe_release_recording_file_cache(AVFormatContext *output_ctx,
+                                                int *cache_fd,
+                                                off_t *released_through) {
+    if (!output_ctx || !output_ctx->pb || !cache_fd || *cache_fd < 0 ||
+        !released_through) {
+        return;
+    }
+
+    int64_t position = avio_tell(output_ctx->pb);
+    off_t current_position = (off_t)position;
+    if (position < 0 || (int64_t)current_position != position ||
+        !file_cache_release_due(*released_through, current_position,
+                                (off_t)RECORDING_CACHE_RELEASE_INTERVAL_BYTES)) {
+        return;
+    }
+
+    /* Move FFmpeg's userspace AVIO buffer into the kernel before syncing and
+     * evicting the completed range through the second descriptor. */
+    avio_flush(output_ctx->pb);
+    int release_rc = file_cache_flush_and_release(
+        *cache_fd, *released_through, current_position - *released_through);
+    if (release_rc == 0) {
+        *released_through = current_position;
+        return;
+    }
+
+    log_warn("Disabling recording page-cache release after flush failed: %s",
+             strerror(release_rc));
+    close(*cache_fd);
+    *cache_fd = -1;
+}
+
+static void release_all_recording_file_cache(int *cache_fd,
+                                             const char *output_file) {
+    if (!cache_fd || *cache_fd < 0) {
+        return;
+    }
+
+    /* The MP4 faststart trailer can revisit earlier pages, so release the
+     * entire file after avio_closep(), not only the last incremental range. */
+    int release_rc = file_cache_flush_and_release(*cache_fd, 0, 0);
+    if (release_rc != 0) {
+        log_warn("Failed to release recording page cache for %s: %s",
+                 output_file ? output_file : "[unknown-file]",
+                 strerror(release_rc));
+    }
+    close(*cache_fd);
+    *cache_fd = -1;
+}
+
+void mp4_segment_rescale_packet_ts(AVPacket *pkt,
+                                   const AVStream *input_stream,
+                                   const AVStream *output_stream) {
+    if (!pkt || !input_stream || !output_stream) {
+        return;
+    }
+
+    av_packet_rescale_ts(pkt, input_stream->time_base, output_stream->time_base);
+}
+
+bool mp4_segment_audio_error_requires_input_refresh(int error) {
+    return error == AVERROR(EINVAL);
 }
 
 /**
@@ -263,6 +341,9 @@ int record_segment(const char *rtsp_url, const char *output_file, int duration, 
                    record_segment_started_cb started_cb,
                    record_segment_activity_cb activity_cb, void *cb_ctx,
                    atomic_int *shutdown_flag) {
+    if (g_config.audio_disabled) {
+        has_audio = 0;
+    }
     int ret = 0;
     AVFormatContext *input_ctx = NULL;
     AVFormatContext *output_ctx = NULL;
@@ -272,6 +353,9 @@ int record_segment(const char *rtsp_url, const char *output_file, int duration, 
     int video_stream_idx = -1;
     int audio_stream_idx = -1;
     bool needs_audio_transcoding = false;
+    bool reuse_input_context = true;
+    int recording_cache_fd = -1;
+    off_t recording_cache_released_through = 0;
     AVStream *out_video_stream = NULL;
     AVStream *out_audio_stream = NULL;
     int64_t first_video_dts = AV_NOPTS_VALUE;
@@ -324,7 +408,13 @@ int record_segment(const char *rtsp_url, const char *output_file, int duration, 
 
     log_info("Starting new segment with index %d", segment_index);
 
-    log_info("Recording from %s", rtsp_url);
+    char safe_rtsp_url[MAX_URL_LENGTH];
+    if (url_redact_for_logging(rtsp_url, safe_rtsp_url,
+                               sizeof(safe_rtsp_url)) != 0) {
+        safe_strcpy(safe_rtsp_url, "[invalid-url]", sizeof(safe_rtsp_url), 0);
+    }
+
+    log_info("Recording from %s", safe_rtsp_url);
     log_info("Output file: %s", output_file);
     log_info("Duration: %d seconds", duration);
 
@@ -344,6 +434,9 @@ int record_segment(const char *rtsp_url, const char *output_file, int duration, 
         // This allows us to interrupt blocking operations like av_read_frame during shutdown
         input_ctx = avformat_alloc_context();
         if (!input_ctx) {
+            recording_io_report_failure(RECORDING_IO_RESOURCE_RECORDING,
+                                        RECORDING_IO_OPERATION_ALLOCATE,
+                                        ENOMEM);
             log_error("Failed to allocate input context");
             ret = -1;
             goto cleanup;
@@ -376,16 +469,16 @@ int record_segment(const char *rtsp_url, const char *output_file, int duration, 
         av_dict_set(&opts, "probesize", "5242880", 0);        // 5 MB (5 * 1024 * 1024 bytes, FFmpeg default)
 
         // Open input
-        log_info("Opening RTSP connection to %s (analyzeduration=5s, probesize=5MB)", rtsp_url);
+        log_info("Opening RTSP connection to %s (analyzeduration=5s, probesize=5MB)", safe_rtsp_url);
         ret = avformat_open_input(&input_ctx, rtsp_url, NULL, &opts);
         if (ret < 0) {
             char error_buf[AV_ERROR_MAX_STRING_SIZE] = {0};
             av_strerror(ret, error_buf, AV_ERROR_MAX_STRING_SIZE);
             if (ret == AVERROR_EXIT) {
                 log_warn("RTSP open interrupted (AVERROR_EXIT) for %s — "
-                         "thread shutdown was requested during connection", rtsp_url);
+                         "thread shutdown was requested during connection", safe_rtsp_url);
             } else {
-                log_error("Failed to open RTSP input %s: %d (%s)", rtsp_url, ret, error_buf);
+                log_error("Failed to open RTSP input %s: %d (%s)", safe_rtsp_url, ret, error_buf);
             }
 
             // Ensure input_ctx is NULL after a failed open
@@ -399,15 +492,15 @@ int record_segment(const char *rtsp_url, const char *output_file, int duration, 
         }
 
         // Find stream info
-        log_info("Probing stream info for %s ...", rtsp_url);
+        log_info("Probing stream info for %s ...", safe_rtsp_url);
         ret = avformat_find_stream_info(input_ctx, NULL);
         if (ret < 0) {
             char err_buf[AV_ERROR_MAX_STRING_SIZE] = {0};
             av_strerror(ret, err_buf, sizeof(err_buf));
-            log_error("Failed to find stream info for %s: %d (%s)", rtsp_url, ret, err_buf);
+            log_error("Failed to find stream info for %s: %d (%s)", safe_rtsp_url, ret, err_buf);
             goto cleanup;
         }
-        log_info("Stream info detected for %s: %d streams", rtsp_url, input_ctx->nb_streams);
+        log_info("Stream info detected for %s: %d streams", safe_rtsp_url, input_ctx->nb_streams);
     }
 
     // Log input stream info
@@ -479,6 +572,11 @@ int record_segment(const char *rtsp_url, const char *output_file, int duration, 
                     if (avcodec_open2(probe_ctx, probe_decoder, NULL) >= 0) {
                         AVPacket *probe_pkt = av_packet_alloc();
                         AVFrame *probe_frame = av_frame_alloc();
+                        if (!probe_pkt || !probe_frame) {
+                            recording_io_report_failure(
+                                RECORDING_IO_RESOURCE_RECORDING,
+                                RECORDING_IO_OPERATION_ALLOCATE, ENOMEM);
+                        }
                         if (probe_pkt && probe_frame) {
                             int64_t probe_start = av_gettime();
                             // 60-second ceiling: go2rtc withholds video until it
@@ -609,6 +707,9 @@ int record_segment(const char *rtsp_url, const char *output_file, int duration, 
     // Create output context
     ret = avformat_alloc_output_context2(&output_ctx, NULL, "mp4", output_file);
     if (ret < 0 || !output_ctx) {
+        recording_io_report_failure(RECORDING_IO_RESOURCE_RECORDING,
+                                    RECORDING_IO_OPERATION_ALLOCATE,
+                                    ret < 0 ? ret : ENOMEM);
         log_error("Failed to create output context: %d", ret);
         goto cleanup;
     }
@@ -616,6 +717,8 @@ int record_segment(const char *rtsp_url, const char *output_file, int duration, 
     // Add video stream
     out_video_stream = avformat_new_stream(output_ctx, NULL);
     if (!out_video_stream) {
+        recording_io_report_failure(RECORDING_IO_RESOURCE_RECORDING,
+                                    RECORDING_IO_OPERATION_ALLOCATE, ENOMEM);
         log_error("Failed to create output video stream");
         ret = -1;
         goto cleanup;
@@ -687,6 +790,9 @@ int record_segment(const char *rtsp_url, const char *output_file, int duration, 
 
                     out_audio_stream = avformat_new_stream(output_ctx, NULL);
                     if (!out_audio_stream) {
+                        recording_io_report_failure(RECORDING_IO_RESOURCE_RECORDING,
+                                                    RECORDING_IO_OPERATION_ALLOCATE,
+                                                    ENOMEM);
                         log_error("Failed to create output audio stream");
                         avcodec_parameters_free(&transcoded_params);
                         ret = -1;
@@ -716,6 +822,9 @@ int record_segment(const char *rtsp_url, const char *output_file, int duration, 
             // Compatible codec — copy parameters directly
             out_audio_stream = avformat_new_stream(output_ctx, NULL);
             if (!out_audio_stream) {
+                recording_io_report_failure(RECORDING_IO_RESOURCE_RECORDING,
+                                            RECORDING_IO_OPERATION_ALLOCATE,
+                                            ENOMEM);
                 log_error("Failed to create output audio stream");
                 ret = -1;
                 goto cleanup;
@@ -763,14 +872,20 @@ int record_segment(const char *rtsp_url, const char *output_file, int duration, 
     // time-of-check time-of-use (TOCTOU) race condition. ENOENT simply
     // means the file did not exist, which is fine.
     if (unlink(output_file) != 0 && errno != ENOENT) {
+        int unlink_error = errno;
+        recording_io_report_failure(RECORDING_IO_RESOURCE_RECORDING,
+                                    RECORDING_IO_OPERATION_FILESYSTEM,
+                                    unlink_error);
         log_warn("Failed to remove existing output file: %s (error: %s)",
-                output_file, strerror(errno));
+                output_file, strerror(unlink_error));
         // Continue anyway, avio_open might still succeed (e.g. overwrite)
     }
 
     // Open output file
     ret = avio_open(&output_ctx->pb, output_file, AVIO_FLAG_WRITE);
     if (ret < 0) {
+        recording_io_report_failure(RECORDING_IO_RESOURCE_RECORDING,
+                                    RECORDING_IO_OPERATION_OPEN, ret);
         char error_buf[AV_ERROR_MAX_STRING_SIZE] = {0};
         av_strerror(ret, error_buf, AV_ERROR_MAX_STRING_SIZE);
         log_error("Failed to open output file: %d (%s)", ret, error_buf);
@@ -796,6 +911,12 @@ int record_segment(const char *rtsp_url, const char *output_file, int duration, 
 
     log_debug("Successfully opened output file: %s", output_file);
 
+    recording_cache_fd = open(output_file, O_RDWR | O_CLOEXEC);
+    if (recording_cache_fd < 0) {
+        log_debug("Recording page-cache control unavailable for %s: %s",
+                  output_file, strerror(errno));
+    }
+
     // Defensive: if we somehow reach here with 0x0 dimensions (should be caught
     // above), fail rather than writing a broken MP4 header.
     if (out_video_stream->codecpar->width == 0 || out_video_stream->codecpar->height == 0) {
@@ -807,6 +928,8 @@ int record_segment(const char *rtsp_url, const char *output_file, int duration, 
     // Write file header
     ret = avformat_write_header(output_ctx, &out_opts);
     if (ret < 0) {
+        recording_io_report_failure(RECORDING_IO_RESOURCE_RECORDING,
+                                    RECORDING_IO_OPERATION_HEADER, ret);
         char error_buf[AV_ERROR_MAX_STRING_SIZE] = {0};
         av_strerror(ret, error_buf, AV_ERROR_MAX_STRING_SIZE);
         log_error("Failed to write header: %d (%s)", ret, error_buf);
@@ -856,9 +979,24 @@ int record_segment(const char *rtsp_url, const char *output_file, int duration, 
         goto cleanup;
     }
 
+    log_debug("Video packet time base: input=%d/%d, muxer=%d/%d",
+              input_ctx->streams[video_stream_idx]->time_base.num,
+              input_ctx->streams[video_stream_idx]->time_base.den,
+              out_video_stream->time_base.num,
+              out_video_stream->time_base.den);
+    if (out_audio_stream && audio_stream_idx >= 0) {
+        log_debug("Audio packet time base: input=%d/%d, muxer=%d/%d",
+                  input_ctx->streams[audio_stream_idx]->time_base.num,
+                  input_ctx->streams[audio_stream_idx]->time_base.den,
+                  out_audio_stream->time_base.num,
+                  out_audio_stream->time_base.den);
+    }
+
     // Initialize packet - ensure it's properly allocated and initialized
     pkt = av_packet_alloc();
     if (!pkt) {
+        recording_io_report_failure(RECORDING_IO_RESOURCE_RECORDING,
+                                    RECORDING_IO_OPERATION_ALLOCATE, ENOMEM);
         log_error("Failed to allocate packet");
         ret = AVERROR(ENOMEM);
         goto cleanup;
@@ -915,7 +1053,7 @@ int record_segment(const char *rtsp_url, const char *output_file, int duration, 
 
 		// Read packet (or, if available, consume a carried-over boundary keyframe).
 		// This biases toward overlap vs gaps when segments are aligned on keyframes.
-		if (segment_info_ptr->pending_video_keyframe) {
+							if (segment_info_ptr->pending_video_keyframe) {
 			if (segment_info_ptr->pending_video_keyframe->size > 0) {
 				log_debug("Using carried-over keyframe packet to start segment immediately (overlap mode)");
 				av_packet_unref(pkt);
@@ -1044,8 +1182,11 @@ int record_segment(const char *rtsp_url, const char *output_file, int duration, 
 							} else {
 								log_debug("Stored boundary keyframe for next segment start (overlap mode)");
 							}
-						} else {
-							log_warn("Failed to allocate pending keyframe packet for overlap mode");
+							} else {
+								recording_io_report_failure(
+									RECORDING_IO_RESOURCE_RECORDING,
+									RECORDING_IO_OPERATION_ALLOCATE, ENOMEM);
+								log_warn("Failed to allocate pending keyframe packet for overlap mode");
 						}
                     } else {
 	                        if (keyframe_timeout_reached && !shutdown_detected) {
@@ -1159,6 +1300,13 @@ int record_segment(const char *rtsp_url, const char *output_file, int duration, 
                     }
                     // Set output stream index
                     pkt->stream_index = out_video_stream->index;
+
+                    // avformat_write_header() may replace the requested output
+                    // time base (MP4 commonly selects 1/90000). All timestamp
+                    // normalization above is in the input stream time base, so
+                    // convert immediately before handing the packet to the muxer.
+                    mp4_segment_rescale_packet_ts(
+                        pkt, input_ctx->streams[video_stream_idx], out_video_stream);
 
                     // Write packet
                     ret = av_interleaved_write_frame(output_ctx, pkt);
@@ -1293,9 +1441,17 @@ int record_segment(const char *rtsp_url, const char *output_file, int duration, 
             // Set output stream index
             pkt->stream_index = out_video_stream->index;
 
+            // The muxer is free to change out_video_stream->time_base in
+            // avformat_write_header(). Preserve the media duration by converting
+            // the normalized input timestamps to that final output time base.
+            mp4_segment_rescale_packet_ts(
+                pkt, input_ctx->streams[video_stream_idx], out_video_stream);
+
             // Write packet
             ret = av_interleaved_write_frame(output_ctx, pkt);
             if (ret < 0) {
+                recording_io_report_failure(RECORDING_IO_RESOURCE_RECORDING,
+                                            RECORDING_IO_OPERATION_PACKET, ret);
                 char error_buf[AV_ERROR_MAX_STRING_SIZE] = {0};
                 av_strerror(ret, error_buf, AV_ERROR_MAX_STRING_SIZE);
                 log_error("Error writing video frame: %d (%s)", ret, error_buf);
@@ -1345,10 +1501,14 @@ int record_segment(const char *rtsp_url, const char *output_file, int duration, 
                 if (video_packet_count % 300 == 0) {
                     log_debug("Processed %d video packets", video_packet_count);
                 }
+                maybe_release_recording_file_cache(
+                    output_ctx, &recording_cache_fd,
+                    &recording_cache_released_through);
             }
         }
         // Process audio packets - only if audio is enabled and we have an audio output stream
-        else if (has_audio && audio_stream_idx >= 0 && pkt->stream_index == audio_stream_idx && out_audio_stream) {
+        else if (has_audio && !g_config.audio_disabled && audio_stream_idx >= 0 &&
+                 pkt->stream_index == audio_stream_idx && out_audio_stream) {
             // Skip audio packets until we've found the first video keyframe
             if (!found_first_keyframe) {
                 av_packet_unref(pkt);
@@ -1491,6 +1651,9 @@ int record_segment(const char *rtsp_url, const char *output_file, int duration, 
             if (needs_audio_transcoding) {
                 AVPacket *transcoded_pkt = av_packet_alloc();
                 if (!transcoded_pkt) {
+                    recording_io_report_failure(RECORDING_IO_RESOURCE_RECORDING,
+                                                RECORDING_IO_OPERATION_ALLOCATE,
+                                                ENOMEM);
                     log_error("Failed to allocate packet for transcoded audio");
                     av_packet_unref(pkt);
                     continue;
@@ -1517,13 +1680,20 @@ int record_segment(const char *rtsp_url, const char *output_file, int duration, 
                 transcoded_pkt->pts = pkt->pts;
                 transcoded_pkt->duration = pkt->duration;
 
+                mp4_segment_rescale_packet_ts(
+                    transcoded_pkt, input_ctx->streams[audio_stream_idx], out_audio_stream);
+
                 ret = av_interleaved_write_frame(output_ctx, transcoded_pkt);
                 av_packet_free(&transcoded_pkt);
             } else {
                 // Write packet directly (compatible codec)
+                mp4_segment_rescale_packet_ts(
+                    pkt, input_ctx->streams[audio_stream_idx], out_audio_stream);
                 ret = av_interleaved_write_frame(output_ctx, pkt);
             }
             if (ret < 0) {
+                recording_io_report_failure(RECORDING_IO_RESOURCE_RECORDING,
+                                            RECORDING_IO_OPERATION_PACKET, ret);
                 char error_buf[AV_ERROR_MAX_STRING_SIZE] = {0};
                 av_strerror(ret, error_buf, AV_ERROR_MAX_STRING_SIZE);
                 log_error("Error writing audio frame: %d (%s)", ret, error_buf);
@@ -1534,37 +1704,20 @@ int record_segment(const char *rtsp_url, const char *output_file, int duration, 
                     goto cleanup;
                 }
 
-                // CRITICAL FIX: Handle timestamp-related errors
-                if (ret == AVERROR(EINVAL) && strstr(error_buf, "monoton")) {
-                    // This is likely a timestamp error, try to fix it for the next packet
-                    log_warn("Detected audio timestamp error, will try to fix for next packet");
-
-                    // Increment the consecutive error counter
-                    consecutive_timestamp_errors++;
-
-                    if (consecutive_timestamp_errors >= max_timestamp_errors) {
-                        // Too many consecutive errors, reset all timestamps
-                        log_warn("Too many consecutive audio timestamp errors (%d), resetting all timestamps",
-                                consecutive_timestamp_errors);
-
-                        // Reset timestamps to an undefined state; they will be reinitialized
-                        // based on the next valid packet's timestamps.
-                        first_video_dts = AV_NOPTS_VALUE;
-                        first_video_pts = AV_NOPTS_VALUE;
-                        last_video_dts = AV_NOPTS_VALUE;
-                        last_video_pts = AV_NOPTS_VALUE;
-                        first_audio_dts = AV_NOPTS_VALUE;
-                        first_audio_pts = AV_NOPTS_VALUE;
-                        last_audio_dts = AV_NOPTS_VALUE;
-                        last_audio_pts = AV_NOPTS_VALUE;
-
-                        // Reset the error counter
-                        consecutive_timestamp_errors = 0;
-                    } else {
-                        // Force a larger increment for the next packet to avoid timestamp issues
-                        last_audio_dts += (int64_t)100 * consecutive_timestamp_errors;
-                        last_audio_pts += (int64_t)100 * consecutive_timestamp_errors;
-                    }
+                if (mp4_segment_audio_error_requires_input_refresh(ret)) {
+                    /* av_strerror(EINVAL) is always "Invalid argument", so the
+                     * old strstr(error_buf, "monoton") guard could never run.
+                     * A muxer EINVAL leaves the current audio track unusable;
+                     * retrying every packet only drops audio and floods logs.
+                     * Keep the valid video portion of this segment, stop feeding
+                     * its audio track, and reopen the long-lived RTSP demuxer for
+                     * the next segment so codec/timestamp state is reprobed. */
+                    log_warn("Audio mux state is invalid; disabling audio for the "
+                             "remainder of this segment and refreshing the RTSP "
+                             "input before the next segment");
+                    has_audio = 0;
+                    reuse_input_context = false;
+                    ret = 0;
                 }
             } else {
                 // Reset consecutive error counter on success
@@ -1574,6 +1727,9 @@ int record_segment(const char *rtsp_url, const char *output_file, int duration, 
                 if (audio_packet_count % 300 == 0) {
                     log_debug("Processed %d audio packets", audio_packet_count);
                 }
+                maybe_release_recording_file_cache(
+                    output_ctx, &recording_cache_fd,
+                    &recording_cache_released_through);
             }
         }
 
@@ -1612,6 +1768,8 @@ int record_segment(const char *rtsp_url, const char *output_file, int duration, 
     if (output_ctx && output_ctx->pb) {
         ret = av_write_trailer(output_ctx);
         if (ret < 0) {
+            recording_io_report_failure(RECORDING_IO_RESOURCE_RECORDING,
+                                        RECORDING_IO_OPERATION_TRAILER, ret);
             log_error("Failed to write trailer: %d", ret);
         } else {
             trailer_written = true;
@@ -1667,14 +1825,26 @@ cleanup:
         // Only write trailer if we successfully wrote the header and it hasn't been written yet
         if (output_ctx->pb && ret >= 0 && !trailer_written) {
             log_debug("Writing trailer during cleanup");
-            av_write_trailer(output_ctx);
+            int trailer_ret = av_write_trailer(output_ctx);
+            if (trailer_ret < 0) {
+                recording_io_report_failure(RECORDING_IO_RESOURCE_RECORDING,
+                                            RECORDING_IO_OPERATION_TRAILER,
+                                            trailer_ret);
+            }
         }
 
         // Close output file if it was opened
         if (output_ctx->pb) {
             log_debug("Closing output file");
-            avio_closep(&output_ctx->pb);
+            int close_ret = avio_closep(&output_ctx->pb);
+            if (close_ret < 0) {
+                recording_io_report_failure(RECORDING_IO_RESOURCE_RECORDING,
+                                            RECORDING_IO_OPERATION_CLOSE,
+                                            close_ret);
+            }
         }
+
+        release_all_recording_file_cache(&recording_cache_fd, output_file);
 
         // Free output context — avformat_free_context() owns all streams and their
         // codecpar; do NOT call avcodec_parameters_free() on them beforehand.
@@ -1683,11 +1853,14 @@ cleanup:
         output_ctx = NULL;
     }
 
+    /* Covers failures before an output context reached the normal close path. */
+    release_all_recording_file_cache(&recording_cache_fd, output_file);
+
     // CRITICAL FIX: Properly handle the input context to prevent memory leaks
     log_debug("Handling input context cleanup");
 
     // BUGFIX: Store the input context in the per-stream variable for reuse if recording was successful
-    if (ret >= 0) {
+    if (ret >= 0 && reuse_input_context) {
         // Store the input context for reuse in the next segment
         // We can't directly access internal FFmpeg structures
         // Just store the context as is and rely on FFmpeg's internal reference counting
@@ -1696,8 +1869,8 @@ cleanup:
         input_ctx = NULL;
         log_debug("Stored input context for reuse in next segment");
     } else {
-        // If there was an error, close the input context
-        log_debug("Closing input context due to error");
+        // On errors or stale mux state, force a fresh RTSP probe next segment.
+        log_debug("Closing input context due to error or refresh request");
 
         // CRITICAL FIX: Check if input_ctx is NULL before trying to access it
         // This prevents segmentation fault when RTSP connection fails
@@ -1766,6 +1939,8 @@ int mp4_segment_recorder_write_packet(mp4_writer_t *writer, const AVPacket *pkt,
     // Create a copy of the packet to avoid modifying the original
     AVPacket *out_pkt = av_packet_alloc();
     if (!out_pkt) {
+        recording_io_report_failure(RECORDING_IO_RESOURCE_RECORDING,
+                                    RECORDING_IO_OPERATION_ALLOCATE, ENOMEM);
         log_error("Failed to allocate packet for stream %s",
                 writer->stream_name ? writer->stream_name : "unknown");
         return -1;
@@ -1774,6 +1949,10 @@ int mp4_segment_recorder_write_packet(mp4_writer_t *writer, const AVPacket *pkt,
     // Make a reference copy of the packet
     int ret = av_packet_ref(out_pkt, pkt);
     if (ret < 0) {
+        if (ret == AVERROR(ENOMEM)) {
+            recording_io_report_failure(RECORDING_IO_RESOURCE_RECORDING,
+                                        RECORDING_IO_OPERATION_ALLOCATE, ret);
+        }
         char error_buf[AV_ERROR_MAX_STRING_SIZE] = {0};
         av_strerror(ret, error_buf, AV_ERROR_MAX_STRING_SIZE);
         log_error("Failed to copy packet for stream %s: %s",
@@ -1939,6 +2118,8 @@ int mp4_segment_recorder_write_packet(mp4_writer_t *writer, const AVPacket *pkt,
     // Write the packet to the output
     ret = av_interleaved_write_frame(writer->output_ctx, out_pkt);
     if (ret < 0) {
+        recording_io_report_failure(RECORDING_IO_RESOURCE_RECORDING,
+                                    RECORDING_IO_OPERATION_PACKET, ret);
         char error_buf[AV_ERROR_MAX_STRING_SIZE] = {0};
         av_strerror(ret, error_buf, AV_ERROR_MAX_STRING_SIZE);
         log_error("Error writing frame for stream %s: %s",

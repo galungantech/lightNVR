@@ -7,7 +7,7 @@ import { useState, useEffect, useCallback, useMemo } from 'preact/hooks';
 // Note: useCallback is still used by getStreamsToShow
 import { showStatusMessage } from './ToastContainer.jsx';
 import { useFullscreenManager, FullscreenManager, useFullscreenGridNav, useFullscreenCellStream, getNativeFullscreenElement, requestNativeFullscreen, exitNativeFullscreen } from './FullscreenManager.jsx';
-import { useQuery, useQueryClient } from '../../query-client.js';
+import { useQuery } from '../../query-client.js';
 import { PlaybackTransportCell } from './PlaybackTransportCell.jsx';
 import { SnapshotManager, useSnapshotManager } from './SnapshotManager.jsx';
 import { isGo2rtcEnabled } from '../../utils/settings-utils.js';
@@ -20,6 +20,10 @@ import { AlwaysFullscreenToggle } from './AlwaysFullscreenToggle.jsx';
 import { useAlwaysFullscreenOnTap } from './useAlwaysFullscreenOnTap.js';
 import { usePullToRefresh } from './usePullToRefresh.js';
 import { shouldShowGestureTip } from './mobileLiveGestures.js';
+import { fetchAllStreamSummaries } from '../../utils/stream-summaries.js';
+import { LiveOperatorNavigator } from './live/LiveOperatorNavigator.jsx';
+import { LiveBuildingPlan } from './live/LiveBuildingPlan.jsx';
+import { filterLiveNavigatorInventory } from './live/liveOperator.js';
 
 /**
  * Convert the old single-string layout value to cols/rows for backward compat.
@@ -40,11 +44,19 @@ function legacyLayoutToColsRowsWebRTC(layout) {
  * WebRTCView component
  * @returns {JSX.Element} WebRTCView component
  */
-export function WebRTCView({ isWebRTCDisabled, isHlsDisabled, isMseDisabled }) {
+export function WebRTCView({ audioDisabled = false, isAutoDisabled = false, isWebRTCDisabled, isHlsDisabled, isMseDisabled }) {
   const { t } = useI18n();
   const forcedTransport = resolveForcedLiveTransport(
     window.location.pathname,
-    window.location.search
+    window.location.search,
+    {
+      autoDisabled: isAutoDisabled,
+      offerings: {
+        webrtc: !isWebRTCDisabled,
+        mse: !isMseDisabled,
+        hls: !isHlsDisabled,
+      },
+    }
   );
   const [alwaysFullscreenOnTap, setAlwaysFullscreenOnTap] = useAlwaysFullscreenOnTap();
 
@@ -62,6 +74,30 @@ export function WebRTCView({ isWebRTCDisabled, isHlsDisabled, isMseDisabled }) {
   // State for streams and layout
   const [streams, setStreams] = useState([]);
   const [refreshGeneration, setRefreshGeneration] = useState(0);
+  const [operatorFilter, setOperatorFilter] = useState(null);
+  const [operatorSurface, setOperatorSurfaceState] = useState(() =>
+    new URLSearchParams(window.location.search).get('surface') === 'plan' ? 'plan' : 'grid');
+  const [selectedPlanUuid, setSelectedPlanUuidState] = useState(() =>
+    new URLSearchParams(window.location.search).get('plan') ||
+    localStorage.getItem('lightnvr-live-plan') || '');
+
+  const setOperatorSurface = useCallback((surface) => {
+    const next = surface === 'plan' ? 'plan' : 'grid';
+    setOperatorSurfaceState(next);
+    const url = new URL(window.location.href);
+    if (next === 'plan') url.searchParams.set('surface', 'plan');
+    else url.searchParams.delete('surface');
+    window.history.replaceState({}, '', url);
+  }, []);
+  const setSelectedPlanUuid = useCallback((uuid) => {
+    setSelectedPlanUuidState(uuid || '');
+    if (uuid) localStorage.setItem('lightnvr-live-plan', uuid);
+    else localStorage.removeItem('lightnvr-live-plan');
+    const url = new URL(window.location.href);
+    if (uuid) url.searchParams.set('plan', uuid);
+    else url.searchParams.delete('plan');
+    window.history.replaceState({}, '', url);
+  }, []);
 
   // Tag filter: '' means "All tags", or a single tag value to filter by
   const [tagFilter, setTagFilter] = useState(() => {
@@ -193,9 +229,6 @@ export function WebRTCView({ isWebRTCDisabled, isHlsDisabled, isMseDisabled }) {
     return 0;
   });
 
-  // Get query client for fetching and invalidating queries
-  const queryClient = useQueryClient();
-
   // Check if go2rtc is enabled (for showing MSE View button)
   useEffect(() => {
     const checkGo2rtc = async () => {
@@ -218,18 +251,14 @@ export function WebRTCView({ isWebRTCDisabled, isHlsDisabled, isMseDisabled }) {
     isLoading: isLoadingStreams,
     error: streamsError,
     refetch: refetchStreams,
-  } = useQuery(
-    'streams',
-    '/api/streams',
-    {
-      timeout: 15000, // 15 second timeout
-      retries: 2,     // Retry twice
-      retryDelay: 1000 // 1 second between retries
-    },
-    {
-      refetchInterval: 30000 // Re-poll stream list (and status) every 30 s
-    }
-  );
+  } = useQuery({
+    queryKey: ['streams', 'webrtc-summary'],
+    queryFn: ({ signal }) => fetchAllStreamSummaries({
+      surface: 'live', signal,
+    }),
+    staleTime: 15000,
+    refetchInterval: 30000,
+  });
 
   const refreshLiveGrid = useCallback(async () => {
     try {
@@ -390,37 +419,9 @@ export function WebRTCView({ isWebRTCDisabled, isHlsDisabled, isMseDisabled }) {
         return [];
       }
 
-      // For WebRTC view, we need to fetch full details for each stream
-      const streamPromises = streams.map(async (stream) => {
-        try {
-          const streamId = stream.id || stream.name;
-
-          const streamDetails = await queryClient.fetchQuery({
-            queryKey: ['stream-details', streamId],
-            queryFn: async () => {
-              const response = await fetch(`/api/streams/${encodeURIComponent(streamId)}`);
-              if (!response.ok) {
-                throw new Error(`Failed to load details for stream ${stream.name}`);
-              }
-              return response.json();
-            },
-            staleTime: 30000 // 30 seconds
-          });
-
-          return streamDetails;
-        } catch (error) {
-          console.error(`Error loading details for stream ${stream.name}:`, error);
-          // Return the basic stream info if we can't get details
-          return stream;
-        }
-      });
-
-      const detailedStreams = await Promise.all(streamPromises);
-      console.log('Loaded detailed streams for WebRTC view:', detailedStreams);
-
       // Filter out streams that are soft deleted, administratively disabled, or not configured for streaming.
       // Streams in privacy mode (privacy_mode=true) are kept visible with a privacy overlay.
-      const filteredStreams = detailedStreams.filter(stream => {
+      const filteredStreams = streams.filter(stream => {
         // Filter out soft deleted streams
         if (stream.is_deleted) {
           console.log(`Stream ${stream.name} is soft deleted, filtering out`);
@@ -452,7 +453,17 @@ export function WebRTCView({ isWebRTCDisabled, isHlsDisabled, isMseDisabled }) {
     }
   };
 
-  // Derive unique tags from all streams for the filter dropdown
+  // The playback grid intentionally excludes administratively disabled
+  // cameras, but the Navigator's availability inventory must still include
+  // them. Keep its source separate from the playable stream list.
+  const navigatorStreams = useMemo(() => {
+    if (!Array.isArray(streamsData)) return streams;
+    if (collectionFilter && isCollectionLoading) return streams;
+    return filterLiveNavigatorInventory(
+      streamsData, collectionFilter ? collectionCameraUuids : null);
+  }, [streamsData, streams, collectionFilter, collectionCameraUuids, isCollectionLoading]);
+
+  // Derive unique tags from playable streams for the header filter.
   const availableTags = useMemo(() => {
     const tags = new Set();
     streams.forEach(s => {
@@ -467,9 +478,12 @@ export function WebRTCView({ isWebRTCDisabled, isHlsDisabled, isMseDisabled }) {
   const tagFilteredStreams = useMemo(() => {
     return streams.filter((stream) => {
       if (collectionFilter && !collectionCameraUuids.has(stream.camera_uuid)) return false;
+      if (operatorFilter && !operatorFilter.cameraUuids.has(stream.camera_uuid)) return false;
+      if (operatorFilter && operatorFilter.availability !== 'all' &&
+          stream.availability !== operatorFilter.availability) return false;
       return !tagFilter || (stream.tags && stream.tags.split(',').some(tag => tag.trim() === tagFilter));
     });
-  }, [streams, tagFilter, collectionFilter, collectionCameraUuids]);
+  }, [streams, tagFilter, collectionFilter, collectionCameraUuids, operatorFilter]);
 
   // Camera ordering hook (operates on group-filtered streams)
   const {
@@ -478,6 +492,8 @@ export function WebRTCView({ isWebRTCDisabled, isHlsDisabled, isMseDisabled }) {
     toggleReorderMode,
     enterReorderMode,
     resetOrder,
+    setCameraOrder,
+    placeCameraAtIndex,
     handleDragStart,
     handleDragOver,
     handleDrop,
@@ -487,6 +503,26 @@ export function WebRTCView({ isWebRTCDisabled, isHlsDisabled, isMseDisabled }) {
     handleReorderPointerUp,
     handleReorderPointerCancel,
   } = useCameraOrder(tagFilteredStreams, 'webrtc');
+
+  const applyOperatorLayout = useCallback((layout) => {
+    const nextCols = Math.max(1, Math.min(9, Number(layout.columns) || cols));
+    const nextRows = Math.max(1, Math.min(9, Number(layout.rows) || rows));
+    setCols(nextCols);
+    setRows(Math.min(nextRows, Math.floor(MAX_GRID_CELLS / nextCols)));
+    setCurrentPage(0);
+    setAutoGrid(false);
+    const names = (layout.cameraUuids || []).map((cameraUuid) =>
+      streams.find((stream) => stream.camera_uuid === cameraUuid)?.name).filter(Boolean);
+    setCameraOrder(names);
+    if (nextCols * nextRows === 1 && names[0]) setSelectedStream(names[0]);
+  }, [cols, rows, streams, setCameraOrder]);
+
+  const openPlanCamera = useCallback((stream) => {
+    setOperatorSurface('grid');
+    applyOperatorLayout({
+      cameraUuids: [stream.camera_uuid], columns: 1, rows: 1,
+    });
+  }, [applyOperatorLayout, setOperatorSurface]);
 
   // Ensure current page is valid when orderedStreams or maxStreams changes
   useEffect(() => {
@@ -587,17 +623,19 @@ export function WebRTCView({ isWebRTCDisabled, isHlsDisabled, isMseDisabled }) {
           <h2 className="text-xl font-bold whitespace-nowrap">{t('live.liveView')}</h2>
           {/* Auto honors per-stream precedence; explicit modes force every tile. */}
           <div className="inline-flex items-center bg-muted rounded-lg p-1 gap-1" style={{ position: 'relative', zIndex: 50 }}>
-            {forcedTransport === null ? (
-              <span className="px-3 py-1.5 rounded text-sm font-medium bg-primary text-primary-foreground select-none">
-                Auto
-              </span>
-            ) : (
-              <a
-                href={buildLiveViewHref('/index.html', window.location.search)}
-                className="px-3 py-1.5 rounded text-sm font-medium transition-colors no-underline text-muted-foreground hover:bg-background hover:text-foreground focus:outline-none"
-              >
-                Auto
-              </a>
+            {!isAutoDisabled && (
+              forcedTransport === null ? (
+                <span className="px-3 py-1.5 rounded text-sm font-medium bg-primary text-primary-foreground select-none">
+                  Auto
+                </span>
+              ) : (
+                <a
+                  href={buildLiveViewHref('/index.html', window.location.search)}
+                  className="px-3 py-1.5 rounded text-sm font-medium transition-colors no-underline text-muted-foreground hover:bg-background hover:text-foreground focus:outline-none"
+                >
+                  Auto
+                </a>
+              )
             )}
 
             {forcedTransport === 'webrtc' ? (
@@ -647,6 +685,7 @@ export function WebRTCView({ isWebRTCDisabled, isHlsDisabled, isMseDisabled }) {
           </div>
         </div>
         
+        {operatorSurface === 'grid' && (
         <div className="controls flex items-center space-x-2">
           {collections.length > 0 && (
             <div className="flex items-center gap-1.5">
@@ -810,12 +849,35 @@ export function WebRTCView({ isWebRTCDisabled, isHlsDisabled, isMseDisabled }) {
             </svg>
           </button>
         </div>
+        )}
       </div>
 
-      <div
-        className="live-grid-frame flex flex-col space-y-4 h-full"
-        {...pullToRefresh.bind}
-      >
+      <div className="live-workspace-shell">
+        <LiveOperatorNavigator
+          streams={navigatorStreams}
+          orderedStreams={orderedStreams}
+          columns={cols}
+          rows={rows}
+          operatorSurface={operatorSurface}
+          selectedPlanUuid={selectedPlanUuid}
+          onFilterChange={setOperatorFilter}
+          onApplyLayout={applyOperatorLayout}
+          onSurfaceChange={setOperatorSurface}
+          onSelectPlan={setSelectedPlanUuid}
+        />
+        <div className="live-operator-main">
+        {operatorSurface === 'plan' ? (
+          <LiveBuildingPlan
+            streams={navigatorStreams}
+            selectedPlanUuid={selectedPlanUuid}
+            onSelectPlan={setSelectedPlanUuid}
+            onOpenCamera={openPlanCamera}
+          />
+        ) : (
+        <div
+          className="live-grid-frame flex flex-col space-y-4 h-full"
+          {...pullToRefresh.bind}
+        >
         {(pullToRefresh.distance > 0 || pullToRefresh.refreshing) && (
           <div
             className={`mobile-pull-refresh ${pullToRefresh.ready ? 'ready' : ''}`}
@@ -872,6 +934,10 @@ export function WebRTCView({ isWebRTCDisabled, isHlsDisabled, isMseDisabled }) {
               <p className="mb-6 text-muted-foreground text-lg">{t('live.noStreamsConfigured')}</p>
               <a href="streams.html" className="btn-primary">{t('live.configureStreams')}</a>
             </div>
+          ) : orderedStreams.length === 0 ? (
+            <div className="placeholder flex flex-col justify-center items-center col-span-full row-span-full bg-card text-card-foreground rounded-lg shadow-md text-center p-8">
+              <p className="mb-0 text-muted-foreground text-lg">{t('live.navigator.noCameras')}</p>
+            </div>
           ) : (
             // Render video cells. Connection concurrency is bounded by the
             // shared stream connection gate (see stream-connection-gate.js),
@@ -887,8 +953,17 @@ export function WebRTCView({ isWebRTCDisabled, isHlsDisabled, isMseDisabled }) {
                   style={{ position: 'relative', touchAction: reorderMode ? 'none' : undefined }}
                   draggable={reorderMode}
                   onDragStart={reorderMode ? () => handleDragStart(globalIndex) : undefined}
-                  onDragOver={reorderMode ? (e) => handleDragOver(e, globalIndex) : undefined}
-                  onDrop={reorderMode ? handleDrop : undefined}
+                  onDragOver={(event) => {
+                    if (reorderMode) handleDragOver(event, globalIndex);
+                    else if (event.dataTransfer?.types?.includes('application/x-lightnvr-camera')) event.preventDefault();
+                  }}
+                  onDrop={(event) => {
+                    if (reorderMode) handleDrop(event);
+                    else {
+                      const cameraUuid = event.dataTransfer?.getData('application/x-lightnvr-camera');
+                      if (cameraUuid) { event.preventDefault(); placeCameraAtIndex(cameraUuid, globalIndex); }
+                    }
+                  }}
                   onDragEnd={reorderMode ? handleDragEnd : undefined}
                   onPointerDown={reorderMode ? (event) => handleReorderPointerDown(event, globalIndex) : undefined}
                   onPointerMove={reorderMode ? handleReorderPointerMove : undefined}
@@ -914,6 +989,7 @@ export function WebRTCView({ isWebRTCDisabled, isHlsDisabled, isMseDisabled }) {
                   )}
                   <PlaybackTransportCell
                     stream={stream}
+                    audioDisabled={audioDisabled}
                     offerings={{
                       webrtc: !isWebRTCDisabled,
                       mse: !isMseDisabled,
@@ -968,6 +1044,9 @@ export function WebRTCView({ isWebRTCDisabled, isHlsDisabled, isMseDisabled }) {
             </button>
           </div>
         ) : null}
+        </div>
+        )}
+        </div>
       </div>
     </section>
   );

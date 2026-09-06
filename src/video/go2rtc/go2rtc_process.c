@@ -1050,7 +1050,8 @@ static bool go2rtc_process_generate_config_locked(const char *config_path, int a
                 char ice_servers_copy[512];
                 safe_strcpy(ice_servers_copy, global_config->go2rtc_ice_servers, sizeof(ice_servers_copy), 0);
 
-                char *token = strtok(ice_servers_copy, ",");
+                char *saveptr = NULL;
+                char *token = strtok_r(ice_servers_copy, ",", &saveptr);
                 while (token != NULL) {
                     // Trim whitespace
                     while (*token == ' ') token++;
@@ -1059,7 +1060,7 @@ static bool go2rtc_process_generate_config_locked(const char *config_path, int a
                     *(end + 1) = '\0';
 
                     fprintf(config_file, "    - urls: [\"%s\"]\n", token);
-                    token = strtok(NULL, ",");
+                    token = strtok_r(NULL, ",", &saveptr);
                 }
             } else if (global_config->go2rtc_stun_enabled) {
                 // Use default STUN servers - multiple servers for redundancy
@@ -1194,6 +1195,10 @@ bool go2rtc_process_generate_config(const char *config_path, int api_port) {
 static int write_stream_overrides(FILE *fp) {
     if (!fp) return 0;
     if (get_db_handle() == NULL) return 0;
+    if (g_config.audio_disabled) {
+        log_warn("Ignoring per-stream go2rtc source overrides while the global audio policy is enabled");
+        return 0;
+    }
 
     int ms = configured_stream_slots();
     stream_config_t *streams = calloc(ms, sizeof(stream_config_t));
@@ -1204,7 +1209,7 @@ static int write_stream_overrides(FILE *fp) {
 
     for (int i = 0; i < count; i++) {
         if (!streams[i].enabled) continue;
-        if (streams[i].go2rtc_source_override[0] == '\0') continue;
+        if (!string_has_non_whitespace(streams[i].go2rtc_source_override)) continue;
 
         // Escape stream name for YAML double-quoted key safety
         char escaped_name[MAX_STREAM_NAME * 2];
@@ -1598,6 +1603,19 @@ static int go2rtc_process_generate_override_file_locked(const char *override_pat
     if (!override_path || override_path[0] == '\0') {
         log_error("go2rtc_process_generate_override_file: invalid path");
         return -1;
+    }
+
+    // Arbitrary go2rtc YAML can declare audio producers that bypass LightNVR's
+    // normal stream registration. Keep the saved text dormant while the
+    // compliance policy is active and remove any previously generated file.
+    if (g_config.audio_disabled) {
+        log_warn("Ignoring global go2rtc override while the global audio policy is enabled");
+        if (unlink(override_path) != 0 && errno != ENOENT) {
+            log_error("Failed to remove go2rtc override under audio policy: %s",
+                      strerror(errno));
+            return -1;
+        }
+        return 0;
     }
 
     /* T4b — if a prior crash loop quarantined this override, the

@@ -63,6 +63,21 @@ static int safe_atoi(const char *str, int fallback) {
     return parsed;
 }
 
+static bool parse_bool_strict(const char *value, bool *result) {
+    if (!value || !result) return false;
+    if (strcasecmp(value, "true") == 0 || strcmp(value, "1") == 0 ||
+        strcasecmp(value, "yes") == 0 || strcasecmp(value, "on") == 0) {
+        *result = true;
+        return true;
+    }
+    if (strcasecmp(value, "false") == 0 || strcmp(value, "0") == 0 ||
+        strcasecmp(value, "no") == 0 || strcasecmp(value, "off") == 0) {
+        *result = false;
+        return true;
+    }
+    return false;
+}
+
 // ============================================================================
 // Environment Variable Override Support
 // ============================================================================
@@ -129,6 +144,7 @@ static const env_config_mapping_t env_config_mappings[] = {
     {"WEB_USERNAME",       CONFIG_TYPE_STRING, CONFIG_OFFSET(web_username),       32,  "admin", 0, false},
     {"WEB_TRUSTED_PROXY_CIDRS", CONFIG_TYPE_STRING, CONFIG_OFFSET(trusted_proxy_cidrs), WEB_TRUSTED_PROXY_CIDRS_MAX, "", 0, false},
     {"DEMO_MODE",          CONFIG_TYPE_BOOL,   CONFIG_OFFSET(demo_mode),          0,   NULL, 0, false},
+    {"AUDIO_DISABLED",     CONFIG_TYPE_BOOL,   CONFIG_OFFSET(audio_disabled),     0,   NULL, 0, false},
 
     // General settings
     {"LOG_LEVEL",          CONFIG_TYPE_INT,    CONFIG_OFFSET(log_level),          0,   NULL, 2, false},
@@ -139,10 +155,10 @@ static const env_config_mapping_t env_config_mappings[] = {
 
     // Database settings
     {"DB_PATH",            CONFIG_TYPE_STRING, CONFIG_OFFSET(db_path),            MAX_PATH_LENGTH, "/var/lib/lightnvr/lightnvr.db", 0, false},
-    {"DB_BACKUP_INTERVAL_MINUTES", CONFIG_TYPE_INT, CONFIG_OFFSET(db_backup_interval_minutes), 0, NULL, 60, false},
+    {"DB_BACKUP_INTERVAL_MINUTES", CONFIG_TYPE_INT, CONFIG_OFFSET(db_backup_interval_minutes), 0, NULL, 0, false},
     {"DB_BACKUP_RETENTION_COUNT",  CONFIG_TYPE_INT, CONFIG_OFFSET(db_backup_retention_count),  0, NULL, 6, false},
     {"DB_POST_BACKUP_SCRIPT",      CONFIG_TYPE_STRING, CONFIG_OFFSET(db_post_backup_script),    MAX_PATH_LENGTH, "", 0, false},
-    {"DB_STARTUP_CHECK",           CONFIG_TYPE_INT, CONFIG_OFFSET(db_startup_check),           0, NULL, DB_STARTUP_CHECK_QUICK, false},
+    {"DB_STARTUP_CHECK",           CONFIG_TYPE_INT, CONFIG_OFFSET(db_startup_check),           0, NULL, DB_STARTUP_CHECK_OFF, false},
 
     // Sentinel to mark end of array
     {NULL, CONFIG_TYPE_BOOL, 0, 0, NULL, 0, false}
@@ -381,10 +397,13 @@ void load_default_config(config_t *config) {
 
     // Database settings
     safe_strcpy(config->db_path, "/var/lib/lightnvr/lightnvr.db", MAX_PATH_LENGTH, 0);
-    config->db_backup_interval_minutes = 60;
+    /* Full runtime backups are opt-in.  Large, continuously-written NVR
+     * databases can otherwise create substantial periodic I/O and page-cache
+     * pressure.  Initial and clean-shutdown backups remain enabled. */
+    config->db_backup_interval_minutes = 0;
     config->db_backup_retention_count = 6;
     config->db_post_backup_script[0] = '\0';
-    config->db_startup_check = DB_STARTUP_CHECK_QUICK;
+    config->db_startup_check = DB_STARTUP_CHECK_OFF;
     
     // Web server settings
     config->web_port = 8080;
@@ -394,6 +413,8 @@ void load_default_config(config_t *config) {
     safe_strcpy(config->web_username, "admin", 32, 0);
     // Blank means bootstrap admin/admin; db_auth_init requires first-login replacement.
     config->web_password[0] = '\0';
+    config->audio_disabled = false;  // Audio is allowed by default
+    config->auto_disabled = false;   // Auto view is enabled by default
     config->webrtc_disabled = false; // WebRTC is enabled by default
     config->hls_disabled = false;    // HLS is enabled by default (#397)
     config->mse_disabled = false;    // MSE is enabled by default (#397)
@@ -510,6 +531,9 @@ void load_default_config(config_t *config) {
     config->mqtt_ha_discovery = false;          // Disabled by default
     safe_strcpy(config->mqtt_ha_discovery_prefix, "homeassistant", sizeof(config->mqtt_ha_discovery_prefix), 0);
     config->mqtt_ha_snapshot_interval = 30;     // 30 seconds default
+
+    // Host and hardware health defaults from OPS-03.
+    system_health_policy_settings_defaults(&config->health);
 }
 
 // Ensure all required directories exist
@@ -574,6 +598,13 @@ static int ensure_directories(const config_t *config) {
 int validate_config(config_t *config) {
     if (!config) return -1;
 
+    char health_error[SYSTEM_HEALTH_POLICY_ERROR_LENGTH];
+    if (system_health_policy_validate_settings(&config->health,
+                                               health_error) != 0) {
+        log_error("Invalid health configuration: %s", health_error);
+        return -1;
+    }
+
     if (config->auth_absolute_timeout_hours < config->auth_timeout_hours) {
         log_warn("auth_absolute_timeout_hours (%d) is less than auth_timeout_hours (%d); clamping to the idle timeout",
                  config->auth_absolute_timeout_hours, config->auth_timeout_hours);
@@ -610,9 +641,9 @@ int validate_config(config_t *config) {
 
     if (config->db_startup_check < DB_STARTUP_CHECK_OFF ||
         config->db_startup_check > DB_STARTUP_CHECK_FULL) {
-        log_warn("db startup_check (%d) out of range [%d,%d]; using quick",
+        log_warn("db startup_check (%d) out of range [%d,%d]; using off",
                  config->db_startup_check, DB_STARTUP_CHECK_OFF, DB_STARTUP_CHECK_FULL);
-        config->db_startup_check = DB_STARTUP_CHECK_QUICK;
+        config->db_startup_check = DB_STARTUP_CHECK_OFF;
     }
 
     // Clamp capacity/pressure settings to sane ranges. min_free_pct must leave
@@ -718,6 +749,44 @@ static int config_ini_handler(void* user, const char* section, const char* name,
                 else if (strcmp(value, "LOG_LOCAL7") == 0) config->syslog_facility = LOG_LOCAL7;
                 else config->syslog_facility = LOG_USER; // Default
             }
+        }
+    }
+    // Host and hardware health. Invalid/unknown health keys fail the complete
+    // INI load instead of being silently clamped or ignored.
+    else if (strcmp(section, "health") == 0) {
+        bool parsed_bool;
+        if (strcmp(name, "enabled") == 0) {
+            if (!parse_bool_strict(value, &parsed_bool)) return 0;
+            config->health.enabled = parsed_bool;
+        } else if (strcmp(name, "profile") == 0) {
+            safe_strcpy(config->health.profile, value,
+                        sizeof(config->health.profile), 0);
+        } else if (strcmp(name, "fast_interval_seconds") == 0) {
+            config->health.fast_interval_seconds =
+                (uint32_t)safe_atoi(value, -1);
+        } else if (strcmp(name, "normal_interval_seconds") == 0) {
+            config->health.normal_interval_seconds =
+                (uint32_t)safe_atoi(value, -1);
+        } else if (strcmp(name, "slow_interval_seconds") == 0) {
+            config->health.slow_interval_seconds =
+                (uint32_t)safe_atoi(value, -1);
+        } else if (strcmp(name, "device_interval_seconds") == 0) {
+            config->health.device_interval_seconds =
+                (uint32_t)safe_atoi(value, -1);
+        } else if (strcmp(name, "write_probe_enabled") == 0) {
+            if (!parse_bool_strict(value, &parsed_bool)) return 0;
+            config->health.write_probe_enabled = parsed_bool;
+        } else if (strcmp(name, "hardware_provider") == 0) {
+            safe_strcpy(config->health.hardware_provider, value,
+                        sizeof(config->health.hardware_provider), 0);
+        } else if (strcmp(name, "presence_interval_seconds") == 0) {
+            config->health.presence_interval_seconds =
+                (uint32_t)safe_atoi(value, -1);
+        } else if (strcmp(name, "incident_retention_days") == 0) {
+            config->health.incident_retention_days =
+                (uint32_t)safe_atoi(value, -1);
+        } else {
+            return 0;
         }
     }
     // Storage settings
@@ -834,7 +903,7 @@ static int config_ini_handler(void* user, const char* section, const char* name,
             } else if (strcasecmp(value, "quick") == 0) {
                 config->db_startup_check = DB_STARTUP_CHECK_QUICK;
             } else {
-                config->db_startup_check = safe_atoi(value, DB_STARTUP_CHECK_QUICK);
+                config->db_startup_check = safe_atoi(value, DB_STARTUP_CHECK_OFF);
             }
         }
     }
@@ -852,6 +921,10 @@ static int config_ini_handler(void* user, const char* section, const char* name,
             safe_strcpy(config->web_username, value, sizeof(config->web_username), 0);
         } else if (strcmp(name, "password") == 0) {
             safe_strcpy(config->web_password, value, sizeof(config->web_password), 0);
+        } else if (strcmp(name, "audio_disabled") == 0) {
+            config->audio_disabled = (strcmp(value, "true") == 0 || strcmp(value, "1") == 0);
+        } else if (strcmp(name, "auto_disabled") == 0) {
+            config->auto_disabled = (strcmp(value, "true") == 0 || strcmp(value, "1") == 0);
         } else if (strcmp(name, "webrtc_disabled") == 0) {
             config->webrtc_disabled = (strcmp(value, "true") == 0 || strcmp(value, "1") == 0);
         } else if (strcmp(name, "hls_disabled") == 0) {
@@ -1663,6 +1736,28 @@ int save_config(const config_t *config, const char *path) {
         default: /* facility_name already set to "LOG_USER" above */ break;
     }
     fprintf(file, "syslog_facility = %s  ; Syslog facility for system logging\n\n", facility_name);
+
+    // Structured condition overrides intentionally are not written here; they
+    // are one canonical, bounded system_settings value.
+    fprintf(file, "[health]\n");
+    fprintf(file, "enabled = %s\n", config->health.enabled ? "true" : "false");
+    fprintf(file, "profile = %s\n", config->health.profile);
+    fprintf(file, "fast_interval_seconds = %u\n",
+            config->health.fast_interval_seconds);
+    fprintf(file, "normal_interval_seconds = %u\n",
+            config->health.normal_interval_seconds);
+    fprintf(file, "slow_interval_seconds = %u\n",
+            config->health.slow_interval_seconds);
+    fprintf(file, "device_interval_seconds = %u\n",
+            config->health.device_interval_seconds);
+    fprintf(file, "write_probe_enabled = %s\n",
+            config->health.write_probe_enabled ? "true" : "false");
+    fprintf(file, "hardware_provider = %s\n",
+            config->health.hardware_provider);
+    fprintf(file, "presence_interval_seconds = %u\n",
+            config->health.presence_interval_seconds);
+    fprintf(file, "incident_retention_days = %u\n\n",
+            config->health.incident_retention_days);
     
     // Write storage settings
     fprintf(file, "[storage]\n");
@@ -1735,7 +1830,7 @@ int save_config(const config_t *config, const char *path) {
             config->db_backup_interval_minutes);
     fprintf(file, "backup_retention_count = %d  ; Number of timestamped backups to keep\n",
             config->db_backup_retention_count);
-    fprintf(file, "startup_check = %s  ; Boot consistency check: off, quick (default), or full\n",
+    fprintf(file, "startup_check = %s  ; Boot consistency check: off (default), quick, or full\n",
             config->db_startup_check == DB_STARTUP_CHECK_OFF ? "off" :
             config->db_startup_check == DB_STARTUP_CHECK_FULL ? "full" : "quick");
     fprintf(file, "post_backup_script = %s  ; Optional absolute path to executable hook\n\n",
@@ -1750,6 +1845,8 @@ int save_config(const config_t *config, const char *path) {
     fprintf(file, "auth_enabled = %s\n", config->web_auth_enabled ? "true" : "false");
     fprintf(file, "username = %s\n", config->web_username);
     // Note: web_password is no longer saved to config - user passwords are managed in the database
+    fprintf(file, "audio_disabled = %s  ; Instance-wide audio compliance policy\n", config->audio_disabled ? "true" : "false");
+    fprintf(file, "auto_disabled = %s  ; Hide Auto view and use the first enabled explicit transport\n", config->auto_disabled ? "true" : "false");
     fprintf(file, "webrtc_disabled = %s  ; Hide WebRTC view on dashboard\n", config->webrtc_disabled ? "true" : "false");
     fprintf(file, "hls_disabled = %s     ; Hide HLS view on dashboard\n", config->hls_disabled ? "true" : "false");
     fprintf(file, "mse_disabled = %s     ; Hide MSE view on dashboard\n", config->mse_disabled ? "true" : "false");
@@ -1876,6 +1973,15 @@ void print_config(const config_t *config) {
     printf("    Max Storage Size: %llu bytes\n", (unsigned long long)config->max_storage_size);
     printf("    Retention Days: %d\n", config->retention_days);
     printf("    Auto Delete Oldest: %s\n", config->auto_delete_oldest ? "true" : "false");
+
+    printf("  Health Settings:\n");
+    printf("    Enabled: %s\n", config->health.enabled ? "true" : "false");
+    printf("    Profile: %s\n", config->health.profile);
+    printf("    Sampling intervals: %u/%u/%u/%u seconds\n",
+           config->health.fast_interval_seconds,
+           config->health.normal_interval_seconds,
+           config->health.slow_interval_seconds,
+           config->health.device_interval_seconds);
     
     printf("  Models Settings:\n");
     printf("    Models Path: %s\n", config->models_path);
@@ -1900,6 +2006,8 @@ void print_config(const config_t *config) {
     printf("    Web Auth Enabled: %s\n", config->web_auth_enabled ? "true" : "false");
     printf("    Web Username: %s\n", config->web_username);
     printf("    Web Password: %s\n", "********");
+    printf("    Audio Disabled: %s\n",  config->audio_disabled ? "true" : "false");
+    printf("    Auto Disabled: %s\n",   config->auto_disabled ? "true" : "false");
     printf("    WebRTC Disabled: %s\n", config->webrtc_disabled ? "true" : "false");
     printf("    HLS Disabled: %s\n",    config->hls_disabled ? "true" : "false");
     printf("    MSE Disabled: %s\n",    config->mse_disabled ? "true" : "false");
