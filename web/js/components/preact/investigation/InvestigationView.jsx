@@ -8,6 +8,7 @@ import {
   resolveRecordedStreamSummary,
 } from '../../../utils/stream-summaries.js';
 import { isEptzEnabled } from '../../../utils/eptz-config.js';
+import { loadRecordingPlayback } from '../../../utils/recording-playback.js';
 import { LoadingIndicator } from '../LoadingIndicator.jsx';
 import { FisheyeEptzCanvas } from '../FisheyeEptzCanvas.jsx';
 import { formatUtils } from '../recordings/formatUtils.js';
@@ -80,6 +81,8 @@ function InvestigationPlayer({
   const videoShellRef = useRef(null);
   const videoFrameRef = useRef(null);
   const cursorRef = useRef(cursor);
+  const playbackRef = useRef({ playing, speed });
+  playbackRef.current = { playing, speed };
   const regionAnchorRef = useRef(null);
   const coverageSegment = findSegmentAt(track.segments, cursor);
   const [resolvedSegment, setResolvedSegment] = useState(null);
@@ -223,15 +226,23 @@ function InvestigationPlayer({
         setVideoDimensions({ width: video.videoWidth, height: video.videoHeight });
       }
       seekToCursor();
-      video.playbackRate = speed;
-      if (playing) {
+      video.playbackRate = playbackRef.current.speed;
+      if (playbackRef.current.playing) {
         video.play().catch(() => setStatus('paused-by-browser'));
       }
     };
     video.addEventListener('loadedmetadata', loaded);
-    video.src = `/api/recordings/play/${segment.id}`;
-    video.load();
-    return () => video.removeEventListener('loadedmetadata', loaded);
+    const cleanup = loadRecordingPlayback(video, `/api/recordings/play/${segment.id}`, {
+      onPreparing: () => setStatus('loading'),
+      onError: error => {
+        console.warn('Could not play investigation recording', error);
+        setStatus('error');
+      },
+    });
+    return () => {
+      video.removeEventListener('loadedmetadata', loaded);
+      cleanup();
+    };
   }, [segment?.id]);
 
   useEffect(() => {
@@ -240,7 +251,7 @@ function InvestigationPlayer({
 
   useEffect(() => {
     const video = videoRef.current;
-    if (!video || !segment) return;
+    if (!video || !segment || video.readyState < 1) return;
     video.playbackRate = speed;
     if (playing) {
       video.play().catch(() => setStatus('paused-by-browser'));
@@ -330,7 +341,6 @@ function InvestigationPlayer({
               onWaiting={() => setStatus('late')}
               onPlaying={() => setStatus('ready')}
               onCanPlay={() => setStatus('ready')}
-              onError={() => setStatus('error')}
             />
           ) : status === 'loading' ? (
             <div className="investigation-gap-state">

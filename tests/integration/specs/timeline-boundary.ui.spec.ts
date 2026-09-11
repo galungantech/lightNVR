@@ -1,6 +1,7 @@
 import { test, expect, Page } from '@playwright/test';
 import { login, USERS } from '../fixtures/test-fixtures';
 import { TimelinePage } from '../pages/TimelinePage';
+import { serveRecordingMedia } from '../fixtures/recording-media';
 
 type Segment = { id: number; stream: string; start_timestamp: number; end_timestamp: number };
 
@@ -27,9 +28,14 @@ async function mockTimelineApis(page: Page, stream: string, segments: Segment[],
   } }));
   await page.route('**/api/detection/results/**', route => route.fulfill({ json: { detections: [] } }));
   await page.route('**/api/recordings/**', async route => {
-    const pathname = new URL(route.request().url()).pathname;
+    const url = new URL(route.request().url());
+    const pathname = url.pathname;
     const play = pathname.match(/\/api\/recordings\/play\/(\d+)$/);
-    if (play) return route.fulfill({ status: 204, body: '' });
+    if (play) {
+      return route.fulfill(url.searchParams.get('prepare') === '1'
+        ? { json: { status: 'ready' } }
+        : { status: 204, body: '' });
+    }
 
     const tags = pathname.match(/\/api\/recordings\/(\d+)\/tags$/);
     if (tags) return route.fulfill({ json: { tags: tagsById[Number(tags[1])] || [] } });
@@ -261,6 +267,95 @@ test.describe('Timeline boundary flows @ui @timeline', () => {
     await expect(timelinePage.timeDisplay).toHaveText('front_door - 11:20:00');
     await expect(timelinePage.videoPlayer).toHaveAttribute('src', /\/api\/recordings\/play\/313(?:\?|$)/);
     await expect(timelinePage.nextRecordingButton).toBeDisabled();
+  });
+
+  test('plays and seeks the original recording without preparing a copy', async ({ page }) => {
+    const stream = 'front_door';
+    const date = '2026-03-08';
+    const segments: Segment[] = [
+      { id: 320, stream, start_timestamp: localTimestamp(date, '11:00:00'), end_timestamp: localTimestamp(date, '11:10:00') }
+    ];
+    await mockTimelineApis(page, stream, segments);
+    const playbackRequests: string[] = [];
+    await page.route('**/api/recordings/play/*', route => {
+      playbackRequests.push(route.request().url());
+      return serveRecordingMedia(route);
+    });
+    await page.goto(`/timeline.html?stream=${stream}&date=${date}&time=11:02:00`, { waitUntil: 'domcontentloaded' });
+    const timelinePage = new TimelinePage(page);
+    await expect.poll(() => timelinePage.videoPlayer.evaluate((video: HTMLVideoElement) => video.videoWidth)).toBe(64);
+    await expect.poll(() => timelinePage.videoPlayer.evaluate((video: HTMLVideoElement) => Math.round(video.currentTime))).toBe(120);
+    await timelinePage.videoPlayer.evaluate(async (video: HTMLVideoElement) => {
+      video.muted = true;
+      await video.play();
+    });
+    await expect.poll(() => timelinePage.videoPlayer.evaluate((video: HTMLVideoElement) => video.currentTime)).toBeGreaterThan(120);
+    expect(playbackRequests.length).toBeGreaterThan(0);
+    expect(playbackRequests.every(url => !new URL(url).searchParams.has('prepare') &&
+      !new URL(url).searchParams.has('transcode'))).toBe(true);
+    await expect(timelinePage.videoContainer.getByRole('status')).toHaveCount(0);
+  });
+
+  test('prepares only rejected recordings and cancels fallback when switching recordings', async ({ page }) => {
+    const stream = 'front_door';
+    const date = '2026-03-08';
+    const segments: Segment[] = [
+      { id: 321, stream, start_timestamp: localTimestamp(date, '11:00:00'), end_timestamp: localTimestamp(date, '11:05:00') },
+      { id: 322, stream, start_timestamp: localTimestamp(date, '11:10:00'), end_timestamp: localTimestamp(date, '11:15:00') },
+      { id: 323, stream, start_timestamp: localTimestamp(date, '11:20:00'), end_timestamp: localTimestamp(date, '11:25:00') }
+    ];
+    await mockTimelineApis(page, stream, segments);
+    const preparations: number[] = [];
+    const mediaRequests: Array<{ id: number; transcode: boolean }> = [];
+    let firstReady = false;
+    await page.route('**/api/recordings/play/*', route => {
+      const url = new URL(route.request().url());
+      const id = Number(url.pathname.split('/').pop());
+      if (url.searchParams.get('prepare') === '1') {
+        preparations.push(id);
+        const ready = id === 323 || (id === 321 && firstReady);
+        return route.fulfill({
+          status: ready ? 200 : 202,
+          headers: { 'Retry-After': '1' },
+          json: { status: ready ? 'ready' : 'preparing' }
+        });
+      }
+      const transcode = url.searchParams.get('transcode') === '1';
+      mediaRequests.push({ id, transcode });
+      if (transcode || id === 323) return serveRecordingMedia(route);
+      return route.fulfill({
+        contentType: 'video/mp4',
+        body: Buffer.from('unsupported video')
+      });
+    });
+    await page.goto(`/timeline.html?stream=${stream}&date=${date}&time=11:00:00`, { waitUntil: 'domcontentloaded' });
+
+    const timelinePage = new TimelinePage(page);
+    const status = timelinePage.videoContainer.getByRole('status');
+    await expect(status).toHaveText('Preparing a compatible version for this browser…');
+    await expect(timelinePage.videoPlayer).not.toHaveAttribute('src');
+    expect(mediaRequests).toEqual([{ id: 321, transcode: false }]);
+    firstReady = true;
+    await expect(timelinePage.videoPlayer).toHaveAttribute('src', /\/api\/recordings\/play\/321(?:\?|$)/);
+    await expect.poll(() => timelinePage.videoPlayer.evaluate((video: HTMLVideoElement) => video.videoWidth)).toBe(64);
+    expect(preparations.filter(id => id === 321).length).toBeGreaterThanOrEqual(2);
+
+    await timelinePage.nextRecordingButton.click();
+    await expect(status).toHaveText('Preparing a compatible version for this browser…');
+    await expect(timelinePage.videoPlayer).not.toHaveAttribute('src');
+    await timelinePage.nextRecordingButton.click();
+    await expect(timelinePage.videoPlayer).toHaveAttribute('src', /\/api\/recordings\/play\/323(?:\?|$)/);
+    const abandonedRequests = preparations.filter(id => id === 322).length;
+    expect(abandonedRequests).toBeGreaterThan(0);
+    // Wait beyond Retry-After to catch polling or media loads from the old clip.
+    await page.waitForTimeout(1200);
+    expect(preparations.filter(id => id === 322)).toHaveLength(abandonedRequests);
+    expect(mediaRequests).toEqual([
+      { id: 321, transcode: false }, { id: 321, transcode: true },
+      { id: 322, transcode: false }, { id: 323, transcode: false }
+    ]);
+    expect(preparations).not.toContain(323);
+    await expect(timelinePage.videoPlayer).toHaveAttribute('src', /\/api\/recordings\/play\/323(?:\?|$)/);
   });
 
   test('loads selected recordings mode, reuses batch download modal, and restores selections when refining', async ({ page }) => {
