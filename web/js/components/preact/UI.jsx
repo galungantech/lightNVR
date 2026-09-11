@@ -13,6 +13,7 @@ import dayjs from 'dayjs';
 import utc from 'dayjs/plugin/utc';
 import customParseFormat from 'dayjs/plugin/customParseFormat';
 import { ConfirmDialog } from './common/ModalDialog.jsx';
+import { loadRecordingPlayback } from '../../utils/recording-playback.js';
 
 export { ConfirmDialog } from './common/ModalDialog.jsx';
 
@@ -236,6 +237,7 @@ export function VideoModal({ isOpen, onClose, videoUrl, title, downloadUrl }) {
   const [isFullscreen, setIsFullscreen] = useState(false);
   const [isProtected, setIsProtected] = useState(false);
   const [showDeleteConfirm, setShowDeleteConfirm] = useState(false);
+  const [playbackMessage, setPlaybackMessage] = useState('');
 
   const videoRef = useRef(null);
   const canvasRef = useRef(null);
@@ -259,9 +261,7 @@ export function VideoModal({ isOpen, onClose, videoUrl, title, downloadUrl }) {
       console.log('VideoModal opened, setting up event listeners');
       document.addEventListener('keydown', handleKeyDown);
 
-      // Reset video element when modal opens
       if (videoRef.current) {
-        videoRef.current.load();
         videoRef.current.ondblclick = () => handleToggleFullscreen();
       }
     }
@@ -270,17 +270,6 @@ export function VideoModal({ isOpen, onClose, videoUrl, title, downloadUrl }) {
       console.log('VideoModal cleanup');
       document.removeEventListener('keydown', handleKeyDown);
 
-      // Cleanup video element when component unmounts or modal closes
-      if (videoRef.current) {
-        // Pause and reset video src to stop any ongoing requests
-        try {
-          videoRef.current.pause();
-          videoRef.current.removeAttribute('src');
-          videoRef.current.load();
-        } catch (e) {
-          console.error('Error cleaning up video element:', e);
-        }
-      }
     };
   }, [isOpen, onClose]);
 
@@ -608,12 +597,17 @@ export function VideoModal({ isOpen, onClose, videoUrl, title, downloadUrl }) {
     };
   }, [isOpen, detectionOverlayEnabled, drawDetections, updatePlaybackSeconds]);
 
-  // Handle video URL changes
+  // Own the media source in one effect. Closing/switching aborts preparation
+  // and clears the captured element so stale requests cannot reload a clip.
   useEffect(() => {
-    if (isOpen && videoUrl && videoRef.current) {
-      console.log('Video URL changed, loading new video');
-      videoRef.current.load();
-    }
+    if (!isOpen || !videoUrl || !videoRef.current) return;
+    const video = videoRef.current;
+    setPlaybackMessage('');
+    return loadRecordingPlayback(video, videoUrl, {
+      onPreparing: () => setPlaybackMessage('Preparing a compatible version for this browser…'),
+      onReady: () => setPlaybackMessage(''),
+      onError: error => setPlaybackMessage(error.message),
+    });
   }, [isOpen, videoUrl]);
 
   // Update detection overlay when enabled/disabled
@@ -804,16 +798,14 @@ export function VideoModal({ isOpen, onClose, videoUrl, title, downloadUrl }) {
                 className="w-full h-full object-contain"
                 controls
                 key={videoUrl} /* Add key to force re-render when URL changes */
-                onError={(e) => {
-                  console.error('Video error:', e);
-                  showStatusMessage('Error loading video. Please try again.', 'error');
-                }}
                 onLoadStart={() => console.log('Video load started')}
                 onLoadedData={() => console.log('Video data loaded')}
-              >
-                {/* Use source element instead of src attribute for better control */}
-                {videoUrl && <source src={videoUrl} type="video/mp4" />}
-              </video>
+              />
+              {playbackMessage && (
+                <div role="status" className="absolute inset-0 flex items-center justify-center p-4 text-center text-white bg-black/75">
+                  {playbackMessage}
+                </div>
+              )}
               <canvas
                 ref={canvasRef}
                 className="absolute top-0 left-0 w-full h-full pointer-events-none"
