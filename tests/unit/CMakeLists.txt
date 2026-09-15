@@ -51,6 +51,8 @@ macro(add_layer2_test TEST_NAME)
         find_package(Python3 COMPONENTS Interpreter REQUIRED)
         add_test(NAME test_storage_archive_s3 COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/s3_fixture.py $<TARGET_FILE:test_storage_archive>)
+        add_test(NAME test_storage_archive_operator COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/test_archive_operator.py)
     else()
         add_test(NAME ${TEST_NAME} COMMAND ${TEST_NAME})
     endif()
@@ -247,6 +249,17 @@ if(ENABLE_GO2RTC)
         FAKE_GO2RTC_PATH="$<TARGET_FILE:fake_go2rtc_server>"
     )
     add_dependencies(test_go2rtc_process_lifecycle fake_go2rtc_server)
+    add_layer3_test(test_go2rtc_substream_registration)
+    target_compile_definitions(test_go2rtc_substream_registration PRIVATE
+        FAKE_GO2RTC_PATH="$<TARGET_FILE:fake_go2rtc_server>"
+    )
+    target_link_options(test_go2rtc_substream_registration PRIVATE
+        "-Wl,--wrap=go2rtc_api_add_stream"
+        "-Wl,--wrap=go2rtc_api_add_stream_multi"
+        "-Wl,--wrap=get_stream_config_by_name"
+    )
+    add_dependencies(test_go2rtc_substream_registration fake_go2rtc_server)
+    set_tests_properties(test_go2rtc_substream_registration PROPERTIES TIMEOUT 60)
 endif()
 if(ENABLE_GO2RTC)
     add_layer2_test_with_curl(test_go2rtc_process_config_generation)

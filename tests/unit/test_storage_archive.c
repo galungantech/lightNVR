@@ -253,6 +253,63 @@ static void test_protected_recording_archives_after_ordinary_expiry(void) {
     TEST_ASSERT_EQUAL_INT(1, scalar("SELECT count(*) FROM recordings;"));
 }
 
+static int stop_runaway_lifecycle_query(void *context) {
+    int *callbacks = context;
+    // Count SQLite instructions instead of wall time so slow CI machines use
+    // the same budget. A recording-by-job nested scan exceeds this by far.
+    return ++*callbacks > 2000;
+}
+
+static void test_lifecycle_scheduler_with_large_migration_backlog(void) {
+    uint64_t id = recording(false);
+    storage_target_t target = archive_target("backlog", true);
+    TEST_ASSERT_EQUAL_INT(0, db_storage_target_create(&target));
+    storage_policy_t policy = {0};
+    safe_strcpy(policy.name, "backlog archive", sizeof(policy.name), 0);
+    safe_strcpy(policy.selector_json, "{\"version\":1,\"expression\":{\"op\":\"all\"}}", sizeof(policy.selector_json), 0);
+    safe_strcpy(policy.primary_target_uuid, source_uuid, sizeof(policy.primary_target_uuid), 0);
+    safe_strcpy(policy.migration_target_uuid, target.uuid, sizeof(policy.migration_target_uuid), 0);
+    safe_strcpy(policy.fallback_mode, "pause", sizeof(policy.fallback_mode), 0);
+    policy.enabled = true;
+    policy.required_copy_count = 1;
+    policy.archive_after_seconds = 21600;
+    policy.hot_residency_seconds = 21600;
+    TEST_ASSERT_EQUAL_INT(DB_STORAGE_POLICY_OK, db_storage_policy_create(&policy));
+
+    char query[4096];
+    snprintf(query, sizeof(query),
+        "UPDATE recordings SET storage_policy_uuid='%s',storage_policy_version=%lld WHERE id=%llu;"
+        "WITH RECURSIVE batch(n) AS (VALUES(1) UNION ALL SELECT n+1 FROM batch WHERE n<2000) "
+        "INSERT INTO recordings(stream_name,camera_uuid,file_path,start_time,end_time,size_bytes,"
+        "is_complete,storage_target_uuid,object_key,storage_policy_uuid,storage_policy_version,"
+        "retention_override_days,trigger_type) "
+        "SELECT stream_name,camera_uuid,file_path||'.'||n,start_time,end_time,size_bytes,1,"
+        "storage_target_uuid,'backlog/'||n,storage_policy_uuid,storage_policy_version,-1,trigger_type "
+        "FROM recordings,batch WHERE id=%llu;"
+        "INSERT INTO storage_migration_jobs(uuid,recording_id,source_target_uuid,source_object_key,"
+        "destination_target_uuid,destination_object_key,state,bytes_total) "
+        "SELECT printf('00000000-0000-4000-8000-%%012d',id),id,storage_target_uuid,object_key,"
+        "'%s','archive/'||id,CASE id%%3 WHEN 0 THEN 'failed' WHEN 1 THEN 'cancelled' ELSE 'queued' END,"
+        "size_bytes FROM recordings WHERE id<>%llu;",
+        policy.uuid, (long long)policy.revision, (unsigned long long)id,
+        (unsigned long long)id, target.uuid, (unsigned long long)id);
+    sql(query);
+    TEST_ASSERT_EQUAL_INT(2000, scalar("SELECT count(*) FROM storage_migration_jobs;"));
+
+    int callbacks = 0;
+    sqlite3_progress_handler(get_db_handle(), 1000, stop_runaway_lifecycle_query, &callbacks);
+    int scheduled = db_storage_lifecycle_schedule(16);
+    sqlite3_progress_handler(get_db_handle(), 0, NULL, NULL);
+    TEST_ASSERT_EQUAL_INT_MESSAGE(1, scheduled,
+        "Scheduling must not scan every migration job for each recording");
+    // Failed/cancelled transfers remain excluded, just as queued transfers do.
+    // Only the one recording without any existing job should be scheduled.
+    TEST_ASSERT_EQUAL_INT(2001, scalar("SELECT count(*) FROM storage_migration_jobs;"));
+    snprintf(query, sizeof(query), "SELECT count(*) FROM storage_migration_jobs WHERE recording_id=%llu;",
+             (unsigned long long)id);
+    TEST_ASSERT_EQUAL_INT(1, scalar(query));
+}
+
 static void test_failed_delete_retains_inventory_until_retry(void) {
     uint64_t id = recording(false);
     storage_target_t target = archive_target("delete-retry", true);
@@ -845,6 +902,118 @@ static void test_archive_credentials_require_private_regular_files(void) {
     TEST_ASSERT_EQUAL_INT(STORAGE_S3_ERROR, symlinked);
 }
 
+static void write_lifecycle_attestation(const storage_target_t *target, double checked_at,
+                                        const char *xml, char path[1024]) {
+    snprintf(path, 1024, "%s/%s.lifecycle.json",
+             getenv("LIGHTNVR_ARCHIVE_CREDENTIALS_DIR"), target->credential_ref);
+    cJSON *json = cJSON_CreateObject();
+    cJSON_AddStringToObject(json, "endpoint", target->endpoint);
+    cJSON_AddStringToObject(json, "region", target->region);
+    cJSON_AddStringToObject(json, "bucket", target->bucket);
+    cJSON_AddNumberToObject(json, "checked_at", checked_at);
+    cJSON_AddStringToObject(json, "lifecycle_configuration_xml", xml);
+    char *encoded = cJSON_PrintUnformatted(json);
+    cJSON_Delete(json);
+    FILE *file = fopen(path, "w");
+    TEST_ASSERT_NOT_NULL(file);
+    fputs(encoded, file);
+    fclose(file);
+    free(encoded);
+    TEST_ASSERT_EQUAL_INT(0, chmod(path, 0600));
+}
+
+static void test_scoped_credentials_use_fresh_operator_lifecycle_inspection(void) {
+    storage_target_t target = archive_target("scoped-lifecycle", true);
+    TEST_ASSERT_NOT_EQUAL_INT(0, storage_s3_probe(&target, true));
+    TEST_ASSERT_NOT_NULL(strstr(target.last_error, "operator-verified"));
+    char path[1024];
+    write_lifecycle_attestation(&target, time(NULL),
+        "<LifecycleConfiguration><Rule><ID>abort</ID><Status>Enabled</Status>"
+        "<AbortIncompleteMultipartUpload><DaysAfterInitiation>7</DaysAfterInitiation>"
+        "</AbortIncompleteMultipartUpload></Rule></LifecycleConfiguration>", path);
+    uint64_t id = recording(true);
+    storage_migration_job_t job = move_recording(id, &target);
+    unlink(path);
+    TEST_ASSERT_EQUAL_STRING("completed", job.state);
+    TEST_ASSERT_NOT_EQUAL_INT(0, access(source_path, F_OK));
+    assert_storage_state(id, "archived", 1, true, "inherit");
+    TEST_ASSERT_NOT_EQUAL_INT(0, storage_s3_probe(&target, false));
+    TEST_ASSERT_EQUAL_STRING("unavailable", target.health_status);
+}
+
+static void test_lifecycle_attestation_rejects_stale_mismatched_and_unsafe_files(void) {
+    storage_target_t target = archive_target("scoped-lifecycle", true);
+    const char *empty = "<LifecycleConfiguration/>";
+    char path[1024];
+    const double ages[] = {3601, -60, 86400};
+    for (size_t i = 0; i < sizeof(ages)/sizeof(ages[0]); i++) {
+        write_lifecycle_attestation(&target, (double)time(NULL) - ages[i], empty, path);
+        int result = storage_s3_probe(&target, false);
+        unlink(path);
+        TEST_ASSERT_NOT_EQUAL_INT(0, result);
+    }
+    for (int field = 0; field < 3; field++) {
+        storage_target_t other = target;
+        if (field == 0) safe_strcpy(other.bucket, "another-bucket", sizeof(other.bucket), 0);
+        if (field == 1) safe_strcpy(other.region, "another-region", sizeof(other.region), 0);
+        if (field == 2) safe_strcpy(other.endpoint, "https://another-provider.invalid", sizeof(other.endpoint), 0);
+        write_lifecycle_attestation(&other, time(NULL), empty, path);
+        int result = storage_s3_probe(&target, false);
+        unlink(path);
+        TEST_ASSERT_NOT_EQUAL_INT(0, result);
+    }
+    const char *unsafe[] = {"garbage", "<WrongRoot/>",
+        "<LifecycleConfiguration><Rule><Expiration><Days>1</Days></Expiration></Rule></LifecycleConfiguration>",
+        "<LifecycleConfiguration><Rule><AbortIncompleteMultipartUpload><DaysAfterInitiation>8</DaysAfterInitiation></AbortIncompleteMultipartUpload></Rule></LifecycleConfiguration>"};
+    for (size_t i = 0; i < sizeof(unsafe)/sizeof(unsafe[0]); i++) {
+        write_lifecycle_attestation(&target, time(NULL), unsafe[i], path);
+        int result = storage_s3_probe(&target, false);
+        unlink(path);
+        TEST_ASSERT_NOT_EQUAL_INT(0, result);
+    }
+    write_lifecycle_attestation(&target, time(NULL), empty, path);
+    TEST_ASSERT_EQUAL_INT(0, chmod(path, 0644));
+    int public_mode = storage_s3_probe(&target, false);
+    TEST_ASSERT_EQUAL_INT(0, chmod(path, 0600));
+    char moved[1100];
+    snprintf(moved, sizeof(moved), "%s.actual", path);
+    TEST_ASSERT_EQUAL_INT(0, rename(path, moved));
+    TEST_ASSERT_EQUAL_INT(0, symlink(moved, path));
+    int symlinked = storage_s3_probe(&target, false);
+    unlink(path);
+    unlink(moved);
+    TEST_ASSERT_NOT_EQUAL_INT(0, public_mode);
+    TEST_ASSERT_NOT_EQUAL_INT(0, symlinked);
+}
+
+static void test_s3_nested_keys_preserve_slashes_and_escape_literal_percent(void) {
+    storage_target_t target = archive_target("key-encoding", true);
+    char checksum[65], error[256];
+    unsigned char digest[32];
+    TEST_ASSERT_EQUAL_INT(0, mbedtls_sha256((const unsigned char *)payload, strlen(payload), digest, 0));
+    for (int i = 0; i < 32; i++) snprintf(checksum + i * 2, 3, "%02x", digest[i]);
+    recording(false);
+    const char *key = "folder with spaces/literal%2F-plus+question?.mp4";
+    TEST_ASSERT_EQUAL_INT(0, storage_s3_upload(&target, key, source_path, checksum, NULL, error));
+    TEST_ASSERT_EQUAL_INT(0, storage_s3_verify(&target, key, strlen(payload), checksum, NULL, error));
+    uint64_t bytes;
+    TEST_ASSERT_EQUAL_INT(STORAGE_S3_MISSING, storage_s3_stat(&target,
+        "folder with spaces/literal/-plus+question?.mp4", &bytes, error));
+    TEST_ASSERT_EQUAL_INT(0, storage_s3_delete(&target, key, error));
+}
+
+static void test_lifecycle_attestation_cannot_override_provider_checks(void) {
+    const char *buckets[] = {"versioned", "expiry", "lifecycle-unavailable", "public"};
+    for (size_t i = 0; i < sizeof(buckets)/sizeof(buckets[0]); i++) {
+        storage_target_t target = archive_target(buckets[i], true);
+        char path[1024];
+        write_lifecycle_attestation(&target, time(NULL), "<LifecycleConfiguration/>", path);
+        int result = storage_s3_probe(&target, true);
+        unlink(path);
+        TEST_ASSERT_NOT_EQUAL_INT(0, result);
+    }
+}
+
 static void test_legacy_age_cleanup_honors_archive_retention_override(void) {
     uint64_t id = recording(true);
     storage_target_t target = archive_target("legacy-retention", true);
@@ -1281,6 +1450,7 @@ int main(void) {
     RUN_TEST(test_verified_archive_and_retrieval);
     RUN_TEST(test_verification_failure_preserves_source);
     RUN_TEST(test_protected_recording_archives_after_ordinary_expiry);
+    RUN_TEST(test_lifecycle_scheduler_with_large_migration_backlog);
     RUN_TEST(test_failed_delete_retains_inventory_until_retry);
     RUN_TEST(test_unsafe_bucket_configuration_rejected);
     RUN_TEST(test_multipart_resume_after_restart);
@@ -1301,6 +1471,10 @@ int main(void) {
     RUN_TEST(test_s3_configuration_api_and_archive_budget);
     RUN_TEST(test_multipart_cancellation_aborts_owned_upload_and_preserves_source);
     RUN_TEST(test_archive_credentials_require_private_regular_files);
+    RUN_TEST(test_scoped_credentials_use_fresh_operator_lifecycle_inspection);
+    RUN_TEST(test_lifecycle_attestation_rejects_stale_mismatched_and_unsafe_files);
+    RUN_TEST(test_lifecycle_attestation_cannot_override_provider_checks);
+    RUN_TEST(test_s3_nested_keys_preserve_slashes_and_escape_literal_percent);
     RUN_TEST(test_batch_export_waits_for_verified_archive_source);
     RUN_TEST(test_legacy_age_cleanup_honors_archive_retention_override);
     RUN_TEST(test_expired_multipart_upload_restarts_from_source);
