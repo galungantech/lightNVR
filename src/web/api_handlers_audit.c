@@ -2,7 +2,6 @@
 
 #include <cjson/cJSON.h>
 #include <errno.h>
-#include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -12,16 +11,7 @@
 #include "utils/strings.h"
 #include "web/api_handlers_audit.h"
 #include "web/audit_log.h"
-#include "web/audit_summary.h"
 #include "web/httpd_utils.h"
-
-/* Serializes handle_put_audit_settings() from reading the previous decision
- * modes through persisting/swapping them and building the response, so two
- * concurrent PUTs cannot race on the previous->next diff or observe a
- * response snapshot from a request other than their own. Nothing else takes
- * this mutex; it is always acquired before the summary mutex (audit_summary.c)
- * and the database mutex, never after. */
-static pthread_mutex_t audit_settings_put_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 static bool authorize_audit_admin(const http_request_t *req,
                                   http_response_t *res, user_t *user) {
@@ -89,8 +79,6 @@ static bool parse_audit_query(const http_request_t *req, audit_query_t *query,
                     sizeof(query->target_uuid));
     read_text_query(req, "request_id", query->request_id,
                     sizeof(query->request_id));
-    read_text_query(req, "event_type", query->event_type,
-                    sizeof(query->event_type));
     return true;
 }
 
@@ -188,16 +176,9 @@ void handle_get_audit_events(const http_request_t *req, http_response_t *res) {
 
 static void csv_cell(FILE *stream, const char *value) {
     fputc('"', stream);
-    if (value) {
-        const char *cursor = value;
-        while (*cursor &&
-               ((unsigned char)*cursor <= 0x20 || (unsigned char)*cursor == 0x7f)) {
-            cursor++;
-        }
-        if (*cursor && strchr("=+-@", *cursor)) {
-            /* Keep spreadsheet applications from interpreting exported cells. */
-            fputc('\'', stream);
-        }
+    if (value && strchr("=+-@", value[0])) {
+        /* Keep spreadsheet applications from interpreting exported cells. */
+        fputc('\'', stream);
     }
     for (const char *cursor = value ? value : ""; *cursor; cursor++) {
         if (*cursor == '"') fputc('"', stream);
@@ -279,50 +260,19 @@ void handle_get_audit_export(const http_request_t *req, http_response_t *res) {
     db_audit_page_free(&page);
 }
 
-static void respond_audit_settings(http_response_t *res, int retention_days,
-                                   int pruned_events, bool include_pruned) {
-    cJSON *root = cJSON_CreateObject();
-    cJSON *modes = root ? cJSON_AddArrayToObject(root, "allowed_decision_modes") : NULL;
-    int count = 0;
-    const authorization_action_metadata_t *catalog = authorization_action_catalog(&count);
-    if (!root || !modes || !catalog) {
-        cJSON_Delete(root);
-        http_response_set_json_error(res, 500, "Failed to create response");
-        return;
-    }
-    cJSON_AddNumberToObject(root, "retention_days", retention_days);
-    cJSON_AddNumberToObject(root, "summary_window_seconds", AUDIT_SUMMARY_WINDOW_SECONDS);
-    if (include_pruned) cJSON_AddNumberToObject(root, "pruned_events", pruned_events);
-    for (int i = 0; i < count; i++) {
-        cJSON *item = cJSON_CreateObject();
-        if (!item) continue;
-        cJSON_AddStringToObject(item, "action", catalog[i].key);
-        cJSON_AddStringToObject(item, "category", catalog[i].category);
-        cJSON_AddStringToObject(item, "description", catalog[i].description);
-        cJSON_AddStringToObject(item, "mode", audit_decision_mode_name(
-            audit_log_get_decision_mode(catalog[i].action)));
-        cJSON_AddItemToArray(modes, item);
-    }
-    char *body = cJSON_PrintUnformatted(root);
-    cJSON_Delete(root);
-    if (!body) {
-        http_response_set_json_error(res, 500, "Failed to serialize response");
-        return;
-    }
-    http_response_set_json(res, 200, body);
-    free(body);
-}
-
 void handle_get_audit_settings(const http_request_t *req,
                                http_response_t *res) {
     user_t user;
     if (!authorize_audit_admin(req, res, &user)) return;
     int retention_days = 0;
     if (db_audit_get_retention_days(&retention_days) != 0) {
-        http_response_set_json_error(res, 500, "Failed to load audit settings");
+        http_response_set_json_error(res, 500,
+                                     "Failed to load audit settings");
         return;
     }
-    respond_audit_settings(res, retention_days, 0, false);
+    char body[96];
+    snprintf(body, sizeof(body), "{\"retention_days\":%d}", retention_days);
+    http_response_set_json(res, 200, body);
 }
 
 void handle_put_audit_settings(const http_request_t *req,
@@ -330,169 +280,47 @@ void handle_put_audit_settings(const http_request_t *req,
     user_t user;
     if (!authorize_audit_admin(req, res, &user)) return;
     cJSON *body = httpd_parse_json_body(req);
-    if (!cJSON_IsObject(body)) {
+    cJSON *retention = cJSON_IsObject(body)
+        ? cJSON_GetObjectItemCaseSensitive(body, "retention_days") : NULL;
+    double number = cJSON_IsNumber(retention) ? retention->valuedouble : 0;
+    int retention_days = (int)number;
+    if (!cJSON_IsNumber(retention) || number != retention_days ||
+        retention_days < 1 || retention_days > AUDIT_RETENTION_MAX_DAYS) {
         cJSON_Delete(body);
-        http_response_set_json_error(res, 400, "Audit settings body must be a JSON object");
+        http_response_set_json_error(res, 400,
+                                     "retention_days must be 1-3650");
         return;
     }
-    const cJSON *retention = cJSON_GetObjectItemCaseSensitive(body, "retention_days");
-    const cJSON *modes_json = cJSON_GetObjectItemCaseSensitive(body, "allowed_decision_modes");
-    if (!retention && !modes_json) {
+    int previous_days = AUDIT_RETENTION_DEFAULT_DAYS;
+    db_audit_get_retention_days(&previous_days);
+    if (db_audit_set_retention_days(retention_days) != 0) {
         cJSON_Delete(body);
-        http_response_set_json_error(res, 400, "Provide retention_days, allowed_decision_modes, or both");
+        http_response_set_json_error(res, 500,
+                                     "Failed to save audit settings");
         return;
     }
-
-    /* Validate everything before saving anything. */
-    int retention_days = 0;
-    if (retention) {
-        double number = cJSON_IsNumber(retention) ? retention->valuedouble : 0;
-        retention_days = (int)number;
-        if (!cJSON_IsNumber(retention) || number != retention_days ||
-            retention_days < 1 || retention_days > AUDIT_RETENTION_MAX_DAYS) {
-            cJSON_Delete(body);
-            http_response_set_json_error(res, 400, "retention_days must be 1-3650");
-            return;
-        }
-    }
-    /* Everything from here through the response below is serialized: see the
-     * comment on audit_settings_put_mutex above. */
-    pthread_mutex_lock(&audit_settings_put_mutex);
-
-    cJSON *changes = NULL;
     int deleted_count = 0;
-
-    audit_decision_mode_t previous[AUTHZ_ACTION_COUNT];
-    audit_decision_mode_t next[AUTHZ_ACTION_COUNT];
-    for (int i = 0; i < AUTHZ_ACTION_COUNT; i++) {
-        previous[i] = next[i] = audit_log_get_decision_mode((authorization_action_t)i);
-    }
-    if (modes_json) {
-        if (!cJSON_IsObject(modes_json)) {
-            cJSON_Delete(body);
-            http_response_set_json_error(res, 400, "allowed_decision_modes must be an object");
-            goto unlock_and_return;
-        }
-        for (const cJSON *item = modes_json->child; item; item = item->next) {
-            char message[160];
-            authorization_action_t action = authorization_action_from_key(item->string);
-            if (action == AUTHZ_ACTION_INVALID) {
-                snprintf(message, sizeof(message), "Unknown audit action: %s",
-                         item->string ? item->string : "");
-                cJSON_Delete(body);
-                http_response_set_json_error(res, 400, message);
-                goto unlock_and_return;
-            }
-            audit_decision_mode_t mode;
-            if (!cJSON_IsString(item) ||
-                audit_decision_mode_from_name(item->valuestring, &mode) != 0) {
-                snprintf(message, sizeof(message), "Invalid audit decision mode for %s",
-                         item->string);
-                cJSON_Delete(body);
-                http_response_set_json_error(res, 400, message);
-                goto unlock_and_return;
-            }
-            next[action] = mode;
-        }
-    }
-
-    if (retention) {
-        int previous_days = AUDIT_RETENTION_DEFAULT_DAYS;
-        if (db_audit_get_retention_days(&previous_days) != 0) {
-            cJSON_Delete(body);
-            http_response_set_json_error(res, 500, "Failed to load audit settings");
-            goto unlock_and_return;
-        }
-        if (db_audit_set_retention_days(retention_days) != 0) {
-            cJSON_Delete(body);
-            http_response_set_json_error(res, 500, "Failed to save audit settings");
-            goto unlock_and_return;
-        }
-        if (db_audit_prune(&deleted_count) != 0) {
-            cJSON_Delete(body);
-            http_response_set_json_error(res, 500, "Audit setting saved but pruning failed");
-            goto unlock_and_return;
-        }
-        cJSON *details = cJSON_CreateObject();
-        if (details) {
-            cJSON_AddStringToObject(details, "event_type", "audit.retention_update");
-            cJSON_AddNumberToObject(details, "previous_days", previous_days);
-            cJSON_AddNumberToObject(details, "retention_days", retention_days);
-            cJSON_AddNumberToObject(details, "pruned_events", deleted_count);
-        }
-        audit_log_append(req, &user, "audit.retention.update", "audit_log", NULL,
-                         "success", details);
-        cJSON_Delete(details);
-    } else if (db_audit_get_retention_days(&retention_days) != 0) {
+    if (db_audit_prune(&deleted_count) != 0) {
         cJSON_Delete(body);
-        http_response_set_json_error(res, 500, "Failed to load audit settings");
-        goto unlock_and_return;
+        http_response_set_json_error(res, 500,
+                                     "Audit setting saved but pruning failed");
+        return;
     }
-
-    changes = cJSON_CreateArray();
-    int count = 0;
-    const authorization_action_metadata_t *catalog = authorization_action_catalog(&count);
-    if (!changes) {
-        /* Allocation failure must not silently drop a validated mode change:
-         * without the array we cannot build the audit event, so fail hard
-         * rather than fall through to a 200 that never persisted it. */
-        for (int i = 0; catalog && i < count; i++) {
-            if (previous[catalog[i].action] != next[catalog[i].action]) {
-                cJSON_Delete(body);
-                http_response_set_json_error(res, 500, "Failed to create response");
-                goto unlock_and_return;
-            }
-        }
+    cJSON *details = cJSON_CreateObject();
+    if (details) {
+        cJSON_AddStringToObject(details, "event_type",
+                                "audit.retention_update");
+        cJSON_AddNumberToObject(details, "previous_days", previous_days);
+        cJSON_AddNumberToObject(details, "retention_days", retention_days);
+        cJSON_AddNumberToObject(details, "pruned_events", deleted_count);
     }
-    for (int i = 0; changes && catalog && i < count; i++) {
-        authorization_action_t action = catalog[i].action;
-        if (previous[action] == next[action]) continue;
-        cJSON *change = cJSON_CreateObject();
-        if (!change ||
-            !cJSON_AddStringToObject(change, "action", catalog[i].key) ||
-            !cJSON_AddStringToObject(change, "previous", audit_decision_mode_name(previous[action])) ||
-            !cJSON_AddStringToObject(change, "mode", audit_decision_mode_name(next[action])) ||
-            !cJSON_AddItemToArray(changes, change)) {
-            cJSON_Delete(change);
-            cJSON_Delete(changes);
-            changes = NULL;
-            cJSON_Delete(body);
-            http_response_set_json_error(res, 500, "Failed to create response");
-            goto unlock_and_return;
-        }
-    }
-    if (changes && cJSON_GetArraySize(changes) > 0) {
-        /* Build the audit event before publishing the modes: an allocation
-         * failure here must not leave the new modes live with an event that
-         * omits the changes that produced them. */
-        cJSON *details = cJSON_CreateObject();
-        if (!details ||
-            !cJSON_AddStringToObject(details, "event_type", "audit.decision_modes.update") ||
-            !cJSON_AddItemToObject(details, "changes", changes)) {
-            cJSON_Delete(details);
-            cJSON_Delete(changes);
-            changes = NULL;
-            cJSON_Delete(body);
-            http_response_set_json_error(res, 500, "Failed to create response");
-            goto unlock_and_return;
-        }
-        changes = NULL; /* details owns the array now */
-        if (audit_log_set_decision_modes(next) != 0) {
-            cJSON_Delete(details);
-            cJSON_Delete(body);
-            http_response_set_json_error(res, 500, "Failed to save audit decision modes");
-            goto unlock_and_return;
-        }
-        audit_log_append(req, &user, "audit.settings.update", "audit_log", NULL,
-                         "success", details);
-        cJSON_Delete(details);
-    }
-    cJSON_Delete(changes);
-    changes = NULL;
+    audit_log_append(req, &user, "audit.retention.update", "audit_log", NULL,
+                     "success", details);
+    cJSON_Delete(details);
     cJSON_Delete(body);
-    body = NULL;
-    respond_audit_settings(res, retention_days, deleted_count, retention != NULL);
-
-unlock_and_return:
-    pthread_mutex_unlock(&audit_settings_put_mutex);
+    char response_body[128];
+    snprintf(response_body, sizeof(response_body),
+             "{\"retention_days\":%d,\"pruned_events\":%d}",
+             retention_days, deleted_count);
+    http_response_set_json(res, 200, response_body);
 }

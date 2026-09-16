@@ -291,7 +291,6 @@ optional query parameters:
 | `since`, `until` | Inclusive Unix timestamp bounds |
 | `principal_user_id` | Exact local user ID |
 | `action`, `outcome` | Exact action and outcome (`allowed`, `denied`, `success`, `failure`, or `error`) |
-| `event_type` | Exact `details.event_type` value (for example `authorization.summary`) |
 | `target_uuid`, `request_id` | Exact target or correlation ID |
 
 The response contains `page`, `page_size`, page `count`, complete filtered
@@ -308,73 +307,24 @@ Accepts the same filters and pagination contract and returns CSV. The filtered
 total is exposed as `X-Total-Count`. CSV cells are quoted and spreadsheet
 formula prefixes are neutralized.
 
-#### Manage audit settings
+#### Manage audit retention
 
 ```
 GET /api/audit/settings
 PUT /api/audit/settings
 ```
 
-Requires `system.admin`.
-
-`GET` returns the retention period, the summary window, and how allowed
-decisions are recorded for each authorization action, in catalog order:
+Requires `system.admin`. `PUT` accepts an integer retention period from 1 to
+3650 days and prunes already-expired records immediately:
 
 ```json
 {
-  "retention_days": 365,
-  "summary_window_seconds": 900,
-  "allowed_decision_modes": [
-    {
-      "action": "live.view",
-      "category": "Live video",
-      "description": "View a camera live stream",
-      "mode": "record"
-    }
-  ]
+  "retention_days": 365
 }
 ```
 
-`PUT` accepts either field or both. The whole body is validated before
-anything is saved; an unknown action, an invalid mode, or a retention outside
-1–3650 days returns `400` and changes nothing.
-
-```json
-{
-  "retention_days": 90,
-  "allowed_decision_modes": { "live.view": "summarize", "system.admin": "off" }
-}
-```
-
-The response is the `GET` object, plus `pruned_events` when `retention_days`
-was included. Lowering retention prunes already-expired records immediately.
-The default is 365 days, and routine audit writes perform an at-most-hourly
-expiry check, so retention does not depend on a separate scheduler.
-
-**Decision modes** apply only to *allowed* decisions on read-only requests
-(`GET`, `HEAD`):
-
-| Mode | Effect |
-|---|---|
-| `record` (default) | One audit event per decision, as before. |
-| `summarize` | Normally one event per user, action, target, and client address per 15-minute window, with `details.event_type` `authorization.summary` and `count`, `first_at`, `last_at`, `window_seconds`, and the first request's `method`, `path`, `decision_source`, and `explanation`. |
-| `off` | No event. |
-
-Always recorded regardless of mode: denied and error decisions, any request
-that changes state (`POST`, `PUT`, `PATCH`, `DELETE`), sign-ins, and operation
-outcomes. Changing modes records an `audit.settings.update` event. Summaries
-are written when their window closes, when modes change, when the summary
-table fills, and at shutdown; a crash can lose up to one window of summary
-counts.
-
-Summary authentication method and scoped-token UUID are taken from the first
-request; changing credentials does not create a separate summary group.
-
-`GET /api/audit/events` and its CSV export also accept `event_type`, matching
-`details.event_type` exactly (for example `authorization.summary`). This
-filter scans each row's stored details rather than using an index, so combine
-it with `since`/`until` on large histories to avoid a slow, lock-holding
-query.
+The default is 365 days. Routine audit writes perform an at-most-hourly expiry
+check, so retention does not depend on a separate scheduler.
 
 Administrators can browse this history from **Users → Audit History**. The
 responsive workspace keeps filters server-side, shows structured details on
