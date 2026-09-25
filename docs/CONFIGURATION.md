@@ -136,6 +136,18 @@ performance class, reserved headroom, watermarks, cached capacity, and health.
 Enabled roots must already be mounted and writable. lightNVR does not mount
 remote shares or store share credentials.
 
+**Adding a target does not by itself change where anything is recorded.** A
+target is inventory: new segments keep going to the default target until a
+camera placement policy routes cameras to the new target, either as the
+policy's primary target (or a pool containing it) or as its archive target
+with an age or pressure trigger. A passing **Test target** only proves the
+directory is writable. Two more things keep a target idle even with a policy:
+the target must be `healthy` (a target above its high watermark or inside its
+reserve is `degraded` and is skipped), and footage recorded before the policy
+existed is not attributed to it, so only new segments are affected. When a
+policy's primary target is skipped, the log reports
+`Storage policy "<name>": primary not eligible (...)` with the reason.
+
 Storage pools and selector-driven lifecycle policies are managed on the same
 page. A pool can allocate by most-free, round-robin, or explicit priority.
 Policies may place new segments into a pool, require distinct verified copies,
@@ -227,7 +239,11 @@ mp4_retention_days = 30
 
 - `path`: Directory where recordings are stored
 - `max_size`: Maximum storage size in bytes (0 means unlimited)
-- `retention_days`: Number of days to keep recordings
+- `retention_days`: Number of days to keep recordings. Age-based retention
+  applies to every configured camera, enabled or disabled (deleting a camera
+  from the UI without "permanent" only disables it), and to recordings whose
+  camera was permanently deleted; per-camera overrides still apply, and
+  protected recordings are never expired by age.
 - `auto_delete_oldest`: Whether to automatically delete the oldest recordings when storage is full
 - `record_mp4_directly`: Enable direct MP4 recording (instead of HLS-to-MP4 conversion)
 - `mp4_path`: Directory for direct MP4 recordings
@@ -242,6 +258,7 @@ mp4_retention_days = 30
 path = /var/lib/lightnvr/data/database/lightnvr.db
 startup_check = off
 backup_retention_count = 6
+backup_verify = full
 ```
 
 - `path`: Path to the SQLite database file
@@ -257,6 +274,16 @@ backup_retention_count = 6
 - `backup_retention_count`: Number of timestamped backups to retain (default: 6).
   Each backup is a full copy of the database, so this multiplies disk usage by
   the database size.
+- `backup_verify`: Scan applied to the copied file after each backup before it
+  is published (default: `full`). `full` runs `PRAGMA integrity_check`, which
+  also cross-checks every index against its table and seeks across the whole
+  file; on a large database over a mechanical disk that scan can take longer
+  than the copy and may hit the 30-minute stuck-backup safety valve, in which
+  case the backup is discarded. `quick` runs `PRAGMA quick_check`, which
+  validates page structure (torn or truncated pages, corrupted b-trees) with
+  far fewer seeks; the backup is a page-level copy of a consistent snapshot, so
+  index/table consistency is inherited from the source. `off` skips the scan.
+  Every mode logs `Backup verification (<mode>) ... in N s`.
 
 ### Web Server Settings
 

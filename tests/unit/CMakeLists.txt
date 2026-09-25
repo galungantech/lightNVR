@@ -148,6 +148,7 @@ target_compile_definitions(test_onvif_lpr_event PRIVATE
     TEST_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}"
 )
 add_layer2_test_with_ffmpeg(test_api_detection)
+add_layer2_test_with_ffmpeg(test_ffmpeg_rgb24_padding)
 add_layer2_test_with_curl(test_url_utils)
 add_layer2_test(test_db_streams)
 add_layer2_test(test_db_detection_engines)
@@ -172,6 +173,7 @@ add_layer2_test(test_api_handlers_investigation_bookmarks)
 add_layer2_test(test_db_camera_collections)
 add_layer2_test(test_api_handlers_camera_collections)
 add_layer2_test(test_db_recordings_extended)
+add_layer2_test(test_api_handlers_recordings_list)
 add_layer2_test(test_recording_transcode)
 add_layer2_test(test_api_handlers_recordings_playback)
 target_link_options(test_api_handlers_recordings_playback PRIVATE
@@ -186,6 +188,7 @@ target_link_options(test_api_handlers_recordings_playback PRIVATE
 add_layer2_test(test_storage_manager_retention)
 add_layer2_test(test_storage_target_pressure_cleanup)
 add_layer2_test(test_storage_migration)
+add_layer2_test(test_storage_deletion_ledger)   # Layer 2: deletion ledger scoping, pruning, indexes
 if(ENABLE_S3_ARCHIVE)
     add_layer2_test(test_storage_archive)
     target_link_options(test_storage_archive PRIVATE "-Wl,--wrap=uv_timer_start")
@@ -261,6 +264,16 @@ if(ENABLE_GO2RTC)
     )
     add_dependencies(test_go2rtc_substream_registration fake_go2rtc_server)
     set_tests_properties(test_go2rtc_substream_registration PROPERTIES TIMEOUT 60)
+    add_layer3_test(test_go2rtc_unregister_recovery)
+    target_compile_definitions(test_go2rtc_unregister_recovery PRIVATE
+        FAKE_GO2RTC_PATH="$<TARGET_FILE:fake_go2rtc_server>"
+    )
+    target_link_options(test_go2rtc_unregister_recovery PRIVATE
+        "-Wl,--wrap=go2rtc_api_delete_preload"
+        "-Wl,--wrap=go2rtc_api_remove_stream"
+    )
+    add_dependencies(test_go2rtc_unregister_recovery fake_go2rtc_server)
+    set_tests_properties(test_go2rtc_unregister_recovery PROPERTIES TIMEOUT 60)
 endif()
 if(ENABLE_GO2RTC)
     add_layer2_test_with_curl(test_go2rtc_process_config_generation)
