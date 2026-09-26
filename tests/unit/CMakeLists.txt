@@ -148,7 +148,25 @@ target_compile_definitions(test_onvif_lpr_event PRIVATE
     TEST_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}"
 )
 add_layer2_test_with_ffmpeg(test_api_detection)
+add_layer2_test_with_ffmpeg(test_mp4_failed_open_memory)
 add_layer2_test_with_ffmpeg(test_ffmpeg_rgb24_padding)
+if(TARGET lightnvr-ffmpeg-guard)
+    add_executable(test_ffmpeg_guard_probe ffmpeg_guard_probe.c)
+    set_target_properties(test_ffmpeg_guard_probe PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
+    if(CMAKE_BUILD_TYPE STREQUAL "Debug" AND
+       CMAKE_C_COMPILER_ID MATCHES "GNU|Clang" AND
+       CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+        target_compile_options(test_ffmpeg_guard_probe PRIVATE
+            -fno-sanitize=address,undefined)
+        target_link_options(test_ffmpeg_guard_probe PRIVATE
+            -fno-sanitize=address,undefined)
+    endif()
+    add_test(NAME test_ffmpeg_guard COMMAND sh
+        "${CMAKE_CURRENT_SOURCE_DIR}/test_ffmpeg_guard.sh"
+        "$<TARGET_FILE:lightnvr-ffmpeg-guard>"
+        "$<TARGET_FILE:test_ffmpeg_guard_probe>")
+endif()
 add_layer2_test_with_curl(test_url_utils)
 add_layer2_test(test_db_streams)
 add_layer2_test(test_db_detection_engines)
