@@ -8,6 +8,7 @@
 #include <time.h>
 #include <sqlite3.h>
 #include <pthread.h>
+#include <stdatomic.h>
 #include <unistd.h>
 #include <sys/stat.h>
 #include <sys/types.h>
@@ -20,12 +21,36 @@
 #include "database/db_core.h"
 #include "database/db_backup.h"
 #include "database/db_schema_utils.h"
+#include "core/config.h"
 #include "core/logger.h"
 #include "core/shutdown_coordinator.h"
 
 // Flag to indicate if a backup is in progress
 static bool backup_in_progress = false;
 static pthread_mutex_t backup_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+/* Cancels the in-flight abortable backup without the process-wide restart/
+ * shutdown flag. shutdown_database() raises it while it waits for the
+ * scheduled-backup worker during a settings-driven database restart -- the
+ * process keeps running there, so request_background_abort() (never reset,
+ * and it also disables periodic service self-healing) must not be used --
+ * and clears it again once the worker is idle. */
+static atomic_bool backup_cancel_requested = false;
+
+void db_backup_request_cancel(void) {
+    atomic_store(&backup_cancel_requested, true);
+}
+
+void db_backup_clear_cancel(void) {
+    atomic_store(&backup_cancel_requested, false);
+}
+
+/* Every abort point of an abortable backup honours both the process-wide
+ * restart/shutdown request and the database-restart cancel above. */
+static bool backup_abort_requested(void) {
+    return is_background_abort_requested() ||
+           atomic_load(&backup_cancel_requested);
+}
 
 /* Copy in bounded batches so a large database backup cannot populate the
  * container's entire page cache in one sqlite3_backup_step() call.  At the
@@ -36,14 +61,16 @@ static pthread_mutex_t backup_mutex = PTHREAD_MUTEX_INITIALIZER;
 #define BACKUP_VERIFY_PROGRESS_OPS 100000
 
 /* Safety valve for a scheduled backup that never finishes.
- * maybe_run_scheduled_database_backup() runs synchronously on the main loop
- * thread, so a hung copy or verification step blocks all other periodic
- * maintenance (service self-healing, further backup scheduling) indefinitely
- * -- the only existing abort point is an explicit restart/shutdown request,
- * which may never come. 30 minutes gives wide margin above the largest
- * normal backup+verify cycle observed in production (~12 minutes for a 3GB
- * database) while still bounding a truly stuck run instead of it silently
- * blocking every subsequent scheduled backup for hours. */
+ * The scheduled cycle runs on a dedicated worker thread (see
+ * maybe_run_scheduled_database_backup()), so a hung copy or verification
+ * step no longer stalls the main loop -- but the scheduler refuses to start
+ * another cycle while one is in flight, and shutdown_database() has to wait
+ * for the worker, so a stuck run would still silently suppress every
+ * subsequent scheduled backup: the only other abort point is an explicit
+ * restart/shutdown request, which may never come. 30 minutes gives wide
+ * margin above the largest normal backup+verify cycle observed in
+ * production (~12 minutes for a 3GB database) while still bounding a truly
+ * stuck run instead of it blocking scheduled backups for hours. */
 static int g_backup_max_duration_seconds = DB_BACKUP_MAX_DURATION_SECONDS_DEFAULT;
 
 /* Test-only: not declared in the public header (would otherwise let
@@ -124,7 +151,7 @@ static int progress_during_verification(void *opaque) {
      * itself responsive to a pending restart/shutdown or a stuck-backup
      * timeout. */
     if (progress && progress->abortable) {
-        if (is_background_abort_requested()) {
+        if (backup_abort_requested()) {
             return 1;
         }
         if (backup_deadline_exceeded(progress->deadline)) {
@@ -239,9 +266,12 @@ static int sync_parent_directory(const char *path) {
     return 0;
 }
 
-static int run_integrity_check(sqlite3 *db_handle, const char *path_label) {
+/* Run a SQLite self-check pragma (integrity_check or quick_check) and treat
+ * anything other than a single "ok" row as failure. */
+static int run_check_pragma(sqlite3 *db_handle, const char *path_label,
+                            const char *pragma_sql) {
     sqlite3_stmt *stmt = NULL;
-    int rc = sqlite3_prepare_v2(db_handle, "PRAGMA integrity_check;", -1, &stmt, NULL);
+    int rc = sqlite3_prepare_v2(db_handle, pragma_sql, -1, &stmt, NULL);
     if (rc != SQLITE_OK) {
         log_error("Failed to prepare integrity check for %s: %s",
                   path_label, sqlite3_errmsg(db_handle));
@@ -279,6 +309,22 @@ static int run_integrity_check(sqlite3 *db_handle, const char *path_label) {
 
     sqlite3_finalize(stmt);
     return 0;
+}
+
+static int run_integrity_check(sqlite3 *db_handle, const char *path_label) {
+    return run_check_pragma(db_handle, path_label, "PRAGMA integrity_check;");
+}
+
+static int run_quick_check(sqlite3 *db_handle, const char *path_label) {
+    return run_check_pragma(db_handle, path_label, "PRAGMA quick_check;");
+}
+
+static const char *backup_verify_mode_name(int mode) {
+    switch (mode) {
+        case DB_BACKUP_VERIFY_OFF:   return "off";
+        case DB_BACKUP_VERIFY_QUICK: return "quick";
+        default:                     return "full";
+    }
 }
 
 // Backup the database to a specified path
@@ -420,7 +466,7 @@ int backup_database(const char *source_path, const char *dest_path, bool abortab
          * guaranteed set by the time that one runs, so checking it here
          * would make it bail out immediately on every single shutdown and
          * never actually produce a backup. */
-        if (abortable && is_background_abort_requested()) {
+        if (abortable && backup_abort_requested()) {
             log_warn("Database backup aborting early: restart/shutdown requested");
             rc = SQLITE_ABORT;
             goto cleanup;
@@ -474,19 +520,43 @@ int backup_database(const char *source_path, const char *dest_path, bool abortab
         .abortable = abortable,
         .deadline = &deadline,
     };
-    if (abortable) {
-        sqlite3_progress_handler(dest_db, BACKUP_VERIFY_PROGRESS_OPS,
-                                 progress_during_verification,
-                                 &verification_progress);
+    /* The destination is a page-level copy of a consistent snapshot, so the
+     * costly part of a full integrity_check (cross-checking every index
+     * against its table, which seeks all over the file) mostly re-verifies
+     * what the source already guaranteed. On slow disks that scan alone has
+     * been observed to exceed the stuck-backup safety valve (issue #580), so
+     * the operator can choose quick_check or skip the scan via
+     * [database] backup_verify. Default remains the full check. */
+    int verify_mode = g_config.db_backup_verify;
+    int verification_rc = 0;
+    if (verify_mode == DB_BACKUP_VERIFY_OFF) {
+        log_warn("Skipping post-copy verification of %s (backup_verify = off)", temp_path);
+    } else {
+        struct timespec verify_start;
+        clock_gettime(CLOCK_MONOTONIC, &verify_start);
+        if (abortable) {
+            sqlite3_progress_handler(dest_db, BACKUP_VERIFY_PROGRESS_OPS,
+                                     progress_during_verification,
+                                     &verification_progress);
+        }
+        verification_rc = verify_mode == DB_BACKUP_VERIFY_QUICK
+                          ? run_quick_check(dest_db, temp_path)
+                          : run_integrity_check(dest_db, temp_path);
+        sqlite3_progress_handler(dest_db, 0, NULL, NULL);
+        struct timespec verify_end;
+        clock_gettime(CLOCK_MONOTONIC, &verify_end);
+        double verify_secs = (double)(verify_end.tv_sec - verify_start.tv_sec) +
+                             (double)(verify_end.tv_nsec - verify_start.tv_nsec) / 1e9;
+        log_info("Backup verification (%s) of %s %s in %.1f s",
+                 backup_verify_mode_name(verify_mode), temp_path,
+                 verification_rc == 0 ? "passed" : "did not pass", verify_secs);
     }
-    int verification_rc = run_integrity_check(dest_db, temp_path);
-    sqlite3_progress_handler(dest_db, 0, NULL, NULL);
     if (verification_rc != 0) {
         if (abortable && verification_progress.deadline_hit) {
             log_error("Database backup aborting during verification: exceeded maximum duration of %d seconds (stuck-backup safety valve)",
                        g_backup_max_duration_seconds);
             rc = SQLITE_ABORT;
-        } else if (abortable && is_background_abort_requested()) {
+        } else if (abortable && backup_abort_requested()) {
             log_warn("Database backup aborting during verification: restart/shutdown requested");
             rc = SQLITE_ABORT;
         } else {
