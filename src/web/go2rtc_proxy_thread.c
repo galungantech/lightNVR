@@ -12,6 +12,7 @@
 
 #define _GNU_SOURCE
 
+#include "video/go2rtc/go2rtc_api.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -190,7 +191,7 @@ static void *proxy_worker_thread(void *arg) {
     }
     if (ctx->authorization_denied) goto done;
 
-    if (strstr(ctx->request.path, "/api/stream.m3u8") &&
+    if (strcmp(ctx->request.path, "/go2rtc/api/stream.m3u8") == 0 &&
         http_request_get_query_param(&ctx->request, "src",
                                      ctx->capture_stream_name,
                                      sizeof(ctx->capture_stream_name)) >= 0 &&
@@ -206,7 +207,13 @@ static void *proxy_worker_thread(void *arg) {
         goto done;
     }
 
+    // PATH_AS_IS preserves the exact, already-validated path, but it is NOT
+    // sufficient on its own: even with the path preserved, go2rtc's traversal
+    // redirects would re-open the bypass by pointing curl at an endpoint that
+    // was never authorized. Disabling redirect following below is what
+    // actually closes it.
     curl_easy_setopt(curl, CURLOPT_URL, ctx->url);
+    curl_easy_setopt(curl, CURLOPT_PATH_AS_IS, 1L);
     curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, proxy_write_cb);
     curl_easy_setopt(curl, CURLOPT_WRITEDATA, ctx);
     curl_easy_setopt(curl, CURLOPT_HEADERFUNCTION, proxy_header_cb);
@@ -217,8 +224,9 @@ static void *proxy_worker_thread(void *arg) {
     curl_easy_setopt(curl, CURLOPT_TIMEOUT, snapshot_request ? 10L : 30L);
     curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, snapshot_request ? 2L : 5L);
     curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
-    curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
-    curl_easy_setopt(curl, CURLOPT_MAXREDIRS, 3L);
+    // A redirect target has not been authorized. Never follow it internally —
+    // this (not PATH_AS_IS) is what closes the traversal-redirect bypass.
+    curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 0L);
 
     struct curl_slist *headers = NULL;
 
@@ -331,18 +339,6 @@ static void proxy_async_cb(uv_async_t *handle) {
 // Public API
 // ============================================================================
 
-bool go2rtc_proxy_path_matches(const char *path) {
-    if (!path) return false;
-    // Only intercept the HTTP endpoints registered by libuv_api_handlers.
-    // WebRTC SDP and MSE WebSockets connect directly to go2rtc and must never
-    // enter this extra libcurl proxy hop.
-    return strcmp(path, "/go2rtc/api/streams") == 0 ||
-           strcmp(path, "/go2rtc/api/reload") == 0 ||
-           strcmp(path, "/go2rtc/api/stream.m3u8") == 0 ||
-           strncmp(path, "/go2rtc/api/hls/", 16) == 0 ||
-           strcmp(path, "/go2rtc/api/frame.jpeg") == 0;
-}
-
 int go2rtc_proxy_thread_init(uv_loop_t *loop) {
     if (!loop) {
         log_error("go2rtc_proxy_thread_init: NULL loop");
@@ -402,14 +398,13 @@ int go2rtc_proxy_thread_submit(libuv_connection_t *conn, write_complete_action_t
     ctx->request.body_len = 0;
     http_response_init(&ctx->auth_response);
 
-    // Forward the full path as-is. go2rtc is configured with base_path: /go2rtc
-    // (see GO2RTC_BASE_PATH), so it serves /go2rtc/api/streams directly.
+    // Translate the fixed public /go2rtc prefix to the active upstream prefix.
     if (req->query_string[0] != '\0') {
-        snprintf(ctx->url, sizeof(ctx->url), "http://127.0.0.1:%d%s?%s",
-                 port, req->path, req->query_string);
+        snprintf(ctx->url, sizeof(ctx->url), "http://127.0.0.1:%d%s%s?%s",
+                 port, go2rtc_api_get_base_path(), req->path + strlen(GO2RTC_BASE_PATH), req->query_string);
     } else {
-        snprintf(ctx->url, sizeof(ctx->url), "http://127.0.0.1:%d%s",
-                 port, req->path);
+        snprintf(ctx->url, sizeof(ctx->url), "http://127.0.0.1:%d%s%s",
+                 port, go2rtc_api_get_base_path(), req->path + strlen(GO2RTC_BASE_PATH));
     }
 
     safe_strcpy(ctx->method, req->method_str, sizeof(ctx->method), 0);

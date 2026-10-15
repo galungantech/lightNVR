@@ -58,6 +58,11 @@ macro(add_layer2_test TEST_NAME)
     endif()
 endmacro()
 
+# Filesystem-only regression coverage also builds the standalone helper logic.
+add_layer1_test(test_hls_cache_cleanup)
+target_sources(test_hls_cache_cleanup PRIVATE
+    ${CMAKE_SOURCE_DIR}/src/video/hls/hls_cache_cleanup.c)
+
 # Variant for Layer 2 tests that require CURL
 macro(add_layer2_test_with_curl TEST_NAME)
     add_layer2_test(${TEST_NAME})
@@ -183,6 +188,8 @@ add_layer2_test(test_api_handlers_fleet)
 add_layer2_test(test_api_handlers_workspaces)
 add_layer2_test(test_db_live_saved_layouts)
 add_layer2_test(test_api_handlers_live_layouts)
+add_layer2_test(test_db_camera_favorites)
+add_layer2_test(test_api_handlers_camera_favorites)
 add_layer2_test(test_db_operator_floor_plans)
 add_layer2_test(test_api_handlers_operator_floor_plans)
 add_layer2_test(test_api_handlers_investigations)
@@ -209,7 +216,8 @@ add_layer2_test(test_storage_migration)
 add_layer2_test(test_storage_deletion_ledger)   # Layer 2: deletion ledger scoping, pruning, indexes
 if(ENABLE_S3_ARCHIVE)
     add_layer2_test(test_storage_archive)
-    target_link_options(test_storage_archive PRIVATE "-Wl,--wrap=uv_timer_start")
+    target_link_options(test_storage_archive PRIVATE "-Wl,--wrap=uv_timer_start"
+        "-Wl,--wrap=db_open_readonly_connection")
 endif()
 add_layer2_test(test_db_detections)
 add_layer2_test(test_db_zones)
@@ -244,6 +252,7 @@ add_layer2_test(test_httpd_utils)
 add_layer2_test(test_zone_filter)
 add_layer2_test(test_onvif_soap_fault)
 add_layer2_test(test_onvif_discovery_response)
+add_layer2_test(test_go2rtc_base_path)
 add_layer2_test(test_yaml_validate)
 if(YAML_FOUND)
     if(YAML_LIBRARY_DIRS)
@@ -260,6 +269,8 @@ if(YAML_FOUND)
 endif()
 add_layer2_test_with_curl(test_go2rtc_process_detection)
 if(ENABLE_GO2RTC)
+    add_layer3_test(test_go2rtc_proxy_routing)
+    set_tests_properties(test_go2rtc_proxy_routing PROPERTIES TIMEOUT 15)
     add_layer2_test_with_curl(test_go2rtc_proxy_thread)
     target_link_options(test_go2rtc_proxy_thread PRIVATE
         "-Wl,--wrap=go2rtc_proxy_authorize_request"
@@ -309,6 +320,8 @@ endif()
 # ====================================================================
 # Layer 3: Integration tests — lightnvr_lib + FFmpeg
 # ====================================================================
+add_layer3_test(test_faac_encoder)
+add_layer3_test(test_audio_transcoder)
 add_layer3_test(test_stream_manager)
 add_layer3_test(test_stream_state)
 add_layer3_test(test_packet_buffer)
@@ -320,6 +333,9 @@ target_link_options(test_hls_cleanup PRIVATE
     "-Wl,--wrap=alarm" "-Wl,--wrap=sigaction" "-Wl,--wrap=av_read_frame"
 )
 set_tests_properties(test_hls_cleanup PROPERTIES TIMEOUT 30)
+add_layer3_test(test_hls_reconnect_backoff)
+target_link_options(test_hls_reconnect_backoff PRIVATE "-Wl,--wrap=av_usleep")
+set_tests_properties(test_hls_reconnect_backoff PROPERTIES TIMEOUT 10)
 add_layer3_test(test_mp4_writer_watchdog)
 add_layer3_test(test_mp4_segment_timestamps)
 add_layer3_test(test_mp4_segment_boundaries)
@@ -337,6 +353,17 @@ add_layer2_test(test_motion_trigger_parse)       # Layer 2: motion trigger body 
 add_layer2_test(test_motion_max_area)            # Layer 2: motion detector max-area sanity cap
 add_layer3_test(test_cross_stream_motion_trigger)
 add_layer3_test(test_annotation_writer_registry)  # Layer 3: continuous-writer probe behind annotation mode (#547)
+add_layer3_test(test_detection_current_frame)
+target_compile_definitions(test_detection_current_frame PRIVATE
+    TEST_FIXTURE_DIR="${CMAKE_SOURCE_DIR}/tests/fixtures/detection"
+)
+target_link_options(test_detection_current_frame PRIVATE
+    "-Wl,--wrap=detect_objects_api_snapshot_with_options"
+    "-Wl,--wrap=detect_objects_api_with_options"
+    "-Wl,--wrap=filter_detections_by_zones"
+    "-Wl,--wrap=filter_detections_by_stream_objects"
+)
+set_tests_properties(test_detection_current_frame PROPERTIES TIMEOUT 15)
 add_layer3_test(test_detection_io_recovery)
 target_compile_definitions(test_detection_io_recovery PRIVATE
     TEST_RECORDING_PATH="${CMAKE_SOURCE_DIR}/tests/integration/fixtures/recording.mp4"

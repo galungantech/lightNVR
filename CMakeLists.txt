@@ -7,7 +7,7 @@ if(CMAKE_VERSION VERSION_GREATER_EQUAL "4.0")
     set(CMAKE_POLICY_VERSION_MINIMUM 3.5 CACHE STRING "" FORCE)
 endif()
 
-project(LightNVR VERSION 0.42.12 LANGUAGES C CXX)
+project(LightNVR VERSION 0.43.2 LANGUAGES C CXX)
 
 # Set C/C++ standards
 set(CMAKE_C_STANDARD 11)
@@ -160,7 +160,7 @@ if(YAML_FOUND)
     message(STATUS "Found libyaml: ${YAML_LIBRARIES} (version ${YAML_VERSION})")
     add_compile_definitions(LIGHTNVR_HAVE_LIBYAML=1)
 else()
-    message(WARNING "libyaml (yaml-0.1) not found. YAML validation will be disabled. Install libyaml-dev / yaml-dev to enable.")
+    message(WARNING "libyaml (yaml-0.1) not found. YAML validation and go2rtc override base_path detection will be disabled. Install libyaml-dev / yaml-dev to enable.")
 endif()
 
 # MQTT support (optional, uses libmosquitto)
@@ -452,6 +452,44 @@ set(INIH_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/external/inih/ini.c")
 add_library(inih_lib STATIC ${INIH_SOURCES})
 target_include_directories(inih_lib INTERFACE "${CMAKE_CURRENT_SOURCE_DIR}/external/inih")
 
+# Set up vendored FAAC library
+set(FAAC_SOURCES
+    "${CMAKE_CURRENT_SOURCE_DIR}/third_party/faac/libfaac/bitstream.c"
+    "${CMAKE_CURRENT_SOURCE_DIR}/third_party/faac/libfaac/blockswitch.c"
+    "${CMAKE_CURRENT_SOURCE_DIR}/third_party/faac/libfaac/channels.c"
+    "${CMAKE_CURRENT_SOURCE_DIR}/third_party/faac/libfaac/cpu_compute.c"
+    "${CMAKE_CURRENT_SOURCE_DIR}/third_party/faac/libfaac/faac.c"
+    "${CMAKE_CURRENT_SOURCE_DIR}/third_party/faac/libfaac/fft.c"
+    "${CMAKE_CURRENT_SOURCE_DIR}/third_party/faac/libfaac/filtbank.c"
+    "${CMAKE_CURRENT_SOURCE_DIR}/third_party/faac/libfaac/frame.c"
+    "${CMAKE_CURRENT_SOURCE_DIR}/third_party/faac/libfaac/huff2.c"
+    "${CMAKE_CURRENT_SOURCE_DIR}/third_party/faac/libfaac/huffdata.c"
+    "${CMAKE_CURRENT_SOURCE_DIR}/third_party/faac/libfaac/quantize.c"
+    "${CMAKE_CURRENT_SOURCE_DIR}/third_party/faac/libfaac/ratecontrol.c"
+    "${CMAKE_CURRENT_SOURCE_DIR}/third_party/faac/libfaac/resample.c"
+    "${CMAKE_CURRENT_SOURCE_DIR}/third_party/faac/libfaac/sbr.c"
+    "${CMAKE_CURRENT_SOURCE_DIR}/third_party/faac/libfaac/sbr_analysis.c"
+    "${CMAKE_CURRENT_SOURCE_DIR}/third_party/faac/libfaac/sbr_bitstream.c"
+    "${CMAKE_CURRENT_SOURCE_DIR}/third_party/faac/libfaac/sbr_tables.c"
+    "${CMAKE_CURRENT_SOURCE_DIR}/third_party/faac/libfaac/stereo.c"
+    "${CMAKE_CURRENT_SOURCE_DIR}/third_party/faac/libfaac/tns.c"
+    "${CMAKE_CURRENT_SOURCE_DIR}/third_party/faac/libfaac/util.c"
+)
+add_library(faac_lib STATIC ${FAAC_SOURCES})
+target_compile_definitions(faac_lib PRIVATE
+    PACKAGE_VERSION="2.2.0"
+    PACKAGE="faac"
+    MAX_CHANNELS=8
+    FAAC_SBR_DECIMATION=1
+)
+target_include_directories(faac_lib PUBLIC
+    "${CMAKE_CURRENT_SOURCE_DIR}/third_party/faac/include"
+    "${CMAKE_CURRENT_SOURCE_DIR}/third_party/faac/libfaac"
+)
+if(UNIX)
+    target_link_libraries(faac_lib PUBLIC m)
+endif()
+
 # Bundle ezXML implementation used by ONVIF parsing
 set(EZXML_SOURCES
     "${CMAKE_CURRENT_SOURCE_DIR}/src/ezxml/ezxml.c"
@@ -611,6 +649,7 @@ target_include_directories(lightnvr_lib PRIVATE ${HTTP_BACKEND_INCLUDE_DIRS})
 target_link_libraries(lightnvr_lib PUBLIC
         ${HTTP_BACKEND_LIBS}
         inih_lib
+        faac_lib
         ${FFMPEG_LIBRARIES}
         ${SQLITE_LIBRARIES}
         ${CURL_LIBRARIES}
