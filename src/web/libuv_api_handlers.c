@@ -236,6 +236,7 @@ int register_all_libuv_handlers(http_server_handle_t server) {
     http_server_register_handler(server, "/api/streams/#/ptz/set-home", "POST", handle_ptz_set_home);
     http_server_register_handler(server, "/api/streams/#/ptz/goto-preset", "POST", handle_ptz_goto_preset);
     http_server_register_handler(server, "/api/streams/#/ptz/preset", "PUT", handle_ptz_set_preset);
+    http_server_register_handler(server, "/api/streams/#/ptz/delete-preset", "POST", handle_ptz_remove_preset);
 
     // ONVIF Imaging API
     http_server_register_handler(server, "/api/streams/#/imaging/settings", "GET", handle_imaging_get_settings);
@@ -496,10 +497,9 @@ int register_all_libuv_handlers(http_server_handle_t server) {
     // Pattern uses # for single-segment wildcards: /hls/{stream_name}/{filename}
     http_server_register_handler(server, "/hls/#/#", "GET", handle_direct_hls_request);
 
-    // Scoped go2rtc proxy. WebRTC SDP uses the authenticated HTTP origin;
-    // the negotiated media connection still goes directly to go2rtc.
-    http_server_register_handler(server, "/go2rtc/api/ws", "GET", handle_go2rtc_proxy);
-    http_server_register_handler(server, "/go2rtc/api/webrtc", "POST", handle_go2rtc_proxy);
+    // go2rtc Streaming Proxy - SCOPED to HLS streaming endpoints only
+    // This provides buffered pass-through with concurrency limiting
+    // WebRTC connects directly to go2rtc for lower latency
     // Streams list endpoint (for health check)
     http_server_register_handler(server, "/go2rtc/api/streams", "GET", handle_go2rtc_proxy);
     // Stream reload endpoint
